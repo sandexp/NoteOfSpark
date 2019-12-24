@@ -485,7 +485,7 @@
    		需要获得重入锁才可获取
    	弃读标记位@readAborted
    		需要获得重入锁才可获取
-	读异常@readException
+		读异常@readException
    		需要获得重入锁才可获取
    	流状态标记@isClosed
    		需要获得重入锁才可获取
@@ -527,6 +527,91 @@
    				2. 在活动缓冲区数据读取完毕时，这是需要等待异步读取的完成（就是这个方法) 
    			所有在上述两种情况下，这个方法的读取，不会再多线程状态下处于不安全的状态
    				（情况1:  不从预读缓冲读数据，状态2： 等待预读缓冲区数据转换）
+   			* 读取过程:
+   				从底层输入流中获取数据
+   				-> 读取过程中出现错误，则抛出错误
+   			结果处理: 
+   			  处理结果时获取重入锁@stateChangeLock才能进行，处理过程中许多参量需要在获得重入锁才能使用
+   			  将读取到达数据放到预读缓冲区中，设置缓冲区@limit属性为读取偏移量@offset
+   			分为两种可能状况考虑:
+   				1. 完整读完，或者是因为读到了EOF标志符而抛出的异常
+   					在此判定是读到了文档末尾的@endOfStream = true
+   				2. 途中出现了非EOF标志的异常,或者是错误，说明途中出现了弃读
+   					readAborted = true;
+   					因此，读取异常也需要设置
+   						readException = exception;
+   			读取完毕,设置异步读取状态位@readInProgress为false，读取完毕
+   			此时，需要等待异步读取完毕@signalAsyncReadComplete()。释放重入锁@stateChangeLock，如果在		条件满足的情况下，关闭底层输入流@closeUnderlyingInputStreamIfNecessary()。
+   	void closeUnderlyingInputStreamIfNecessary ()
+       	当底层输入流未关闭的时候(@isUnderlyingInputStreamBeingClosed=false)，且调用了关流的方法		(@isClosed=true)，那么	就去对底层输入流，进行事实意义上的关流@underlyingInputStream
+       void signalAsyncReadComplete()
+       	这里异步读取完成的状态时通过@Condition 的signAll()方法,唤醒所有的等待方式实现的，不是通过普通的     状态标记位
+       void waitForAsyncReadComplete()[参数中有需要重入锁才能获取的]
+       	获取重入锁
+       	一直等待，等待到出现IO中断异常，才做处理.
+       		处理方式： @isWaiting标记位(AutomaticBoolean)置0
+       	关闭重入锁
+       	检查读的过程中是否出现了读取异常(因为弃读和正常EOF都会导致IO中断,所以这一步是必须的)
+       		出现读异常: 抛异常
+       		没出现: 正常结束
+   5. 基本的读取方式
+   	+ 范围读取: int read(byte[] b, int offset, int len)
+   		操作条件:
+           	读取起始值合法(非负)
+   			读取长度合法(非负)
+               读取末尾在数组范围内(offset+len<b.len)
+            操作逻辑:
+            	1. 在活动缓冲区中有数据的时候
+            		+ 缓冲区中剩余的数据小于读取数据--> 将剩余数据全部读取
+            		+ 缓冲区中剩余数据大于读取数据--> 读取len个数据，更新缓冲区剩余内容（通过@get()更新指针				位置@position）
+            	2. 活动缓冲区中没有数据时候
+            		需要获取锁，在获取锁期间，与预读缓冲区交换
+            		交换的前置条件:
+            			预读缓冲区需要读满(没满的话需要等待异步读取，知道预读缓冲区满)[读到末尾时自动返回-1]
+            		交换完毕之后，预读缓冲区继续开启异步读取模式。
+            		同时释放锁以供客户端从活动缓冲区读取数据。
+        + 简单读取方式: int read()
+        	1. 当活动缓冲区还有数据时，从活动缓冲区获得1个字节
+        	2. 活动缓冲区没有数据时:
+        		调用read(oneByteArray, 0, 1) [就读一个]
+        		oneByteArray是本地线程创建的长度为1的字节数组
+        + 缓冲区交换 void swapBuffers()
+        + 获取可读字节数量 int available()
+        		ans=MIN(Integer.maxval,activeBuff.size+aheadBuff.size);
+   6. 跳读 [涉及到缓冲区指针的操作@position]
+   	long skipInternal(long n) -->skip 调用，默认已经获得了重入锁
+   		1. 读到输入流末尾 返回0(不可以再跳读)
+   		2. 可读字节数@available()>=n 
+   			可以跳读n个，考虑如何处理两个缓冲区的指针
+   			首先，率先处理的是活动缓冲区的指针:
+   				restSkip=curSkip-activeBuff.remain()
+   			如果还可以往下跳，则跳到预读缓冲区中
+   				assert(restSkip>0)
+   				这时候先读取获取缓存区的内容,在从活动缓存区中读取剩余的内容,剩余内容的开始位置
+   				@position=restSkip+readaheadBuff.postion 
+   				将上述区域的内容交换到活动缓冲区,预读缓存继续异步读取文件
+   			返回:=n
+   		3. 可读字节是@available()<n
+           		这时候restSkip=available(),由于这时候跳读的数量比两个缓冲区的总字节数还要多
+           		所以直接将两个缓冲区的内容全部读取即可,剩下的部分需要在底层输入流@underlyingInputStream				中获取.跳读完毕之后,预读还是需要继续异步读取数据
+           		返回数据=缓冲区总字节数+底层输入流中跳读的字节数
+         long skip(long n)
+         		条件: n>=0 (n<=0 return 0)
+         		功能: 跳读N个字节
+         			1. 活动缓冲区大小足够: 直接在活动缓冲区内部移动指针,返回n,线程不会处于不安全状态
+         			2. 活动缓冲区大小不够,但是预读缓冲区内可以包含到这个移动后的指针
+         				移动到活动缓冲区末尾,计算剩余需要跳过的字节数restSkip
+         				在预读缓冲区内部移动这么多的数量,将他交换给活动缓冲区
+         				预读缓冲区,没有满,继续异步读取
+         				由于这个过程中需要交换缓冲区,所以需要保证原先的活动缓冲区是线程安全的,所以要加一个重				入锁
+         			3. 两个缓冲区加起来也不够数,则需要在第2步的基础上,从底层输入流中再获取restSkip个字节,这				个过程也是需要获取锁			
+   7. 关流
+   	void close()
+   	再处理多个线程读取数据时,关流不能说关就关,需要保证下面几个条件
+   		1. 之前没有下达过关闭指令
+   		2. 当前状态下,没有再读取的工作,这是可以确保关闭是合理的
+   		3. 先关闭异步读取数据("read-ahead")的线程,再关闭底层的输入流
+   			注意: 这里的异步读取线程中,是需要使用到底层输入流的,所以关闭顺序不能弄反了
    ```
    
    
@@ -546,6 +631,10 @@
       7. java.lang.Runnale
       	性质: FunctionalInterface型注解
       	介绍: 
+      8. assert关键字
+      9. 什么样的操作时线程不安全的,这些线程不安全状态,都需要什么安全保障措施(同步,还是加锁,加什么样的锁)
       ```
-   
+   ```
       
+      
+   ```
