@@ -1,5 +1,3 @@
-
-
 ## spark-shuffle**
 
 ---
@@ -467,7 +465,7 @@
 
 5.  **shuffle排序器** 
 
-    1.  外部排序器
+    1.  内部排序器
 
         ```markdown
         ADT ShuffleInMemorySorter{
@@ -548,6 +546,159 @@
         }
         ```
 
-        
+    2. 外部排序器
 
-    2.  内存排序器
+       #class @ShuffleExternalSorter
+    
+       ```markdown
+       基于排序的shuffle的外部排序器
+       	传入的记录添加到数据页中,当所有记录都已经插入完毕(或者是到达了当前线程shuffle的内存上限)。处于内存中的记录根据他们的分区号进行排序，使用的是#class @ShuffleInMemorySorter。排序的文件被写入到单个的输出文件(或者是多个文件，如果发生溢写的情况下)。输出文件的格式与#class @SortShuffleWriter写出的最终输出文件相同:每个输出分区记录写成单个序列化且压缩的(输出)流，这个流可以被一个新的反压缩且反序列化的(输入)流读取。
+       	与@org.apache.spark.util.collection.ExternalSorter不同，这个排序器不会合并分区文件。相反的，合并是执行在@UnsafeShuffleWriter 上，这个类使用了特定的合并程序从而规避了使用序列化/反序列化器。
+       ```
+    
+       ```markdown
+       ADT ShuffleExternalSorter{ 
+       	father --> 内存消费者#class @MemoryConsumer
+       	数据元素:
+       		1. 日志管理器 #name @logger $type @Logger
+       		2. 磁盘缓冲大小@DISK_WRITE_BUFFER_SIZE=1024*1024
+       		3. 分区数 #name @numPartitions $type @int
+       		4. 任务内存管理器 #name @taskMemoryManager $type @TaskMemoryManager
+       		5. 块管理器 #name @blockManager $type @BlockManager
+       		6. 任务上下文信息 #name @taskContext $type @TaskContext
+       		7. shuffle写出度量器 #name @writeMetrics $type @ShuffleWriteMetricsReporter
+       		8. 溢写容量 #name @numElementsForSpillThreshold $type @int
+       			达到这个容量，就会迫使排序器去溢写
+       		9. 文件缓冲字节数 #name @fileBufferSizeBytes $type @int
+       			使用#class @DiskBlockObjectWriter溢写时缓冲大小
+       		10. 写磁盘缓冲大小 #name @diskWriteBufferSize 
+       			这格式在磁盘上写排序后的记录所使用缓冲区的大小
+       		11. 峰值内存使用量 #name @peakMemoryUsedBytes $type 
+       		12. 已分配内存页列表 #name @allocatedPages $type @LinkedList<MemoryBlock>
+       		13. 数据块元数据信息列表 #name @spills $type @LinkedList<SpillInfo>
+       		14. 内存排序器#name @inMemSorter $type @ShuffleInMemorySorter(溢写/初始化后重置)
+       		15. 当前页/内存块#name @currentPage=null(溢写/初始化值) $type @MemoryBlock
+       		16. 页指针@pageCursor=-1(溢写/初始化完成重设值)
+       	操作集:
+       		1. 构造器
+       		ShuffleExternalSorter(TaskMemoryManager memoryManager,BlockManager blockManager,
+             		TaskContext taskContext,int initialSize,int numPartitions,SparkConf conf,
+             		ShuffleWriteMetricsReporter writeMetrics)
+             	功能: 初始化任务内存管理器@taskMemoryManager=memoryManager,
+             		初始化块管理器@blockManager，
+             		初始化任务上下文信息@taskContext，
+             		初始化分区数@numPartitions，
+             		初始化文件字节缓冲大小@fileBufferSizeBytes (参数从SparkConf中配置信息获取)
+             		初始化溢写容量@numElementsForSpillThreshold (参数从SparkConf中配置信息获取)
+             		初始化写出度量器@writeMetrics
+             		初始化内部排序器@inMemSorter=ShuffleInMemorySorter(this,initialSize,useRadixSort)
+       				useRadixSort=(参数从SparkConf中配置信息获取)
+       		2. 操作类
+               	void writeSortedFile(boolean isLastFile)
+               	功能: 对内存内部数据进行排序，并将排序好的数据写出成磁盘上的文件
+               	输入参数: isLastFile=true表示已经是最后一个文件，需要形成一个最终的输出文件。写出的字节			数量应统计到shuffle 溢写计数中，而不是shuffle写计数中。
+               	+ 处理写出度量器@writeMetrics与isLastFile标志的关系
+               		1. 若是最后一个文件，这个文件不会去溢写，直接使用本类的度量器@writeMetrics统计即				可。
+               		2. 不是最后一个文件的话，则需要新设置一个度量器@ShuffleWriteMetrics，去统计这个溢				写部分的字节数量
+               	+ 写缓冲区的设置
+               		直接写小文件到磁盘上是非常低效的，所以需要设置一个缓冲数组。但是这个数组没有必要一定				去容纳一条记录。写缓冲区大小=@diskWriteBufferSize
+               	+ 创建临时shuffle块,并创建数据块元数据信息@SpillInfo
+               		由于输出会在shuffle期间读取,它的压缩(compression codec)必须要受到
+               		spark.shuffle.compress的控制,而不是spark.shuffle.spill.compress。因此此处需要获				取临时shuffle块。
+               	+ 获取一个序列化实例@SerializerInstance
+               		主要是用来构造磁盘块写出器@DiskBlockObjectWriter 。事实上写路径使用的不是这个序列			化对象(原因是底层调用了write()这个输出流中的方法)，但是磁盘块写出器中仍然是调用了它，所			有这里使用一个不可写的实例，详情参考@DummySerializerInstance。
+               	+ 获取排序后的记录，获取记录的分区号，
+               		如果分区号@partition不是当前指针所指@currentPartition
+               		更新当前指针@currentPartition=@partition
+               	+ 获取/内存块对象 and 页内偏移指针 and 页内剩余数据量
+               		1. 使用#class @PackedRecordPointer #method @getRecordPointer获取记录地址
+               		2. 使用任务内存管理器@taskMemoryManager根据记录地址获取页基本对象
+               		3. 使用任务内存管理器@taskMemoryManager根据记录地址获取页内偏移量
+               		4. 设置记录读取位置@recordReadPosition=页内偏移量@recordOffsetInPage+uao_size
+               			(uao_size为操作系统默认偏移量)
+               		5. 将从记录读取位置@recordReadPosition开始的min(业内剩余数据@dataRemaining，块写				出缓冲大小@diskWriteBufferSize)以内存拷贝的方式到写出缓冲@writeBuffer。
+               		6. 将缓冲区的数据写出
+               		7. 更新页内数据剩余量@dataRemaining 和记录读取指针@recordReadPosition+=数据拷贝量
+               		
+               	+ 刷新写出内容并提交#name @DiskBlockObjectWriter #method @commitAndGet()
+               	+ 更新数据块元数据信息中当前分区@currentPartition的分区大小并将信息注册到数据块元数据
+               	信息列表@spill
+       			+ 使用写出度量器@writeMetrics统计写出的时间
+       			+ 使用任务上下文信息@taskContext设置任务的度量@taskMetrics()
+       		
+       		long spill(long size, MemoryConsumer trigger)
+       		功能: 对当前记录进行排序和溢写，以便减小当前内存的压力
+       		返回: 由于溢写释放的内存量
+       		+ 调用@writeSortedFile对记录进行溢写，当然isLastFile=false
+       		+ 释放内存量@spillSize=freeMemory()
+       		+ 重设内部排序器#method @reset()
+       		+ 使用上下文信息管理器@taskContext 对当前操作进行度量
+       		返回spillsize
+       		
+       		long getMemoryUsage() 
+       		功能: 获取内存使用量
+       		val=sigma(allocatedPage.size)
+       		
+       		void updatePeakMemoryUsed()
+       		功能: 更新内存峰值使用量
+       		
+       		long getPeakMemoryUsedBytes()
+       		功能: 获取内存峰值使用量
+       		
+       		long freeMemory()
+       		功能: 释放内存，返回释放内存量
+       		+ val=sigma(allocatedPage.size)
+       		+ 重置allocatedPages,currPage=null,pageCursor=0 
+       		
+       		void cleanupResources()
+       		功能: 清理资源，让内存以及溢写文件删除，有shuffle 错误处理调用
+       		+ 清空内存排序器@inMemSorter
+       		+ 从数据块元数据列表@spills中检测每个数据块是否合法
+       		
+       		SpillInfo[] closeAndGetSpills()
+       		功能: 关闭内部排序器@inMemSorter，引起任意缓冲数据排序且写出到磁盘，返回数据块元数据列
+       		表@SpillInfo[] 
+       		+ 先使用@writeSortedFile(true)写磁盘
+       		+ 再释放内部排序器@inMemSorter内存
+       		
+       		void acquireNewPageIfNecessary(int required)
+       		功能: 根据输入获取新的数据页/内存块
+       		+ 检测当前页@pageCursor后required页的是否存在，如果不存在，则会分配空
+       		间@allocatePage(required)，并将指针指向新开空间的基本对象处。
+       		+ 向已分配页/内存块列表中注册刚分配出来的空间
+       		
+       		void growPointerArrayIfNecessary()
+       		功能: 移动数组指针,主要是检测是否有足够的空间去新增一条记录，如果有则会移动当前指针，否则内存		数据会溢写到磁盘上。
+       		操作条件: 内存排序器@inMemSorter存在
+       		+ 获取内存使用量(字节数)
+       		+ 开辟一个可以容纳当前内存使用量(字数=字节数/8)*2的数组空间@LongArray
+       			1. 如果页长过大，则会溢写
+       			2. spark内存溢出错误发生则会报错
+       		+ 检查是否触发溢写
+       			1. 触发了溢写 内部排序器@inMemSorter扩展指针数组#method @expandPointerArray
+       			2. 没有触发溢写 释放之前创建的@LongArray空间
+       			
+       		nsertRecord(Object recordBase, long recordOffset, int length, int partitionId)
+       		功能: 写入记录到shuffle排序器中
+       		操作条件: 内部排序器存在
+       		+ 内部排序器记录数量大于设定的溢写阈值@numElementsForSpillThreshold。则需要先溢写释放内存
+       		+ 移动数组指针，检查是否可以容纳下一条数据@growPointerArrayIfNecessary()
+       		+ 重设长度@required=length+uao_size(操作系统默认偏移量)
+       		+ 分配设定页的内存@acquireNewPageIfNecessary(required)
+       		+ 新的当前页存在，则获取当前页的页对象@base以及记录的地址@recordAddress，通过任务内存管理器		对当前页对象@currentPage以及页指针(页内偏移指针)@pageCursor获得#method 
+       		@encodePageNumberAndOffset(currentPage, pageCursor)
+       		+ 修正页内偏移指针+=uao_size
+       		+ 将recordBase对象页内偏移地址为recordOffset 长度为length的数据使用内存拷贝的方式拷贝到目		的对象为base，页内指针为@pageCursor长度为length的位置。
+       		+ 移动页内偏移指针@pageCursor+=length
+       		+ 使用内存排序器@inMemSorter 插入到指定的分区中去
+       		@insertRecord(recordAddress, partitionId)
+       }
+       ```
+
+
+
+---
+
+**API**
+
+这部分为相关API的介绍，后续添加
