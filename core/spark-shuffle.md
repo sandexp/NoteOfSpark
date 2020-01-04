@@ -678,7 +678,7 @@
        			1. 触发了溢写 内部排序器@inMemSorter扩展指针数组#method @expandPointerArray
        			2. 没有触发溢写 释放之前创建的@LongArray空间
        			
-       		nsertRecord(Object recordBase, long recordOffset, int length, int partitionId)
+       		insertRecord(Object recordBase, long recordOffset, int length, int partitionId)
        		功能: 写入记录到shuffle排序器中
        		操作条件: 内部排序器存在
        		+ 内部排序器记录数量大于设定的溢写阈值@numElementsForSpillThreshold。则需要先溢写释放内存
@@ -694,8 +694,188 @@
        		@insertRecord(recordAddress, partitionId)
        }
        ```
+    
+6.  #class @UnsafeShuffleWriter<K,V>
 
-
+    ```markdown
+    ADT UnsafeShuffleWriter{
+    	数据元素:
+    		1. 日志处理器 #name @logger #type @Logger
+    		2. 类标签 #name @OBJECT_CLASS_TAG=#scala #object @ClassTag$Module.Object()
+    		3. 初始序列化缓冲大小 #name @DEFAULT_INITIAL_SER_BUFFER_SIZE=1024*1024
+    		4. 块管理器 #name @blockManager #type @BlockManager
+    		5. 任务内存管理器 #name @memoryManager #type @TaskMemoryManager
+    		6. 序列化实例 #name @serializer #type @SerializerInstance
+    		7. 写出度量器 #name @writeMetrics #type @ShuffleWriteMetricsReporter
+    		8. shuffle执行组件 #name @shuffleExecutorComponents #type @ShuffleExecutorComponents
+    		9. shuffId #name @shuffleId #type @int
+    		10. mapId #name @mapId #type @long
+    		11. 任务上下文管理器 #name @taskContext #type @TaskContext
+    		12. 应用程序配置集 #name @sparkConf #type @SparkConf
+    		13. 是否可以转换标记 #name @transferToEnabled #type @boolean
+    		14. 初始化排序缓冲大小 #name @initialSortBufferSize #type @int
+    		15. 输入缓冲字节数 #name @initialSortBufferSize #type @long
+    		16. map侧状态 #name @mapstatus #type @MapStatus
+    		17. 外部排序器 #name @sorter #type @ShuffleExternalSorter
+    		18. 峰值内存使用量 #name @peakMemoryUsedBytes(初始化为0)
+    		19. 序列化流 #name @serOutputStream #type @SerializationStream
+    		20. 序列化缓冲器 #name @serBuffer #type @MyByteArrayOutputStream
+    		21. 停止状态位 #name @stopping (初始化为false)
+    			map侧的停止状态包括
+    				1. 任务完成而停止
+    				2. 引发异常而停止
+    			为了不会两次尝试删除文件，需要加设这个域
+    	
+    	操作集:
+    		1. 构造器
+    		UnsafeShuffleWriter(BlockManager blockManager,TaskMemoryManager memoryManager,
+          		SerializedShuffleHandle<K, V> handle,long mapId,
+          		TaskContext taskContext,SparkConf sparkConf,
+          		ShuffleWriteMetricsReporter writeMetrics,
+          		ShuffleExecutorComponents shuffleExecutorComponents)
+          	功能: 
+          		+ 初始化块管理器@blockManager
+          		+ 初始化任务内存管理器@memoryManager
+      		+ 初始化mapID@mapId
+          		+ 初始化写度量器@writeMetrics
+          		+ 初始化shuffle执行器@shuffleExecutorComponents
+          		+ 初始化任务上下文@taskContext
+          		+ 初始化应用程序配置集@sparkConf
+          		+ 初始化转换标记@transferToEnabled
+          		+ 初始化初始排序缓冲大小@initialSortBufferSize (sparkConf获取)
+          		+ 初始化输入缓冲字节大小@inputBufferSizeInBytes (sparkConf获取)
+    		    + 根据指定的handle获取shuffle依赖关系@ShuffleDependency dep
+    		    	根据dep
+    		 		1. 初始化shuffleId@shuffleId
+    		 		2. 初始化序列化器对象@serializer
+    		 		3. 初始化分区器@partitioner
+    		 	
+    		2. 查询获取类
+    		long getPeakMemoryUsedBytes()
+    		功能: 返回峰值内存使用量
+    		
+    		3. 操作类
+    		void updatePeakMemoryUsed()
+    		功能: 更新峰值内存使用量
+    		
+    		void write(scala.collection.Iterator<Product2<K, V>> records)
+    		功能: 写出记录
+    		+ 将所有的记录插入到本类的外部排序器中@sorter,插入完毕使用closeAndWriteOutput()关闭排序器并将记			录写出，设置写出标记@success为true
+    		+ 作为该操作的首尾，一定需要将外部排序器的记录删除完毕。
+    		
+    		void open()
+    		功能: 初始化外部排序器@sorter,序列化缓冲@surBuffer,序列化输出流@serOutputStream
+    		操作条件: 当前排序器不存在
+    		
+    		void closeAndWriteOutput()
+    		功能: 关闭排序器，写输出
+    		操作条件: 排序器@sorter存在
+    		+ 更新峰值内存使用量
+    		+ 重设序列化缓冲@serBuffer，序列化输出流@serOutputStream
+    		+ 从外部排序器@sorter中获取溢写文件块的元数据信息#name @spills #type @SpillInfo[]
+    		并重置外部排序器
+    		+ 对元数据信息@spills进行多路归并@mergeSpills(spills) [使用最快的方式合并这些文件的元数据信息和			IO压缩码(compression codec)]
+    		+ 处理完成,检索元数据信息，当元数据信息所表示的文件存在且没有被删除时，则表示溢写该文件时出错了，			导致内存没有释放掉，会反映到日志信息上。
+    		+ 设置map侧的状态@mapStatus=MapStatus$.MODULE$.apply(blockManager.shuffleServerId(), 				partitionLengths, mapId)
+    			详情参照scala.MapStatus
+    		
+    		void insertRecordIntoSorter(Product2<K, V> record)
+    		功能: 将记录插入到外部排序器中
+    		操作条件: 外部排序器存在
+    		+ 使用序列化输出流将记录的key/value写出。
+    		+ 接着更新缓冲区@serBuffer，将缓冲区的内容，写入外部排序器中@sorter
+    		
+    		void forceSorterToSpill()
+    		功能: 使得排序器强行溢写
+    		操作条件: 外部排序器@sorter存在
+    		+ 外部排序器溢写#method @spill()
+    		
+    		long[] mergeSpills(SpillInfo[] spills)
+    		功能: 溢写文件块的多路归并
+    		返回: 合并后文的分区长度列表
+    		+ 数据块元数据信息列表长度=0
+    			使用map形式的写出器#class @ShuffleMapOutputWriter直接提交所有分区
+    			#method @commitAllPartitions即可
+    		+ 数据块元数据信息列表长度=1
+    			获取单文件shuffle溢写输出器@SingleSpillShuffleMapOutputWriter #name
+                @maybeSingleFileWriter，
+                如果这个值非null，则使用单文件shuffle溢写输出器的方式，将该部分的数据块进行转化#method 
+                @transferMapSpillFile(File f,long[] partitionLengths)
+                如果这个值为null，则使用@mergeSpillsUsingStandardWriter(spills)的方式进行转化
+             + 数据块元数据信息列表中>1
+             	@mergeSpillsUsingStandardWriter(spills)
+             
+             long[] mergeSpillsUsingStandardWriter(SpillInfo[] spills)
+             功能: 使用标准写出器对文件块进行归并
+             + 获取压缩相关的信息，减少读写磁盘上数据的大小
+             	1. 是否压缩的标志 #name @compressionEnabled #type @bool [来自sparkConf]
+             	2. 压缩状态码@CompressionCodec 
+             + 获取快速合并相关参数
+             	1. 快速合并使能位fastMergeEnabled (sparkConf配置)
+             	2. 支持快速合并标记fastMergeIsSupported (@CompressionCodec中获取)
+             	3. 加密使能位@encryptionEnabled (块管理器@blockManager中获取)
+             + 创建map形式shuffle输出器 @mapWriter
+             + 根据之前状态位的不同，采取
+             	1. 转向式快速归并 [可以转换transferToEnabled=true但是不可加密encryptionEnabled=false]
+             		mergeSpillsWithTransferTo(spills, mapWriter)
+             	2. 文件流快速归并 
+             		mergeSpillsWithFileStream(spills, mapWriter, null)
+             	3. 慢速归并 [不支持快速归并,或者快速归并没有使能]
+             		mergeSpillsWithFileStream(spills, mapWriter, compressionCodec)
+             + 归并完成，提交所有分区@commitAllPartitions()
+             + 如果中途出现异常，mapWriter会弃读
+             
+             void mergeSpillsWithFileStream(SpillInfo[] spills,ShuffleMapOutputWriter mapWriter,
+         		 @Nullable CompressionCodec compressionCodec)
+    		功能: 文件流归并
+    		+ 获取分区器的分区数量
+    		+ 对每个数据块元数据@spills建立一个输入流
+    		+ 获取shuffle分区写出器@writer #type @ShufflePartitionWriter 由此建立分区输出流
+    		@partitionOutput #type @OutputStream，这个分区输出流首先需要携带上时间统计功能
+    		@TimeTrackingOutputStream,其次需要向块管理器@blockManager 中毒序列化管理器
+    		@serializerManager() 申请一层shuffle加密的操作。如果你指定了compressionCodec的话，还需要对分		区输出进行一次压缩。
+    		+ 对于每个数据块元数据@spills,获取分区的溢写数量@partitionLengthInSpill，如果这个数大于0，则要		获取长度为分区溢写数量@partitionLengthInSpill的输入流，并对文件进行读取。当然这里需要根据加密以			及是否压缩采取如同上述的操作步骤，将输入流读取到的内容拷贝到输出流中。参照#class @ByteStreams
+    		#method @copy
+    		+ 最后关闭分区输出流，使用@writer 统计写出的字节数,使用写出度量器@writeMetrics将值累加到内部累			加器中。
+    		+ 关闭输入流
+    		
+    		void mergeSpillsWithTransferTo(SpillInfo[] spills,ShuffleMapOutputWriter mapWriter)
+    		功能: 转向式快速归并
+    		与文件流式快速归并不同的是，这里使用的是文件通道，而不是分区输出流
+    		+ 对于任意一个数据块元数据@spill需要创建一个文件通道
+    		+ 对于每一个分区，获取分区写出器@write，创建输出流类型@WritableByteChannelWrapper #name 
+    		@resolvedChannel .将溢写输入流@spillInputChannel拷贝到@resolvedChannel的通道内，并移动
+    		@spillInputChannel通道指针@spillInputChannelPositions[i]+=溢写数partitionLengthInSpill
+    		+ 处理写度量器@writeMetrics时间增长问题(t(拷贝前)-t(拷贝后))
+    		+ 关闭写出通道,统计写出字节数，并更新到写出度量器@writeMetrics中
+    		+ 关闭溢写输入通道@spillInputChannels[i]
+    		
+    		Option<MapStatus> stop(boolean success)
+    		功能: 处理和分辨map侧正常运行完毕停止和异常停止的情况，上面有类似说明@
+    		
+    		static OutputStream openStreamUnchecked(ShufflePartitionWriter writer)
+    		功能：返回分区写出器@writer对应的输出流
+    }
+    ```
+    
+    #subclass @StreamFallbackChannelWrapper
+    
+    ```markdown
+    ADT StreamFallbackChannelWrapper{
+    	数据元素
+    		1. 可写字节通道 #name @channel #type @WritableByteChannel
+    	操作集
+    		1. 构造器
+    		StreamFallbackChannelWrapper(OutputStream fallbackStream)
+    		根据输入输出流初始化本类的字节通道@channel
+    		WritableByteChannel channel()
+    		返回可写字节通道@channel
+    		void close()
+    		关流
+    }
+    ```
+    
+    
 
 ---
 
