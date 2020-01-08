@@ -78,3 +78,363 @@
      ```
 
 2. spark-util-collection
+
+   + [TimSort](# TimSort)
+   + unsafe.sort
+     1.  [PrefixComparator](# PrefixComparator)
+     2.  [PrefixComparators](# PrefixComparators)
+     3.  [RadixSort](# RadixSort)
+     4.  [RecordComparator](# RecordComparator)
+     5.  [RecordPointerAndKeyPrefix](# RecordPointerAndKeyPrefix)
+     6.  [UnsafeExternalSorter](# UnsafeExternalSorter)
+     7.  [UnsafeInMemorySorter](# UnsafeInMemorySorter)
+     8.  [UnsafeSortDataFormat](# UnsafeSortDataFormat)
+     9.  [UnsafeSorterIterator](# UnsafeSorterIterator)
+     10.  [UnsafeSorterSpillMerger](# UnsafeSorterSpillMerger)
+     11.  [UnsafeSorterSpillReader](# UnsafeSorterSpillReader)
+     12.  [UnsafeSorterSpillWriter](# )
+
+   ---
+
+   #### **TimSort**
+
+   介绍:
+   	使用了安卓TimSort类,利用稳定的，合适的迭代的归并排序，具体请参照#method @`sort()`，在java中使用了原来的风格以便能够更加的贴近安卓源码，因此非常容易的去识别其正确性。这个类是私有的，使用简单的scala包装类对其进行包装#class @org.apache.spark.util.collection.Sorter ，这样就可以在spark中使用了。
+
+   ​	使用这个端口的目的是产生一个接口，这个接口需要接受输入数据，除此之外还接受简单的数组数据。例如，只添加型map(AppendOnlyMap)使用这个使用这个接口去对数组进行交替排序，形入key/value。这种生成方式使用了最小的开销。详情见@SortDataFormat
+
+   ​	允许key的重用，以防止创建了过多的key对象。
+
+   
+
+   
+
+   ```markdown
+   ADT TimSort{
+   	数据元素:
+   		1. 归并排序最小值 #name @MIN_MERGE=32 #type @int
+   		这个是归并排序的最小数据量大小，小于这个值就不会去归并。且这个值设计时需要为2的n次方。如果需要减		小这个值，你必须要在构造器中改变stackLen的计算方式。否则的话极有可能出现数组越界的异常。请参
+   		照listsort.txt,获取最小栈长度，使用这个值作为排序数组的长度以及最小归并的大小。
+   		2. 排序数据格式 #name @s #type @SortDataFormat<K,Buffer>
+       操作集:
+       	1. 构造器
+           TimSort(SortDataFormat<K, Buffer> sortDataFormat)
+           初始化排序数据格式@s
+           2. 操作类
+           void sort(Buffer a, int lo, int hi, Comparator<? super K> c)
+           功能: 使用稳定的合适的归并排序需要少于O(nlg n)次比较，相对于传统排序方式相比，当数据部分有序时执		行次数要低。
+           void binarySort(Buffer a, int lo, int hi, int start, Comparator<? super K> c)
+   	    功能: 排序指定数组的指定部分，使用二分插入排序(二叉查找树BST) 
+   	    	时间复杂度O(nlog n)
+   	    	数据移动量O(n^2)
+   	   int countRunAndMakeAscending(Buffer a, int lo, int hi, Comparator<? super K> c)
+   	   功能: 返回最长递增/递减序列长度
+          注意这里递增序列的判断标准为 a[i]<=a[i+1]
+          递减序列为 a[i]>a[i-1]
+          这里对递减序列做出严格定义的目的是当反转递减序列时不会违反稳定排序的要求。
+          void reverseRange(Buffer a, int lo, int hi)
+          功能: 区域反转
+          反转范围 lo - hi  --> hi - lo
+          
+          int minRunLength(int n)
+          功能: 返回运行时最小的合并长度
+          如果 n < MIN_MERGE 返回n
+          如果 n 为2的整数次方，返回MIN_MERGE/2
+          其他情况返回一个整数k，满足MIN_MERGE/2<=K<=MIN_MERGE,以便于n/k能够快速接近，确切来说是要小于在2		的整数次方的值。
+          
+          
+   }
+   ```
+
+   #### PrefixComparator
+
+   ```markdown
+   /*
+   	比较8个字节的前缀排序器，可以通过子类去实现它
+   */
+   ADT PrefixComparator{
+   	操作集:
+   		int compare(long prefix1, long prefix2)
+   		功能: 返回前缀1和前缀2的大小关系
+   }
+   ```
+
+   #### PrefixComparators 
+
+   ```markdown
+   // 本类提供了各类排序器
+   ADT PrefixComparators{
+   	数据元素:
+   	1. 串排序器 #name @STRING #type @UnsignedPrefixComparator
+   	2. 串降序排序器 #name @STRING_DESC #type @UnsignedPrefixComparatorDesc
+   	3. 串排序器(空串置后) #name @STRING_DESC #type @UnsignedPrefixComparatorDesc
+   	4. 串降序排序器(空串置首) #name @STRING_DESC_NULLS_FIRST 
+   		#type @UnsignedPrefixComparatorDescNullsFirst
+   	5. 二分排序器 #name @BINARY #type @UnsignedPrefixComparator
+   	6. 二分降序器 #name @BINARY_DESC #type @UnsignedPrefixComparatorDesc
+   	7. 二分排序器(空置尾) #name @BINARY_NULLS_LAST #type @UnsignedPrefixComparatorNullsLast
+   	8. 二分降序器(空置首) #nmae @BINARY_DESC_NULLS_FIRST 
+   		#type @UnsignedPrefixComparatorDescNullsFirst
+   	同类还有
+   	LONG
+   	LONG_DESC
+   	LONG_NULLS_LAST
+   	LONG_DESC_NULLS_FIRST
+   	DOUBLE
+   	DOUBLE_DESC
+   	DOUBLE_NULLS_LAST
+   	DOUBLE_DESC_NULLS_FIRST
+   	
+   	9. 串前缀比较器 #subclass @StringPrefixComparator
+   	10. 二分前缀比较器
+   	11. 双精度前缀比较器
+   	12. 基于RadixSortSupport实现的几个实现类
+   		UnsignedPrefixComparator
+   		UnsignedPrefixComparatorNullsLast
+   		UnsignedPrefixComparatorDescNullsFirst
+   		UnsignedPrefixComparatorDesc
+   		SignedPrefixComparator
+   		SignedPrefixComparatorNullsLast
+   		SignedPrefixComparatorDescNullsFirst
+   		SignedPrefixComparatorDesc
+   		每个子类都需要重写 sortDescending() sortSigned() nullsFirst()以及compare(b,a)方法
+   }
+   ```
+
+   #subclass @RadixSortSupport
+
+   ```markdown
+   // 支持基数排序的参数，比较器实现了这个也就说明其定义的比较器满足基数排序
+   ADT RadixSortSupport{
+   	操作集
+   	sortDescending()
+   	功能: 为true表示排序需要按照二分排序降序顺序排列
+   	sortSigned()
+   	功能: 为true时，排序时需要考虑标志位(正负号)
+   	nullsFirst()
+   	功能: 为true时表示，排序时将空元素至于序列首部，否则放在序列尾部
+   	
+   }
+   ```
+
+   #### RadixSort
+
+   #### RecordComparator
+
+   ```markdown
+   // 记录比较器 当整个参与sort的key值使用前缀比较器就可以排序完成的化，这个排序直接返回0即可
+   ADT RecordComparator{
+   	操作集:
+   	int compare(Object leftBaseObject,long leftBaseOffset,int leftBaseLength,
+       	Object rightBaseObject,long rightBaseOffset,int rightBaseLength)
+       功能: 获取页表数据中左右两条记录的大小关系，具体逻辑由子类完成
+   }
+   ```
+
+   #### RecordPointerAndKeyPrefix
+
+   ```markdown
+   ADT RecordPointerAndKeyPrefix{
+   	数据元素:
+   	1. 记录指针 #name @recordPointer 
+   		用于指向记录的指针，具体地址是如何加密的请参照任务内存管理器@TaskMemoryManager
+   	2. 关键字前缀 #name @keyPrefix
+   		关键字前缀，用于比较
+   }
+   ```
+
+   #### UnsafeExternalSorter
+
+   #### UnsafeInMemorySorter
+
+   #### UnsafeSortDataFormat
+
+   介绍:
+
+   ​		支持记录指针，关键字对的排序。用于内存排序器@UnsafeInMemorySorter。
+
+   在一个数组中2*i位置放置的是记录指针的值(地址)，2 * i +1位置放置的是8字节关键字信息。
+
+   ```markdown
+   ADT UnsafeSortDataFormat{
+   	数据元素:
+   	1. 长数组缓冲(8位宽) #name @buffer #type @LongArray
+   	操作集:
+   	1. 构造器
+   	UnsafeSortDataFormat(LongArray buffer)
+   	初始化长数组
+   	2. 查询获取类
+   	RecordPointerAndKeyPrefix getKey(LongArray data, int pos)
+   	不支持按位置查找功能[查找的意义改变了]，若是调用类则会抛出异常
+   	
+   	RecordPointerAndKeyPrefix newKey()
+   	功能: 新建一个关键字，使用@RecordPointerAndKeyPrefix默认构造器初始化
+   	
+   	RecordPointerAndKeyPrefix getKey(LongArray data, int pos,
+   		RecordPointerAndKeyPrefix reuse)
+   	功能: 设置记录指针/关键字键值对的值为pos*2 / pos*2+1
+   	返回记录指针/关键字对象
+   	
+   	void swap(LongArray data, int pos0, int pos1)
+   	功能: 交换长数组pos0,pos1位置记录指针/关键字键值对信息
+   	
+   	void copyElement(LongArray src, int srcPos, LongArray dst, int dstPos)
+   	功能: 拷贝srcPos到dstPos的记录指针/关键字键值对信息
+   	
+   	void copyRange(LongArray src, int srcPos, LongArray dst, int dstPos, int length)
+   	功能: 拷贝srcPos开始的length个数据到dstPos，由于数据量较大，需要使用内存拷贝的方式。
+   	LongArray allocate(int length)
+   	功能: 一个大小为length的长数组缓冲@LongArray
+   }
+   ```
+
+   #### UnsafeSorterIterator
+
+   ```markdown
+   ADT UnsafeSorterIterator{
+   	操作集:
+   	boolean hasNext()
+   	检查迭代是否还有其他元素
+   	void loadNext()
+   	装载下一个元素/记录
+   	Object getBaseObject()
+   	获取页表中的基本对象
+   	long getBaseOffset()
+   	获取页表中的基本偏移量[页内偏移地址]
+   	int getRecordLength()
+   	获取记录长度
+   	long getKeyPrefix()
+   	获取关键字前缀
+   	int getNumRecords()
+   	获取记录数量
+   }
+   ```
+
+   
+
+   #### UnsafeSorterSpillMerger
+
+   ```markdown
+   ADT UnsafeSorterSpillMerger{
+   	数据元素:
+   	1. 记录数量 @numRecords=0
+   	2. 排序迭代器优先队列 #name @priorityQueue #type @PriorityQueue<UnsafeSorterIterator>
+   	操作集:
+   	1. 构造器
+   	  UnsafeSorterSpillMerger(RecordComparator recordComparator,
+   	  	PrefixComparator prefixComparator,int numSpills)
+   	  初始化获得记录比较器
+   	  	优先返回前缀比较器的比较值，相等时返回记录比较器的值
+   	  将获得的比较器形成排序器迭代器，并将其置入优先队列中。
+   	2. 操作类
+   	void addSpillIfNotEmpty(UnsafeSorterIterator spillReader)
+   	功能: 将排序器迭代器放入优先队列中
+   	如果迭代器中还有数据，则将数据置入到优先队列@priorityQueue，更新记录数量
+   	@numRecords+=spillReader.getNumRecords()
+   	
+   	UnsafeSorterIterator getSortedIterator()
+   	功能: 获取迭代器排序器
+   	使用匿名内部类实现@UnsafeSorterIterator,实现时
+   		getNumRecords()=numRecords
+   		hasNext() = isEmpty(priortyQueue)
+   		loadNext()={priortyQueue.push()}
+   		Object getBaseObject()=spillReader.getBaseObject()
+   		int getBaseOffset = spillReader.getBaseOffset()
+   		int getRecordLength()  =  spillReader.getRecordLength()
+   		long getKeyPrefix()  =  spillReader.getKeyPrefix()
+   }
+   ```
+
+   #### UnsafeSorterSpillReader
+
+   ```markdown
+   // 读取由@UnsafeSorterSpillWriter 写出的溢出文件
+   ADT UnsafeSorterSpillReader{
+   	数据元素:
+   	1. 最大缓冲字节数@MAX_BUFFER_SIZE_BYTES=16777216
+   	2. 输入流 #name @in #type @InputStream
+   	3. 数据输入流 #name @din #type @DataInputStream
+   	4. 记录长度 #name @recordLength #type @int
+   	5. 关键字前缀 #name @keyPrefix #type @long
+   	6. 记录数量 #name @numRecords #type @int
+   	7. 剩余记录数量 #name @numRecordsRemaining #type @int
+   	8. 字节数组 #name @arr #type @byte[1024*1024] 
+   	9. 基本对象 #name @baseObject=arr #type @Object
+   	10. 任务上下文 #name @taskContext #type @TaskContext
+   	操作集:
+   	1. 构造器
+   	UnsafeSorterSpillReader(SerializerManager serializerManager,File file,BlockId blockId)
+   	功能: 初始化
+   	+ 输入流@in=@NioBufferedFileInputStream(file,buff_size)
+   	  如果spark env中配置了预读状态位@UNSAFE_SORTER_SPILL_READ_AHEAD_ENABLED()则采用
+   	  @ReadAheadInputStream配置输入流，读取速度会更快
+   	  高级流@din=DataInputStream(in)
+   	2. 查询获取类
+   	int getNumRecords()
+   	功能: 获取记录长度
+   	boolean hasNext()
+   	功能: 检查是否还有剩余数据（@numRecordsRemaining>0）
+   	Object getBaseObject()
+   	功能: 获取基本对象
+   	long getBaseOffset()
+   	功能: 获取基本偏移量(页内偏移量)=Platform.BYTE_ARRAY_OFFSET
+   	int getRecordLength()
+   	功能: 获取记录长度@recordLength
+   	getKeyPrefix()
+   	功能: 获取关键字前缀
+   	void close()
+   	功能: 关闭输入流
+   	3. 操作类
+   	void loadNext()
+   	功能: 读入记录长度@recordLength，关键字前缀@keyPrefix，基本对象@baseObject=arr(arr长度为
+   	@recordLength)，并更新剩余记录@numRecordsRemaining，没有剩余数据时关流。
+   	注: 如果任务被标记为killed时，需要使用任务上下文管理器@taskContext 删除中断任务 #method 
+   	@killTaskIfInterrupted()
+   }
+   ```
+
+   #### UnsafeSorterSpillWriter
+
+   ```markdown
+   // 溢写排序的记录到磁盘，溢写文件遵循如下格式
+   // 记录数量 + [长度,前缀(long),数据(字节)]
+   ADT UnsafeSorterSpillWriter{
+   	数据元素: 
+   	1. 应用程序配置集 	#name @conf #type @SparkConf
+   	2. 磁盘写缓冲大小 #name @diskWriteBufferSize #type @int 值从conf中获取
+   	3. 写缓冲 #name @writeBuffer #type @byte[] size=diskWriteBufferSize
+   	4. 文件对象 #name @file #type @File
+   	5. 磁盘块写出器 #name @writer #type @DiskBlockObjectWriter
+   	6. 块编号 #name @blockId #type @BlockId
+   	7. 需要写入的记录数量#name @numRecordsToWrite #type @int
+   	8. 溢写记录数量 #name @numRecordsSpilled #type @int
+   	操作集:
+   	1. 构造器
+   	UnsafeSorterSpillWriter(BlockManager blockManager,int fileBufferSize,
+         	ShuffleWriteMetrics writeMetrics,int numRecordsToWrite)
+   	功能: 初始化文件对象@file，块编号@blockId，需要写入的记录数量@numRecordsToWrite
+   		磁盘写出器@writer[这里需要使用伪序列化器@DummySerializerInstance]
+   		并将缓冲数据写出
+   	2. 查找获取类
+   	public File getFile()
+   	功能: 获取文件对象
+   	int recordsSpilled()
+   	功能: 获取溢写记录数量
+   	UnsafeSorterSpillReader getReader(SerializerManager serializerManager)
+   	功能: 获取溢写器对应的阅读器
+   	3. 操作类
+   	void close()
+   	功能: 关流
+   	void writeLongToBuffer(long v, int offset)
+   	功能: 将long型数据写入到buffer(8个bit)
+   	void writeIntToBuffer(int v, int offset)
+   	功能: 将int型数据写入到buffer(4个bit)
+   	void write(Object baseObject,long baseOffset,int recordLength,long keyPrefix)
+   	功能: 写出记录对象
+   	
+   }
+   ```
+
+   
+
+   
