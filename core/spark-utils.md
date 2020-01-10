@@ -105,14 +105,10 @@
 
    ​	允许key的重用，以防止创建了过多的key对象。
 
-   
-
-   
-
    ```markdown
-   ADT TimSort{
+ADT TimSort{
    	数据元素:
-   		1. 归并排序最小值 #name @MIN_MERGE=32 #type @int
+		1. 归并排序最小值 #name @MIN_MERGE=32 #type @int
    		这个是归并排序的最小数据量大小，小于这个值就不会去归并。且这个值设计时需要为2的n次方。如果需要减		小这个值，你必须要在构造器中改变stackLen的计算方式。否则的话极有可能出现数组越界的异常。请参
    		照listsort.txt,获取最小栈长度，使用这个值作为排序数组的长度以及最小归并的大小。
    		2. 排序数据格式 #name @s #type @SortDataFormat<K,Buffer>
@@ -141,32 +137,30 @@
           如果 n < MIN_MERGE 返回n
           如果 n 为2的整数次方，返回MIN_MERGE/2
           其他情况返回一个整数k，满足MIN_MERGE/2<=K<=MIN_MERGE,以便于n/k能够快速接近，确切来说是要小于在2		的整数次方的值。
-          
-          
    }
    ```
-
+   
    #### PrefixComparator
-
+   
    ```markdown
    /*
    	比较8个字节的前缀排序器，可以通过子类去实现它
-   */
+*/
    ADT PrefixComparator{
-   	操作集:
+	操作集:
    		int compare(long prefix1, long prefix2)
    		功能: 返回前缀1和前缀2的大小关系
    }
    ```
-
+   
    #### PrefixComparators 
-
+   
    ```markdown
    // 本类提供了各类排序器
    ADT PrefixComparators{
-   	数据元素:
+	数据元素:
    	1. 串排序器 #name @STRING #type @UnsignedPrefixComparator
-   	2. 串降序排序器 #name @STRING_DESC #type @UnsignedPrefixComparatorDesc
+	2. 串降序排序器 #name @STRING_DESC #type @UnsignedPrefixComparatorDesc
    	3. 串排序器(空串置后) #name @STRING_DESC #type @UnsignedPrefixComparatorDesc
    	4. 串降序排序器(空串置首) #name @STRING_DESC_NULLS_FIRST 
    		#type @UnsignedPrefixComparatorDescNullsFirst
@@ -200,15 +194,15 @@
    		每个子类都需要重写 sortDescending() sortSigned() nullsFirst()以及compare(b,a)方法
    }
    ```
-
+   
    #subclass @RadixSortSupport
-
+   
    ```markdown
    // 支持基数排序的参数，比较器实现了这个也就说明其定义的比较器满足基数排序
    ADT RadixSortSupport{
-   	操作集
+	操作集
    	sortDescending()
-   	功能: 为true表示排序需要按照二分排序降序顺序排列
+	功能: 为true表示排序需要按照二分排序降序顺序排列
    	sortSigned()
    	功能: 为true时，排序时需要考虑标志位(正负号)
    	nullsFirst()
@@ -216,17 +210,17 @@
    	
    }
    ```
-
+   
    #### RadixSort
-
+   
    ```markdown
-	int sort(LongArray array, long numRecords, int startByteIndex, int endByteIndex,
+   int sort(LongArray array, long numRecords, int startByteIndex, int endByteIndex,
          	boolean desc, boolean signed)
-        功能介绍:
+     功能介绍:
         	对给定的long型数组进行最小关键数字的基数排序。这个规定了你需要在数组之后有足够的空间，这个空间的大		小至少要等于记录数量。这个排序时毁灭性的且可能导致数组中数据的重新定位。
-        输出参数:
+     输出参数:
         	@array long型元素的数组，且根据规定其中需要有足够多的空槽
-        	@numRecords 数组中的记录数量
+	     	@numRecords 数组中的记录数量
         	@startByteIndex 从最小关键字节数起来的第一个
         	@endByteIndex 从最小关键字节数起来的最后一个，必须要大于@startByteIndex
         	@desc 是否降序(二分排序)
@@ -392,10 +386,263 @@
    		用于指向记录的指针，具体地址是如何加密的请参照任务内存管理器@TaskMemoryManager
    	2. 关键字前缀 #name @keyPrefix
    		关键字前缀，用于比较
-}
+   }
    ```
-
+   
    #### UnsafeExternalSorter
+   
+   ```markdown
+// 外部排序器基于内部排序器#class @UnsafeInMemorySorter
+   ADT UnsafeExternalSorter { father -> #class @MemoryConsumer
+	数据元素:
+   	1. 日志处理器 #name @logger #type @Logger 
+   	2. 前缀比较器 #name @prefixComparator #type @PrefixComparator
+   	3. 记录比较器提供者 #name @recordComparatorSupplier #type @Supplier<RecordComparator>
+   		RecordComparator保存的可能是上一次比较的结果，所以在外部比较器@UnsafeExternalSorter，不能去保	存@RecordComparator实例,原因是@UnsafeExternalSorter被任务上下文管理器@TaskContext所引用，因此直到	 task结束之前，是不能够被垃圾回收的。故而需要辅助内存去存储这个信息。
+   	4. 任务内存管理器 #name @taskMemoryManager #type @TaskMemoryManager
+   	5. 块管理器 #name @blockManager #type @BlockManager
+   	6. 序列化管理器 #name @serializerManager #type @SerializerManager
+   	7. 任务上下文管理器 #name @taskContext #type @TaskContext
+   	8. 文件缓冲字节数 #name @fileBufferSizeBytes #type @int
+   		写溢出文件所使用的缓冲大小(字节)
+   	9. 溢写容量 #name @numElementsForSpillThreshold #type @int
+   	10. 已分配页/内存块列表 #name @allocatedPages #type @LinkedList<MemoryBlock>
+   	11. 溢写写出器列表 #name @spillWriters #type @LinkedList<UnsafeSorterSpillWriter>
+   	12. 内存排序器 #name @inMemSorter #type @UnsafeInMemorySorter volatile 溢写后重置
+   	13. 当前页/内存块 #name @currentPage=null #type @MemoryBlock 溢写后重置
+   	14. 页指针 #name @pageCursor=-1 溢写后重置
+   	15. 峰值内存使用量 #name @peakMemoryUsedBytes=0 溢写后重置
+   	16. 溢写字节数 #name @totalSpillBytes=0 溢写后重置
+   	17. 总排序时间 #name @totalSortTimeNanos=0 
+   	18. 读取迭代器 #type @readingIterator=null #type @volatile SpillableIterator
+   	操作集:
+   	1. 静态方法
+   	static UnsafeExternalSorter createWithExistingInMemorySorter(
+         TaskMemoryManager taskMemoryManager,BlockManager blockManager,
+         SerializerManager serializerManager,TaskContext taskContext,
+         Supplier<RecordComparator> recordComparatorSupplier,
+         PrefixComparator prefixComparator,int initialSize,long pageSizeBytes,
+         int numElementsForSpillThreshold,UnsafeInMemorySorter inMemorySorter)
+   	功能: 在内存排序器存在的情况下创建外部排序器
+   	+ 根据外部排序器构造器初始化外部排序器@sorter [需要指定内部排序器，且不支持基数排序]
+   	+ 将内部排序器的所有内容溢写出来@sorter #method @spill
+   	+ 将内部排序器置空
+   	返回 创建的外部排序器
+   	static UnsafeExternalSorter create(
+         TaskMemoryManager taskMemoryManager,BlockManager blockManager,
+         SerializerManager serializerManager,TaskContext taskContext,
+         Supplier<RecordComparator> recordComparatorSupplier,PrefixComparator prefixComparator,
+         int initialSize,long pageSizeBytes,
+         int numElementsForSpillThreshold,boolean canUseRadixSort)
+		返回 有给定参数创建的外部排序器,具体参照#constructor@UnsafeExternalSorter,需要指定内部排序器为null
+   	2. 构造器 [私有]
+		private UnsafeExternalSorter(TaskMemoryManager taskMemoryManager,
+         BlockManager blockManager,SerializerManager serializerManager,
+         TaskContext taskContext,Supplier<RecordComparator> recordComparatorSupplier,
+         PrefixComparator prefixComparator,int initialSize,
+         long pageSizeBytes,int numElementsForSpillThreshold,
+         @Nullable UnsafeInMemorySorter existingInMemorySorter,boolean canUseRadixSort)
+   	功能:
+   		初始化任务内存管理器@taskMemoryManager，块管理器@blockManager
+   		序列化管理器@serializerManager,上下文管理器@taskContext
+   		记录比较器提供者@recordComparatorSupplier,前缀比较器@prefixComparator为指定
+   		初始化文件缓冲字节数 @fileBufferSizeBytes=32*1024
+   		初始化内存排序器@inMemSorter
+   		初始化峰值内存使用量@peakMemoryUsedBytes,溢出容量@numElementsForSpillThreshold
+   		任务上下文注册清除任务，用于确保任务结束内存会被释放
+   			taskContext.addTaskCompletionListener(context -> {cleanupResources();})
+   	3. 查询获取类
+   	long getMemoryUsage()
+   	功能: 获取内存使用量(排序器使用的)
+   	val=内存排序器内存使用量+ 外存所分配页表的总长度
+   		= inMemSorter.getMemoryUsage())+ sigma(allocatedPages,page.size())
+   	long getPeakMemoryUsedBytes()
+   	功能: 获取到执行该命令前的内存峰值使用量
+   	long getSortTimeNanos()
+   	功能: 获取排序时间@totalSortTimeNanos
+   	long getSpillSize()
+   	功能: 获取溢写字节总数@totalSpillBytes
+   	int getNumberOfAllocatedPages()
+   	功能: 获取已分配页/内存块的数量@allocatedPages.size()
+   	UnsafeSorterIterator getIterator(int startIndex) 
+   	功能: 获取从startIndex开始的排序迭代器，当然消费完迭代器数据之后，需要有调用者自己清空数据，通过:
+   		cleanupResources()
+   	+ 溢写写出器列表@spillWriters为空，直接返回内存排序器@inMemSorter所对应的迭代器。
+   	+ 溢写写出器列表非空，返回一个链式迭代器#class @ChainedIterator，这个链式迭代器中的元素由列表中溢写	  写出器所对应的迭代器链表。
+   	
+   	4. 操作类
+   	void moveOver(UnsafeSorterIterator iter, int steps)
+   	功能: 将迭代器的位置指针@pos向后移动steps个位置。如果不能够移动到，则会抛出异常。
+   	
+   	void updatePeakMemoryUsed()
+   	功能: 更新峰值使用量
+   	peakMemoryUsedBytes=getMemoryUsage()
+   	
+   	long freeMemory() 
+   	功能: 释放所有已分配内存块的内存，重置已分配页表@allocatedPages，当前页@currentPage，页指针
+   	@pageCursor，并返回释放的内存量
+   	
+   	void deleteSpillFiles()
+   	功能： 删除排序器创建的溢写文件
+   	+ 获取溢写写出器列表中写出器对应的溢写文件#method @getFile(),并删除其指示的文件
+   	删除失败则会以日志的形式提示
+   	
+   	void cleanupResources()
+   	功能: 清除排序器的内存部分数据结构，且删除所有的溢写文件
+   	
+   	void growPointerArrayIfNecessary()
+   	功能: 扩展指针数组
+   	操作条件: 内部排序器存在
+   	操作逻辑:
+   	1. 当内部排序器不存在下一条记录(下一条@pos指出了范围外)
+   		检查是否出现溢写
+   			出现溢写则直接溢写，并结束
+   		检查是否出现@SparkOutOfMemoryError
+   			出现则打出error级别日志，并结束
+   	2. 内部排序器可以容纳下一条记
+       	 释放长数组#name @array #class @LongArray
+          不可容纳下一条记录，且未触发溢写和@SparkOutOfMemoryError
+          	 将内部排序器扩展到新数组@array(长度=inMemSorter.getMemoryUsage()/8*2)
+          	 
+       void acquireNewPageIfNecessary(int required)
+   	功能: 分配更多的内存用于插入更多的记录,它会向内存管理器申请更多的内存空间。如果申请的内存空间无法获得	则会触发溢写。
+   	输出参数: required: 数据页所需要的内存空间(单位:字节数)
+   	页表新增内存块条件:
+   		当前页不存在@currentPage=null 或者 给定的required使得页指针@pagecursor超出当前页范围，即:
+   			pageCursor + required > currentPage.getBaseOffset() + currentPage.size()
+   		需要采取的措施	
+   			新增一个长度为required的内存块，将页指针@pagecursor指向当前页的开头@getBaseOffset()
+   			并将新增的内存块加入到页表@allocatedPages中
+   
+   	void insertRecord(Object recordBase, long recordOffset, int length, 
+   		long prefix, boolean prefixIsNull)
+   	功能: 插入一条记录到排序器中
+   	操作条件: 内部排序器@inMemSorter存在
+   	操作逻辑:
+   		1. 内存排序器中的记录数量大于等于溢出容量@numElementsForSpillThreshold
+   			对内存排序器中的记录进行溢写
+   		2. 检查指针数组@array是否需要扩充@growPointerArrayIfNecessary()并进行相关操作
+   		3. 计算可能需要新开辟的内存块大小required=记录长度length+操作系统偏移量uaoSize
+   		4. 获取新的基本对象@base指向新开辟的内存块,并通过任务内存管理器@taskMemoryManager
+   		#method @encodePageNumberAndOffset计算其地址@recordAddress 
+   		5. 将需要插入的基本对象@recordBase 使用内存拷贝复制到@base处。
+   		6. 使用内存排序器@inMemSorter 在记录地址@recordAddress处插入记录，并根据给定指示是否有前缀关键		字信息
+   	void insertKVRecord(Object keyBase, long keyOffset, int keyLen,
+         	Object valueBase, long valueOffset, int valueLen, long prefix, boolean prefixIsNull)
+   	功能: 向排序器中插入kv键值对记录
+   		记录格式:
+   			record length (4 Bytes) + key length(4 Bytes):key data +value data
+        操作逻辑:
+        	计算需要开辟的内存块大小required=keyLen + valueLen + (2 * uaoSize)
+        		这里需要统计两次操作系统偏移量uao_size 
+        	使用内存拷贝的方式将k/v的数据拷贝到base地址处，由于kv是相邻的，所有需要注意@pageCursor的位置，注	  意这个2个操作系统偏移量分配在开头，然后是keyLen最后是valueLen
+   		最后使用内部排序器插入记录，注意是否指定了带有前缀关键字的排序。	
+   	
+       void merge(UnsafeExternalSorter other)
+       功能: other排序器合并到本排序器，其他排序器置空
+       操作逻辑:
+       	1. other先将自己内存排序器中内容溢写出来
+   		2. 将other溢写器列表@spillWriters 整体迁移到本类溢写器列表中@spillWriters
+   		3. 清空other的溢写器列表@spillWriters，且清空其资源#method @cleanupResources()
+   	
+   	static void spillIterator(UnsafeSorterIterator inMemIterator,
+         UnsafeSorterSpillWriter spillWriter)
+         功能: 迭代溢写
+         将内存迭代器@inMemIterator中的所有元素进行溢写
+        
+        long spill(long size, MemoryConsumer trigger)
+        功能: 排序溢写，并返回溢写数量
+        操作条件:
+       	必须是本类触发，且内存排序器存在记录数量大于0，否则全部返回0
+        操作逻辑:
+       	1. 创建一个新的溢写写出器@spillWriter，并将其添加到溢写列表中@spillWriters
+       	2. 使用迭代溢写的方式对内存排序器中的迭代器进行溢写@spillIterator
+       	3. 统计溢写量=freeMemory()
+       	4. 溢写完毕重置内部排序器@reset()
+       	5. 任务上下文管理器使用任务度量器@taskMetrics()对溢写内存量与磁盘溢写量进行统计。
+       	更新溢写总量@totalSpillBytes
+   }
+   ```
+   
+   #subclass @SpillableIterator
+   
+   ```markdown
+   // 支持溢写的排序迭代器@UnsafeSorterIterator
+   ADT SpillableIterator{
+   	数据元素:
+   	1. 上游排序迭代器@upstream #type @UnsafeSorterIterator
+   	2. 下一个上游排序迭代器@nextUpstream=null #type @UnsafeSorterIterator
+   	3. 上一页/内存块@lastPage=null #type @MemoryBlock
+   	4. 是否加载@loaded=false #type @boolean
+   	5. 记录数量@numRecords=0
+   	操作集:
+   	SpillableIterator(UnsafeSorterIterator inMemIterator)
+   	功能:通过指定的内部比较器，初始化上游排序迭代器@upstream以及记录数量@numRecords
+   	int getNumRecords() 
+   	功能: 获取记录数量@numRecords
+   	
+   	boolean hasNext()
+   	功能:确定是否有下一条数据
+   	val=numRecords > 0
+   	
+   	Object getBaseObject()
+   	功能: 获取基本对象
+   	val= upstream.getBaseObject()
+   	
+   	long getBaseOffset()
+   	功能: 获取页内偏移量
+   	val= upstream.getBaseOffset()
+   	
+   	int getRecordLength()	
+   	功能: 获取记录数量
+   	val= upstream.getRecordLength()
+   	
+   	long getKeyPrefix()
+   	功能: 获取前缀关键字
+   	val= upstream.getKeyPrefix()
+   	
+   	void loadNext()
+   	加载下一条记录
+   	
+   	long spill()
+   	功能: 溢写
+   	溢写的工作涉及到读者-写者问题，所以需要设置互斥量，因此需要同步的工作
+   	使用迭代溢写@spillIterator的方式对内存迭代器中的内容进行溢写
+   	溢写完毕,释放内存排序器中的内容,将其置null
+   }
+   ```
+   
+   #subclass @ChainedIterator
+   
+   ```markdown
+   ADT ChainedIterator{
+   	数据元素:
+   	1. 排序迭代器队列@iterators #type @Queue<UnsafeSorterIterator>
+   	2. 当前排序迭代器@current #type @UnsafeSorterIterator
+   	3. 记录数@numRecords #type @int
+   	操作集:
+   	ChainedIterator(Queue<UnsafeSorterIterator> iterators)
+   	功能: 
+   		初始化记录数@numRecords=sigma(iterators.size)
+   		初始化当前迭代器@current为队列头部，并移除队列头部
+   	int getNumRecords()
+   	功能: 获取记录数量@numRecords
+   	boolean hasNext() 
+   	功能: 检查是否还有下一个迭代器
+   	Object getBaseObject()
+   	功能: 获取基本对象
+   	long getBaseOffset()
+   	功能: 获取页内偏移量
+   	int getRecordLength()
+   	功能: 获取记录长度
+   	long getKeyPrefix()
+   	功能: 获取关键字前缀
+   	void loadNext()
+   	功能: 加载迭代器下一个指针记录
+   }
+   ```
+   
+   
    
    #### UnsafeInMemorySorter
    
@@ -429,14 +676,14 @@
        	final RecordComparator recordComparator,final PrefixComparator prefixComparator,
        	int initialSize,boolean canUseRadixSort)
    	功能: initialSize=consumer.allocateArray(initialSize * 2L) 回调上一个构造器
-   	
+   		
    	2. 查询获取类
    	int getUsableCapacity()
    	功能: 获取可用容量
    	val= (int) (array.size() / (radixSortSupport != null ? 2 : 1.5))
-	分别是基数排序/Timsort的实际可用容量
+   分别是基数排序/Timsort的实际可用容量
    	int numRecords()
-	功能: 获取记录数量
+   功能: 获取记录数量
    	val=排序缓冲插入记录指针@pos/2
    	long getSortTimeNanos()
    	功能: 获取排序时间(ns)
@@ -576,10 +823,6 @@
           val= #class @RecordComparator #method @compare
    }
    ```
-   
-   
-   
-   
    
    #### UnsafeSortDataFormat
    
