@@ -245,9 +245,126 @@ private[spark] class TorrentBroadcast [T: ClassTag] (obj: T, id: Long){
      			@StorageLevel=MEMORY_AND_DISK
      			(存储广播变量到驱动器,以便于任务运行于驱动器,不需要创建广播变量值的副本)
      		3. 如果需要校验码@checksumEnabled,则计算校验码@checksums(缓冲)
-     		4. 
+     		4. 使用@blockifyObject()将对象切分成多个块(Array[ByteBuffer]),对每个块的内容进行zip压缩,参照
+     		#class @IndexedSeqOptimized #method @zipWithIndex 对块对象组@blocks中的每一个元素#type 
+     		@ByteBuffer进行:
+     			1. 计算该块@block(ByteBuffer)的校验码并存入到对应的位置checksum[i]
+     			2. 使用#class @BlockId计算块编号@pieceId
+     			3. 计算当前块对应的块字节数组@ChunkedByteBuffer 为bytes
+     			4. 将计算的bytes内容写入到块管理器中@blockManager,存储等级为MEMORY_AND_DISK_SER
+     				存储失败则抛出异常@SparkException
+     	
+     	def readBlocks(): Array[BlockData]
+     	功能: 从驱动器/其他执行器中获取流式块信息 #type Array[BlockData]
+     	注意: 所有数据块(chunk),注意这些块存储在@BlockManager中,且汇报给驱动器,所以其他执行器也可以从这里拉			取数据块.
+     	操作逻辑:
+     		0. 新建一个数据块数组Array[BlockData] 维度为numBlocks @blocks 用于放置读取数据块信息
+     		1. 首先需要将块编号0-->numblocks 使用#class @Random #method @shuffle随机打乱顺序,详情参照
+     		@shuffle,形成一个新的块编号序列(pids)
+     		2. 对这个序列中的每一个元素pid进行如下计算
+     			1. 获取广播变量块编号@pieceId=BroadcastBlockId(id, "piece" + pid)
+     			对于这里块管理器是否能在本地节点获取编号为pieceId的数据块(使用@getLocalBytes)分成如下
+     			两种情况:
+     				1. 能够获取到
+     					+ 首先获取数据时,读取pieceId时操作是互斥的,所以@getLocalBytes内部即加上了锁
+     					+ 读取到的数据卡写入到对应的数据块数组对应位置@blocks[pieceId]=block
+     					+ 释放块管理器的读取锁@releaseBlockManagerLock(pieceId) 
+     				2. 获取不到	
+     					+ 从远端获取块信息@getRemoteBytes(驱动器/其他执行器) 相同参照#class
+                        @BlockManager #type Option[ChunkedByteBuffer]
+     						- 获取成功
+     							获取块字节缓冲@ChunkedByteBuffer的第一个元素,并对其计算校验码
+     							@calcChecksum如果当前块编号@pid与之校验码相同,则对其进行写入操作.
+     						- 获取失败
+     							抛出异常@SparkException
+     	
+     	protected def doUnpersist(blocking: Boolean): Unit
+     	功能: 解除持久化操作 (仅在执行器上)
+     	输入参数: blocking 是否阻塞进行
+     		@TorrentBroadcast.unpersist(id, removeFromDriver = false, blocking)
+     	
+     	protected def doDestroy(blocking: Boolean): Unit
+     	功能: 解除持久化的状态(驱动器+执行器)
+     		@TorrentBroadcast.unpersist(id, removeFromDriver = true, blocking)
+     		
+     	def writeObject(out: ObjectOutputStream): Unit
+     	功能: JVM在序列化对象时使用
+     	操作条件: 广播变量可以使用 @assertValid()
+     		使用底层输出流写出对象,出现IO异常则抛出
+     		
+     	def readBroadcastBlock(): T 
+		功能: 读取广播变量数据块
+		1. 获取互斥资源块编号@broadcastId
+			由于只对@blockId做了锁操作,所以无论何时使用@broadcastCache,只需要获取@blockId即可
+			获取广播变量缓存:
+				val broadcastCache = SparkEnv.get.broadcastManager.cachedValues
+		2. 获取广播变量缓存中指定广播变量编号@broadcastId 对应的广播变量
+			Option(broadcastCache.get(broadcastId)).map(_.asInstanceOf[T])
+		3. 获取块管理器,使用块管理器对指定内容进行读取,这里根据是否能在本地执行器获取数据块分为两种情况:
+			1. 本地执行器获取到数据块
+				读取本地执行器@broadcastId #type @BlockResult中迭代器中对应的数据域值
+					blockResult.data.hasNext==true
+					x= blockResult.data.next().asInstanceOf[T]
+				释放当前@broadcastId 对应的块管理器锁#method @releaseBlockManagerLock
+				将@blockId,x键值对写入广播变量缓存器@broadcastCache中.
+				返回这个x即可	
+			2. 本地执行器没有对应数据块
+				1. 通过#method @readBlocks()将数据从驱动器/其他执行器读取到本地执行器中
+				2. 通过#method @unBlockifyObject() 将数据块还原成对象@T 
+				3. 将数据以MEMORY_AND_DISK的存储级别存储到块管理器中,存储失败抛出异常@SparkException
+				4. 在广播变量缓存中写入@broadcastId和obj键值对
+		4. 全部工作完成后
+			块数据@BlockData需要调用@dispose()取处理数据块
+		
+		def releaseBlockManagerLock(blockId: BlockId): Unit
+		功能: 释放块管理器的锁
+			运行任务的时候,注册已经分配好的块锁,根据任务的完成去释放锁.因此一旦任务不允许应当立即释放锁.
+		向任务上下文管理器中添加释放锁的监听事件:
+			taskContext.addTaskCompletionListener[Unit](_ => blockManager.releaseLock(blockId))
 }
 ```
+```markdown
+private object TorrentBroadcast{
+	关系: father->Logging
+    属性:
+    	#name @torrentBroadcastLock #type KeyLock[BroadcastBlockId] 流式广播变量锁
+    操作集:
+    def blockifyObject[T: ClassTag](obj: T,blockSize: Int,serializer: Serializer,
+      compressionCodec: Option[CompressionCodec]):  Array[ByteBuffer]
+	功能: 切分指定对象@obj
+		1. 获取定长块状字节数组: @ChunkedByteBufferOutputStream(blockSize, ByteBuffer.allocate)=cbbo
+		2. 获取压缩后的输出流@out
+			out=compressionCodec.map(c => c.compressedOutputStream(cbbos)).getOrElse(cbbos)
+		3. 获取序列化实例
+			@ser=serializer.newInstance()
+		4. 获取序列化输出流
+			@serout=ser.serializeStream(out)
+		5. 使用压缩且序列化的流@serOut写出对象@obj
+	返回 块状数组的数组对象(Array[ByteBuffer]) cbbos.toChunkedByteBuffer.getChunks()
+	
+	def unBlockifyObject[T: ClassTag](blocks: Array[InputStream],serializer: Serializer,
+      	compressionCodec: Option[CompressionCodec]): T 
+	功能: 对象还原
+	操作条件: 给定输入流列表@blocks非空 [scala中不使用assert关键字进行条件过滤,使用#class @predef 
+    #method @require]
+    操作步骤:
+    	1. 形成输入流列表@blocks的序列化输入流@SequenceInputStream结果几位is
+        2. 对is进行压缩,获得输入流@in
+        3. 获取序列化实例 @ser
+        4. 获取反序列化器@serIn
+        5. 使用反序列化器读入数据到obj中
+        返回 obj
+       
+   	def unpersist(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit
+   	功能: 解除持久化
+   	输入参数: 
+   		id	广播变量唯一标识符
+   		removeFromDriver 驱动器移除标志 为true则会从驱动器上移除
+   		blocking 是否阻塞执行
+}
+```
+
+
 
 ---
 
@@ -288,23 +405,15 @@ private[spark] class TorrentBroadcastFactory{
 #### scala基础拓展
 
 1. 抽象类
-
 2. 继承与混合
-
 3. 特征
-
 4. 注解@volatile @transient
-
 5. scala变量的命名方式
-
-6.  权限修饰符
-
+6. 权限修饰符
 7. 模式匹配
-
 8. java synchronizedMap(线程安全的map)
-
 9. 科普: 比特流
-
 10.  Adler-32编码 (java.util.zip.Adler32)
+11.  class 与 object
 
-    
+​    
