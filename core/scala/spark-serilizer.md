@@ -166,8 +166,6 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
 }
 ```
 
-
-
 ```markdown
 private object JavaDeserializationStream{
 	属性: 
@@ -226,41 +224,34 @@ private[spark] class JavaSerializerInstance(counterReset: Int, extraDebugInfo: B
 	操作集:
 	def serialize[T: ClassTag](t: T): ByteBuffer 
 	功能: 将输入T序列化称为@ByteBuffer
-	```scala
 		val bos = new ByteBufferOutputStream()
     	val out = serializeStream(bos)
     	out.writeObject(t)
     	out.close()
     	bos.toByteBuffer
-	```
-	
-	def deserialize[T: ClassTag](bytes: ByteBuffer): T 
-	功能: 将@ByteBuffer反序列化为T
-	```scala
-	    val bis = new ByteBufferInputStream(bytes)
-    	val in = deserializeStream(bis)
-    	in.readObject()
-	```
-	
-	def deserialize[T: ClassTag](bytes: ByteBuffer, loader: ClassLoader): T
-	功能: 指定类加载器，对输入进行反序列化
-	```scala
-		val bis = new ByteBufferInputStream(bytes)
-    	val in = deserializeStream(bis, loader)
-    	in.readObject()
-	```
-	
-	def serializeStream(s: OutputStream): SerializationStream 
-	功能: 对输入的输出流进行序列化，形成序列化流@SerializationStream
-		val=new JavaSerializationStream(s, counterReset, extraDebugInfo)
-	
-	def deserializeStream(s: InputStream): DeserializationStream
-	功能: 对输入的输入流进行反序列化
-		val=new JavaDeserializationStream(s, defaultClassLoader)
-	
-	def deserializeStream(s: InputStream, loader: ClassLoader): DeserializationStream 
-	功能: 指定类加载器，反序列化输入流
-		val= new JavaDeserializationStream(s, loader)
+    	def deserialize[T: ClassTag](bytes: ByteBuffer): T 
+    功能: 将@ByteBuffer反序列化为T
+        val bis = new ByteBufferInputStream(bytes)
+        val in = deserializeStream(bis)
+        in.readObject()
+
+    def deserialize[T: ClassTag](bytes: ByteBuffer, loader: ClassLoader): T
+    功能: 指定类加载器，对输入进行反序列化
+        val bis = new ByteBufferInputStream(bytes)
+        val in = deserializeStream(bis, loader)
+        in.readObject()
+    
+    def serializeStream(s: OutputStream): SerializationStream 
+    功能: 对输入的输出流进行序列化，形成序列化流@SerializationStream
+        val=new JavaSerializationStream(s, counterReset, extraDebugInfo)
+    
+    def deserializeStream(s: InputStream): DeserializationStream
+    功能: 对输入的输入流进行反序列化
+        val=new JavaDeserializationStream(s, defaultClassLoader)
+    
+    def deserializeStream(s: InputStream, loader: ClassLoader): DeserializationStream 
+    功能: 指定类加载器，反序列化输入流
+        val= new JavaDeserializationStream(s, loader)
 }
 ```
 
@@ -300,11 +291,9 @@ class KryoSerializer(conf: SparkConf){
     
     def setDefaultClassLoader(classLoader: ClassLoader): Serializer 
     功能: 设置默认类加载器，并重置外部序列化池@internalPool
-    ```scala
     	super.setDefaultClassLoader(classLoader)
     	internalPool.reset()
-    ```
-    
+
     def newInstance(): SerializerInstance 
     功能: 获取一个序列化实例
     val= new KryoSerializerInstance(this, useUnsafe, usePool)
@@ -333,47 +322,46 @@ class KryoSerializer(conf: SparkConf){
   		kryo.register(classOf[GenericRecord], new GenericAvroSerializer(avroSchemas))
     	kryo.register(classOf[GenericData.Record], new GenericAvroSerializer(avroSchemas))
   	+ 调用用户注册器时，加载默认的类加载器
-  	```scala
-  		Utils.withContextClassLoader(classLoader){
-  		try {
-  			// 注册需要注册的类列表
-        	classesToRegister.foreach { className =>
+
+    	```scala
+    		Utils.withContextClassLoader(classLoader){
+    		try {
+    			// 注册需要注册的类列表
+                	classesToRegister.foreach { className =>
           		kryo.register(Utils.classForName(className, noSparkClassLoader = true))}
-        	// 注册用户需要注册的类列表
+                	// 注册用户需要注册的类列表
             userRegistrators
               .map(Utils.classForName[KryoRegistrator](_, noSparkClassLoader = true).
                 getConstructor().newInstance())
               .foreach { reg => reg.registerClasses(kryo) }
-     	 } catch {
+          	 } catch {
         	case e: Exception =>
           	throw new SparkException(s"Failed to register classes with Kryo", e)
-      		}
-  		}
-  	```
+            		}
+    		}
   	+ 提供零散的注册类型
-  		kryo.register(classOf[Array[Tuplex[Any...(x个)]]])
-  		共计22个的注册方式
+
+    		kryo.register(classOf[Array[Tuplex[Any...(x个)]]])
+    		共计22个的注册方式
   	+ 注册一些其他特殊类型的
-  		kryo.register(None.getClass)
+    	kryo.register(None.getClass)
     	kryo.register(Nil.getClass)
     	kryo.register(Utils.classForName("scala.collection.immutable.$colon$colon"))
     	kryo.register(Utils.classForName("scala.collection.immutable.Map$EmptyMap$"))
     	kryo.register(classOf[ArrayBuffer[Any]])
   	+ 对于一些不能直接加载的类，为了避免jar依赖。在加载的时候，如果没有找到则忽略它
-  		```scala
-  		KryoSerializer.loadableSparkClasses.foreach { clazz =>
-              try {
+        KryoSerializer.loadableSparkClasses.foreach { clazz =>
+            try {
                 kryo.register(clazz)
-              } catch {
-                case NonFatal(_) => // do nothing
-                case _: NoClassDefFoundError if Utils.isTesting => // See SPARK-23422.
-              }
-   	 	}
-  		```
-  		其中@loadableSparkClasses是一些spark特有的类
+                } catch {
+                    case NonFatal(_) => // do nothing
+                    case _: NoClassDefFoundError if Utils.isTesting => // See SPARK-23422.
+                }
+            }
+        其中@loadableSparkClasses是一些spark特有的类
   	+ kryo设置类加载器为@classLoader，用于解决未注册类名的问题
-  		kryo.setClassLoader(classLoader)
-  }
+    		kryo.setClassLoader(classLoader)
+    }
 }
 ```
 
@@ -393,7 +381,7 @@ private[spark] class KryoSerializationStream(serInstance: KryoSerializerInstance
     	def writeObject[T: ClassTag](t: T): SerializationStream
     	功能: 写对象T 
     	 kryo.writeClassAndObject(output, t)
-    	 
+
     	 def flush(): Unit 
     	 功能: 将输出@output刷新到到磁盘上
     	
@@ -485,13 +473,13 @@ private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boole
 	2. 读取缓冲数组中的数据,并将其转化为对象
 	  	+ 读取缓存/流式读取数据到输入@input中
 	  	if (bytes.hasArray) {
-        	input.setBuffer(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining())
-      	} else {
-        	input.setBuffer(new Array[Byte](4096))
-        	input.setInputStream(new ByteBufferInputStream(bytes))
-      	}
-      	+ 将输入中的数据反序列化为T
-      	val= kryo.readClassAndObject(input).asInstanceOf[T]
+	    	input.setBuffer(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining())
+	  	} else {
+	    	input.setBuffer(new Array[Byte](4096))
+	    	input.setInputStream(new ByteBufferInputStream(bytes))
+	  	}
+	  	+ 将输入中的数据反序列化为T
+	  	val= kryo.readClassAndObject(input).asInstanceOf[T]
 	3. 将实例还给缓存池
 		releaseKryo(kryo)
 		
@@ -499,23 +487,23 @@ private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boole
 	功能: 指定类加载器@loader对缓冲数组的反序列化
 	1. 借用实例
 		val kryo = borrowKryo()
-    	val oldClassLoader = kryo.getClassLoader // 获取旧的类加载器(kryo的加载器)
+		val oldClassLoader = kryo.getClassLoader // 获取旧的类加载器(kryo的加载器)
 	2. 读取缓冲数组中的数据，并将读取到的数据反序列化为T
 		+ 指定工作的类加载器
 		kryo.setClassLoader(loader)
 		+ 读取数据到input
 		if (bytes.hasArray) {
-        	input.setBuffer(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining())
-      	} else {
-        	input.setBuffer(new Array[Byte](4096))
-        	input.setInputStream(new ByteBufferInputStream(bytes))
-      	}
-      	+ 将输入中的数据反序列化为T
-      	kryo.readClassAndObject(input).asInstanceOf[T]
+	    	input.setBuffer(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining())
+	  	} else {
+	    	input.setBuffer(new Array[Byte](4096))
+	    	input.setInputStream(new ByteBufferInputStream(bytes))
+	  	}
+	  	+ 将输入中的数据反序列化为T
+	  	kryo.readClassAndObject(input).asInstanceOf[T]
 	3. 归还实例
 		kryo.setClassLoader(oldClassLoader) // 重设类加载器为kryo的加载器
-      	releaseKryo(kryo)
-
+	  	releaseKryo(kryo)
+	
 	def serializeStream(s: OutputStream): SerializationStream 
 	功能: 流式序列化
 	val= new KryoSerializationStream(this, s, useUnsafe)
@@ -631,11 +619,11 @@ private class JavaIterableWrapperSerializer{
 		kryo.writeClassAndObject(out, obj)
 	
 	def read(kryo: Kryo, in: KryoInput, clz: Class[java.lang.Iterable[_]]):java.lang.Iterable[_]
-    功能: 反序列化in
-    kryo.readClassAndObject(in) match {
-      case scalaIterable: Iterable[_] => scalaIterable.asJava
-      case javaIterable: java.lang.Iterable[_] => javaIterable
-    }
+	功能: 反序列化in
+	kryo.readClassAndObject(in) match {
+	  case scalaIterable: Iterable[_] => scalaIterable.asJava
+	  case javaIterable: java.lang.Iterable[_] => javaIterable
+	}
 }
 ```
 
@@ -731,15 +719,199 @@ private[serializer] object KryoSerializer {
 }
 ```
 
-
-
 #### SerializationDebugger
 
 ```markdown
-
+private[spark] object SerializationDebugger{
+	关系: father --> Logging
+	属性: 
+	#name @enableDebugging #type @Boolean	允许debugger标志位
+	#name @reflect #type @ObjectStreamClassReflection	对象流类反射
+	操作集:
+	def improveException(obj: Any, e: NotSerializableException): NotSerializableException 
+	功能: 提升@NotSerializableException的功能,使之带有从问题对象引来的序列化路径.如果JVM的
+	@sun.io.serialization.extendedDebugInfo flag标记开启,这个功能将会自动关闭
+	
+	private[serializer] def find(obj: Any): List[String] 
+	功能: 查找导向非序列化对象	
+		这个功能暂时不能处理写对象的重新问题,但是其不能太过复杂
+	val = new SerializationDebugger().visit(obj, List.empty)
+    
+    def findObjectAndDescriptor(o: Object): (Object, ObjectStreamClass) 
+    功能: 查找对象及其描述
+    查找对象并序列化,将其与@ObjectStreamClass 组合成键值对,
+    1. 这种方法处理序列化中存在写替代问题.其开始于对象本身,一直调用@writeReplace方法直到没有对象可以被调用.
+      val replaced = desc.invokeWriteReplace(o)
+      if (replaced.getClass == o.getClass) (replaced, desc)
+      else findObjectAndDescriptor(replaced)
+    2. 对象中不存在写替代问题
+    	val= (o, desc)
+    	val desc = ObjectStreamClass.lookupAny(o.getClass)
+}
 ```
-
-
+```markdown
+private class ListObjectOutputStream{
+	关系: father --> ObjectOutputStream(new NullOutputStream)
+	介绍: 这是一个假的@ObjectOutput,可以简单的保存由外部写入的对象列表
+	属性:
+		#name @output #type @mutable.ArrayBuffer[Any]	输出
+	初始化操作:
+		this.enableReplaceObject(true) // 允许对象替换
+	操作集:
+		def outputArray: Array[Any] = output.toArray
+		功能: 获取输出内容
+		
+		def replaceObject(obj: Object): Object={ output += obj obj }
+		功能: 替换对象
+}
+```
+```markdown
+  private class NullOutputStream extends ObjectOutput{
+  	介绍: 模拟/dev/null的输出流
+    def write(b: Int): Unit = { }
+  }
+```
+```markdown
+private class ObjectStreamClassReflection{
+	属性:
+	val GetClassDataLayout: Method ={
+	    val f = classOf[ObjectStreamClass].getDeclaredMethod("getClassDataLayout")
+      	f.setAccessible(true)
+      	f
+	}
+	获取getClassDataLayout()方法
+	
+	val HasWriteObjectMethod: Method = {
+      val f = classOf[ObjectStreamClass].getDeclaredMethod("hasWriteObjectMethod")
+      f.setAccessible(true)
+      f
+    }
+    获取hasWriteObjectMethod()方法
+    
+    val HasWriteReplaceMethod: Method = {
+      val f = classOf[ObjectStreamClass].getDeclaredMethod("hasWriteReplaceMethod")
+      f.setAccessible(true)
+      f
+    }
+    获取hasWriteReplaceMethod()方法
+    
+    val InvokeWriteReplace: Method = {
+      val f = classOf[ObjectStreamClass].getDeclaredMethod("invokeWriteReplace", classOf[Object])
+      f.setAccessible(true)
+      f
+    }
+    获取invokeWriteReplace()方法
+    
+    val GetNumObjFields: Method = {
+      val f = classOf[ObjectStreamClass].getDeclaredMethod("getNumObjFields")
+      f.setAccessible(true)
+      f
+    }
+    获取getNumObjFields()方法
+    
+    val GetObjFieldValues: Method = {
+      val f = classOf[ObjectStreamClass].getDeclaredMethod(
+        "getObjFieldValues", classOf[Object], classOf[Array[Object]])
+      f.setAccessible(true)
+      f
+    }
+    获取getObjFieldValues()方法
+    
+     val DescField: Field = {
+      val f = Class.forName("java.io.ObjectStreamClass$ClassDataSlot").getDeclaredField("desc")
+      f.setAccessible(true)
+      f
+    }
+    获取属性desc
+}
+```
+```markdown
+implicit class ObjectStreamClassMethods(val desc: ObjectStreamClass){
+ 	关系: father --> AnyVal
+ 	操作集:
+ 	def hasWriteObjectMethod: Boolean
+ 	功能: 确定是否有写对象的方法
+ 	val = reflect.HasWriteObjectMethod.invoke(desc).asInstanceOf[Boolean]
+ 	
+ 	def hasWriteReplaceMethod: Boolean
+ 	功能: 确定是否有替换方法
+ 	reflect.HasWriteReplaceMethod.invoke(desc).asInstanceOf[Boolean]
+ 	
+ 	def invokeWriteReplace(obj: Object): Object
+ 	功能: 调用写替代
+ 	val= reflect.InvokeWriteReplace.invoke(desc, obj)
+ 	
+ 	def getNumObjFields: Int 
+ 	功能: 获取对象属性数量
+ 	val= reflect.GetNumObjFields.invoke(desc).asInstanceOf[Int]
+ 	
+ 	def getObjFieldValues(obj: Object, out: Array[Object]): Unit
+ 	功能: 获取属性值
+ 	val= reflect.GetObjFieldValues.invoke(desc, obj, out)
+ }
+```
+```markdown
+private class ListObjectOutput{
+	关系: father --> ObjectOutput
+	介绍: 这是一个伪@ObjectOutput,用于简单的保存外部写入的数据
+	属性:
+		#name @output=new mutable.ArrayBuffer[Any]	输出
+	操作集:
+	def outputArray: Array[Any] = output.toArray
+	功能: 获取操作集元素
+	
+	def writeObject(o: Any): Unit = output += o
+	功能: 写对象o到输出中
+	
+	def flush(): Unit = {}
+	功能: 空实现
+	
+	def write(i: Int): Unit = {}
+	功能: 空实现
+	
+	def write(bytes: Array[Byte]): Unit = {}
+	功能: 空实现
+	
+	def write(bytes: Array[Byte], i: Int, i1: Int): Unit = {}
+	功能: 空实现
+	
+	def close(): Unit = {}
+	功能: 空实现
+	
+	def writeFloat(v: Float): Unit = {}
+	功能: 空实现
+	
+	def writeChars(s: String): Unit = {}
+	功能: 空实现
+	
+	def writeDouble(v: Double): Unit = {}
+	功能: 空实现
+	
+	def writeUTF(s: String): Unit = {}
+	功能: 空实现
+	
+	def writeShort(i: Int): Unit = {}
+	功能: 空实现
+	
+	def writeInt(i: Int): Unit = {}
+	功能: 空实现
+	
+	def writeBoolean(b: Boolean): Unit = {}
+	功能: 空实现
+	
+	def writeBytes(s: String): Unit = {}
+	功能: 空实现
+	
+	def writeChar(i: Int): Unit = {}
+	功能: 空实现
+	
+	def writeLong(l: Long): Unit = {}
+	功能: 空实现
+    
+	def writeByte(i: Int): Unit = {}
+	功能: 空实现
+}
+```
 
 #### Serializer
 
@@ -996,3 +1168,7 @@ private[spark] class SerializerManager(defaultSerializer: Serializer,conf: Spark
 } 
 ```
 
+#### 基础拓展
+
+1.  注解@tailrec
+2.   implicit关键字
