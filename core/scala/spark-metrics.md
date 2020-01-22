@@ -254,6 +254,88 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### PrometheusServlet
     
+    ```markdown
+    private[spark] class PrometheusServlet(val property: Properties,val registry: MetricRegistry,
+        securityMgr: SecurityManager){
+    	关系: father --> Sink
+        属性:
+        #name @SERVLET_KEY_PATH = "path"	服务端key值
+        #name @servletPath=property.getProperty(SERVLET_KEY_PATH)	服务端地址
+        操作集:
+        def normalizeKey(key: String): String
+        功能: key的格式化
+        val= s"metrics_${key.replaceAll("[^a-zA-Z0-9]", "_")}_"
+        
+        def getHandlers(conf: SparkConf): Array[ServletContextHandler] 
+        功能: 获取服务端处理器列表
+        val= Array[ServletContextHandler](createServletHandler(servletPath,
+        	new ServletParams(request => getMetricsSnapshot(request), "text/plain"), conf)
+        
+        def getMetricsSnapshot(request: HttpServletRequest): String
+        功能: 获取度量器副本
+        1. 设置记录副本
+        val sb = new StringBuilder()
+        2. 记录估值信息
+        registry.getGauges.asScala.foreach { case (k, v) =>
+          if (!v.getValue.isInstanceOf[String]) {
+            sb.append(s"${normalizeKey(k)}Value ${v.getValue}\n")
+          }}
+        3. 记录计数信息
+        registry.getCounters.asScala.foreach { case (k, v) =>
+          sb.append(s"${normalizeKey(k)}Count ${v.getCount}\n") }
+    	4. 获取统计直方图(Histogram)信息
+    	registry.getHistograms.asScala.foreach { case (k, h) =>
+              val snapshot = h.getSnapshot
+              val prefix = normalizeKey(k)
+              sb.append(s"${prefix}Count ${h.getCount}\n")
+              sb.append(s"${prefix}Max ${snapshot.getMax}\n")
+              sb.append(s"${prefix}Mean ${snapshot.getMean}\n")
+              sb.append(s"${prefix}Min ${snapshot.getMin}\n")
+              sb.append(s"${prefix}50thPercentile ${snapshot.getMedian}\n")
+              sb.append(s"${prefix}75thPercentile ${snapshot.get75thPercentile}\n")
+              sb.append(s"${prefix}95thPercentile ${snapshot.get95thPercentile}\n")
+              sb.append(s"${prefix}98thPercentile ${snapshot.get98thPercentile}\n")
+              sb.append(s"${prefix}99thPercentile ${snapshot.get99thPercentile}\n")
+              sb.append(s"${prefix}999thPercentile ${snapshot.get999thPercentile}\n")
+              sb.append(s"${prefix}StdDev ${snapshot.getStdDev}\n") }
+         5. 记录度量频率信息
+         registry.getMeters.entrySet.iterator.asScala.foreach { kv =>
+              val prefix = normalizeKey(kv.getKey)
+              val meter = kv.getValue
+              sb.append(s"${prefix}Count ${meter.getCount}\n")
+              sb.append(s"${prefix}MeanRate ${meter.getMeanRate}\n")
+              sb.append(s"${prefix}OneMinuteRate ${meter.getOneMinuteRate}\n")
+              sb.append(s"${prefix}FiveMinuteRate ${meter.getFiveMinuteRate}\n")
+              sb.append(s"${prefix}FifteenMinuteRate ${meter.getFifteenMinuteRate}\n")}
+         6. 记录定时器信息
+         registry.getTimers.entrySet.iterator.asScala.foreach { kv =>
+              val prefix = normalizeKey(kv.getKey)
+              val timer = kv.getValue
+              val snapshot = timer.getSnapshot
+              sb.append(s"${prefix}Count ${timer.getCount}\n")
+              sb.append(s"${prefix}Max ${snapshot.getMax}\n")
+              sb.append(s"${prefix}Mean ${snapshot.getMax}\n")
+              sb.append(s"${prefix}Min ${snapshot.getMin}\n")
+              sb.append(s"${prefix}50thPercentile ${snapshot.getMedian}\n")
+              sb.append(s"${prefix}75thPercentile ${snapshot.get75thPercentile}\n")
+              sb.append(s"${prefix}95thPercentile ${snapshot.get95thPercentile}\n")
+              sb.append(s"${prefix}98thPercentile ${snapshot.get98thPercentile}\n")
+              sb.append(s"${prefix}99thPercentile ${snapshot.get99thPercentile}\n")
+              sb.append(s"${prefix}999thPercentile ${snapshot.get999thPercentile}\n")
+              sb.append(s"${prefix}StdDev ${snapshot.getStdDev}\n")
+              sb.append(s"${prefix}FifteenMinuteRate ${timer.getFifteenMinuteRate}\n")
+              sb.append(s"${prefix}FiveMinuteRate ${timer.getFiveMinuteRate}\n")
+              sb.append(s"${prefix}OneMinuteRate ${timer.getOneMinuteRate}\n")
+              sb.append(s"${prefix}MeanRate ${timer.getMeanRate}\n") }
+         
+         def start(): Unit = { } 
+         def stop(): Unit = { }
+         def report(): Unit = { }
+    }
+    ```
+    
+    
+    
     #### Sink
     
     ```markdown
@@ -305,6 +387,109 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     
     #### StatsdReporter
+    
+    ```markdown
+    private[spark] object StatsdMetricType{
+    	属性:
+    	#name @COUNTER = "c"	计数器
+    	#name @GAUGE = "g"	估值
+    	#name @TIMER="ms"	定时器
+    	#name @Set = "s"	集合
+    }
+    ```
+    
+    ```markdown
+    private[spark] class StatsdReporter(registry: MetricRegistry,host: String = "127.0.0.1",
+        port: Int = 8125,prefix: String = "",filter: MetricFilter = MetricFilter.ALL,
+        rateUnit: TimeUnit = TimeUnit.SECONDS,durationUnit: TimeUnit = TimeUnit.MILLISECONDS){
+    	关系: 
+    	father --> ScheduledReporter(registry, "statsd-reporter", filter, rateUnit, durationUnit)    
+    	sibling --> Logging
+    	属性:
+    	#name @address = new InetSocketAddress(host, port)	地址
+    	#name whitespace="[\\s]+".r	空格
+    	操作集:
+    	def reportGauge(name: String, gauge: Gauge[_])(implicit socket: DatagramSocket): Unit
+    	功能: 汇报估值情况
+    		formatAny(gauge.getValue).foreach(v => send(fullName(name), v, GAUGE))
+    	
+    	def reportCounter(name: String, counter: Counter)(implicit socket: DatagramSocket): Unit
+    	功能: 汇报计数情况
+    		send(fullName(name), format(counter.getCount), COUNTER)
+    	
+    	def reportHistogram(name: String, histogram: Histogram)
+    		(implicit socket: DatagramSocket): Unit
+    	功能: 通过socket@socket汇报统计直方图@histogram
+    	    val snapshot = histogram.getSnapshot
+            send(fullName(name, "count"), format(histogram.getCount), GAUGE)
+            send(fullName(name, "max"), format(snapshot.getMax), TIMER)
+            send(fullName(name, "mean"), format(snapshot.getMean), TIMER)
+            send(fullName(name, "min"), format(snapshot.getMin), TIMER)
+            send(fullName(name, "stddev"), format(snapshot.getStdDev), TIMER)
+            send(fullName(name, "p50"), format(snapshot.getMedian), TIMER)
+            send(fullName(name, "p75"), format(snapshot.get75thPercentile), TIMER)
+            send(fullName(name, "p95"), format(snapshot.get95thPercentile), TIMER)
+            send(fullName(name, "p98"), format(snapshot.get98thPercentile), TIMER)
+            send(fullName(name, "p99"), format(snapshot.get99thPercentile), TIMER)
+            send(fullName(name, "p999"), format(snapshot.get999thPercentile), TIMER)
+        
+        def reportMetered(name: String, meter: Metered)(implicit socket: DatagramSocket): Unit 
+        功能: 汇报移动频率参数@meter #class @Meterd
+            send(fullName(name, "count"), format(meter.getCount), GAUGE)
+        	send(fullName(name, "m1_rate"), format(convertRate(meter.getOneMinuteRate)), TIMER)
+        	send(fullName(name, "m5_rate"), format(convertRate(meter.getFiveMinuteRate)), TIMER)
+        	send(fullName(name, "m15_rate"), format(convertRate(meter.getFifteenMinuteRate)), TIMER)
+        	send(fullName(name, "mean_rate"), format(convertRate(meter.getMeanRate)), TIMER)
+        
+        def reportTimer(name: String, timer: Timer)(implicit socket: DatagramSocket): Unit
+        功能: 汇报计数器统计参数#class @Timer
+            val snapshot = timer.getSnapshot
+            send(fullName(name, "max"), format(convertDuration(snapshot.getMax)), TIMER)
+            send(fullName(name, "mean"), format(convertDuration(snapshot.getMean)), TIMER)
+            send(fullName(name, "min"), format(convertDuration(snapshot.getMin)), TIMER)
+            send(fullName(name, "stddev"), format(convertDuration(snapshot.getStdDev)), TIMER)
+            send(fullName(name, "p50"), format(convertDuration(snapshot.getMedian)), TIMER)
+            send(fullName(name, "p75"), format(convertDuration(snapshot.get75thPercentile)), TIMER)
+            send(fullName(name, "p95"), format(convertDuration(snapshot.get95thPercentile)), TIMER)
+            send(fullName(name, "p98"), format(convertDuration(snapshot.get98thPercentile)), TIMER)
+            send(fullName(name, "p99"), format(convertDuration(snapshot.get99thPercentile)), TIMER)
+            send(fullName(name, "p999"), format(convertDuration(snapshot.get999thPercentile)), TIMER)
+            reportMetered(name, timer)
+       
+       	def fullName(names: String*): String = MetricRegistry.name(prefix, names : _*)
+       	功能: 获取全名信息
+       	
+       	def sanitize(s: String): String = whitespace.replaceAllIn(s, "-")
+    	功能: 替换所有空格
+    	
+    	def format(v: Any): String = formatAny(v).getOrElse("")
+    	功能: 格式化v
+    	
+    	def formatAny(v: Any): Option[String] 
+    	功能： 对v进行格式化
+    	val= v match {
+    		case f: Float => Some("%2.2f".format(f))
+          	case d: Double => Some("%2.2f".format(d))
+          	case b: BigDecimal => Some("%2.2f".format(b))
+          	case n: Number => Some(v.toString)
+          	case _ => None
+    	}
+    	
+    	def send(name: String, value: String, metricType: String)
+    		(implicit socket: DatagramSocket): Unit
+    	功能:通过@socket 发送度量信息
+            val bytes = sanitize(s"$name:$value|$metricType").getBytes(UTF_8)
+            val packet = new DatagramPacket(bytes, bytes.length, address)
+            socket.send(packet)
+            
+        def report(gauges: SortedMap[String, Gauge[_]],counters: SortedMap[String, Counter],
+          histograms: SortedMap[String, Histogram],meters: SortedMap[String, Meter],
+          timers: SortedMap[String, Timer]): Unit
+        功能: 汇报度量信息
+    }
+    ```
+    
+    
     
     #### StatsdSink
     
@@ -428,6 +613,8 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
    object LongAccumulatorSource {
    	介绍: 这是给@LongAccumulators 的度量资源。累加器只能在驱动器上有效。所有度量数据由驱动器汇报。
    	操作集:
+   ```
+
 	def register(sc: SparkContext, accumulators: Map[String, LongAccumulator]): Unit 
    	功能: 注册累加器到度量系统中
 	val source = new LongAccumulatorSource
@@ -446,9 +633,9 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
         sc.env.metricsSystem.registerSource(source)
 }
    ```
-   
+
    #### JVMCPUSource
-   
+
    ```markdown
    private[spark] class JVMCPUSource{
 	关系: father --> Source
@@ -470,11 +657,11 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
      功能: 登记CPU及其使用量
    }
    ```
+
    
-   
-   
+
    #### JvmSource
-   
+
    ```markdown
    private[spark] class JvmSource {
    	关系: father --> Source
@@ -492,11 +679,9 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
    	功能: 注册缓冲池度量集合
    }
    ```
-   
-   
-   
+
    #### Source
-   
+
    ```markdown
    private[spark] trait Source {
    	操作集:
@@ -506,16 +691,16 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
    	功能: 获取度量注册器
    }
    ```
-   
+
    #### StaticSources
-   
+
 ```markdown
    private[spark] object StaticSources {
    	属性:
    	#name @allSources=Seq(CodegenMetrics, HiveCatalogMetrics)	所有资源列表
    }
-   ```
-   
+```
+
    ```markdown
    object CodegenMetrics { 
    	关系: father -->soruce
@@ -531,7 +716,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
    		val= metricRegistry.histogram(MetricRegistry.name("generatedMethodSize"))
    }
    ```
-   
+
    ```markdown
    object HiveCatalogMetrics{
    	关系: father -->soruce
@@ -573,7 +758,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
      	def incrementParallelListingJobCount(n: Int): Unit = METRIC_PARALLEL_LISTING_JOB_COUNT.inc(n)	 功能: 并行任务数量+=n	
    }
    ```
-   
+
    
 
 ---
@@ -712,7 +897,74 @@ case object MappedPoolMemory extends MBeanExecutorMetricType(
   "java.nio:type=BufferPool,name=mapped")
  介绍: 映射内存池度量
 ```
-
+```markdown
+case object GarbageCollectionMetrics{
+	关系: father --> ExecutorMetricType
+		sibling --> Logging
+	介绍: GC度量器
+	属性:
+	#name @nonBuiltInCollectors=Nil	#type @Seq[String]
+		未建立收集器列表
+	#name @names=Seq("MinorGCCount","MinorGCTime","MajorGCCount","MajorGCTime")	名称列表
+	#name @YOUNG_GENERATION_BUILTIN_GARBAGE_COLLECTORS	年轻代内建垃圾收集器列表
+		val=  Seq("Copy","PS Scavenge","ParNew","G1 Young Generation")
+	#name @OLD_GENERATION_BUILTIN_GARBAGE_COLLECTORS	老年代内建垃圾收集器列表
+		val= Seq("MarkSweepCompact","PS MarkSweep","ConcurrentMarkSweep","G1 Old Generation")
+	#name @youngGenerationGarbageCollector	#type @lazy Seq[String] 年轻代垃圾收集器
+		val= SparkEnv.get.conf.get(config.EVENT_LOG_GC_METRICS_YOUNG_GENERATION_GARBAGE_COLLECTORS)
+	#name @oldGenerationGarbageCollector #type @lazy Seq[String]	老年代垃圾收集器
+		val= SparkEnv.get.conf.get(config.EVENT_LOG_GC_METRICS_OLD_GENERATION_GARBAGE_COLLECTORS)
+	操作集:
+	def getMetricValues(memoryManager: MemoryManager): Array[Long]
+	功能: 获取指定内存管理器的度量值列表
+	0. 确定数组大小
+		val gcMetrics = new Array[Long](names.length)
+		(minorCount次要计数值，minorTime次要计时，majorCount主要计数值，majorTime主要计时)
+	1. 获取年轻代度量参数
+		if (youngGenerationGarbageCollector.contains(mxBean.getName)) {
+            gcMetrics(0) = mxBean.getCollectionCount
+            gcMetrics(1) = mxBean.getCollectionTime }
+    2. 获取老年代度量参数
+    	if (oldGenerationGarbageCollector.contains(mxBean.getName)) {
+        	gcMetrics(2) = mxBean.getCollectionCount
+        	gcMetrics(3) = mxBean.getCollectionTime}
+    3. 其他没有内建的情况
+    	if (!nonBuiltInCollectors.contains(mxBean.getName)) {
+    		nonBuiltInCollectors = mxBean.getName +: nonBuiltInCollectors }
+    val= gcMetrics
+}
+```
+```markdown
+private[spark] object ExecutorMetricType {
+	属性:
+	#name @metricGetters #type @IndexedSeq 		度量获取列表
+	val= IndexedSeq(
+            JVMHeapMemory,
+            JVMOffHeapMemory,
+            OnHeapExecutionMemory,
+            OffHeapExecutionMemory,
+            OnHeapStorageMemory,
+            OffHeapStorageMemory,
+            OnHeapUnifiedMemory,
+            OffHeapUnifiedMemory,
+            DirectPoolMemory,
+            MappedPoolMemory,
+            ProcessTreeMetrics,
+            GarbageCollectionMetrics )
+    
+    #name @(metricToOffset, numMetrics)	度量信息
+    val= {
+        var numberOfMetrics = 0
+        val definedMetricsAndOffset = mutable.LinkedHashMap.empty[String, Int]
+        metricGetters.foreach { m =>
+          (0 until m.names.length).foreach { idx =>
+            definedMetricsAndOffset += (m.names(idx) -> (idx + numberOfMetrics))
+          }
+          numberOfMetrics += m.names.length }
+        (definedMetricsAndOffset, numberOfMetrics)
+    }
+}
+```
 #### MetricsConfig
 
 ```markdown
@@ -784,11 +1036,172 @@ private[spark] class MetricsConfig(conf: SparkConf){
 }
 ```
 
-
-
 #### MetricsSystem
 
+```markdown
+介绍:
+	spark的度量系统，由指定的实例创建。联合sink,source周期性的测试source源，并将度量数据写入到sink目的地。
+	实例指出了谁使用度量系统问题，在spark中，有多种身份，比如说master，worker，executor，client driver。这些角色会创建度量系统的监视。所以这里的角色就指的是它们。
+	资源(source)是度量数据收集的地方。度量系统中存在如下两种资源:
+		1. spark内部资源比如:MasterSource,WorkerSource等等，这些会收集spark组件的内部状态，这些资源会被加	载到特定的度量系统中
+		2. 普通资源，比如说JVMSource这样会收集低级别状态的资源，由配置决定，并通过反射加载
+	sink指定数据输出到哪，多个sink可以共存，且度量数据可以刷写到这些sink中。
+	度量信息配置格式:
+		[instance].[sink|source].[name].[options] = xxxx
+		instance : "master", "worker", "executor", "driver", "applications"
+		sink|source	: 种类
+		name : 名称
+		options	: 代表source/sink 属性
+```
+```markdown
+private[spark] class MetricsSystem private (val instance: String,conf: SparkConf,
+    securityMgr: SecurityManager){
+ 	关系: father --> Logging
+ 	属性:
+ 	#name @metricsConfig = new MetricsConfig(conf)	度量配置
+ 	#name @sinks = new mutable.ArrayBuffer[Sink]	sink列表
+ 	#name @sources = new mutable.ArrayBuffer[Source]	source列表
+ 	#name @registry = new MetricRegistry()	注册度量器
+ 	#name @running: Boolean = false	运行状态标记
+ 	#name @metricsServlet: Option[MetricsServlet] = None	度量服务端
+ 	#name @prometheusServlet: Option[PrometheusServlet] = None 	prometheus服务端
+ 	
+ 	初始化操作:
+ 	metricsConfig.initialize()
+ 	功能: 配置初始化
+ 	
+ 	操作集:
+ 	def getServletHandlers: Array[ServletContextHandler] 
+ 	功能: 获取服务端处理器列表
+ 	操作条件: 度量系统运行中@running=true(两种服务端的并集)
+ 	val= metricsServlet.map(_.getHandlers(conf)).getOrElse(Array()) ++
+ 		prometheusServlet.map(_.getHandlers(conf)).getOrElse(Array())
+ 		
+ 	def report(): Unit = {sinks.foreach(_.report())}
+ 	功能: sink 信息汇报
+ 	
+ 	def stop(): Unit
+	功能: 停止度量系统
+        if (running) {
+            sinks.foreach(_.stop)	// 停止sink
+            registry.removeMatching((_: String, _: Metric) => true) // 移除所有度量器
+        } 
+        running = false
+    
+    def start(registerStaticSources: Boolean = true): Unit
+    功能: 度量系统不在运行
+        running = true
+        if (registerStaticSources) {
+          StaticSources.allSources.foreach(registerSource)
+          registerSources()
+        }
+        registerSinks()
+        sinks.foreach(_.start) // 开启每一个sink
+    
+    def getSourcesByName(sourceName: String): Seq[Source]
+    功能: 获取资源名称
+    val= sources.filter(_.sourceName == sourceName)
+    
+    def registerSource(source: Source): Unit
+    功能: 登记资源@source
+    	sources += source
+        val regName = buildRegistryName(source)
+      	registry.register(regName, source.metricRegistry)
+      	
+    def removeSource(source: Source): Unit
+    功能: 移除资源@source
+        sources -= source
+        val regName = buildRegistryName(source)
+        registry.removeMatching((name: String, _: Metric) => name.startsWith(regName))
+ 	
+ 	def registerSources(): Unit 
+ 	功能: 注册资源
+ 	1. 获取资源列表
+ 		val instConfig = metricsConfig.getInstance(instance)
+    	val sourceConfigs = metricsConfig.subProperties(instConfig, MetricsSystem.SOURCE_REGEX)
+ 	2. 注册资源
+ 	sourceConfigs.foreach { kv =>
+ 		val classPath = kv._2.getProperty("class")
+        val source = Utils.classForName[Source](classPath).getConstructor().newInstance()
+        registerSource(source) }
+    
+    def buildRegistryName(source: Source): String 
+    功能: 给每个资源@source建立一个唯一的标识
+    	格式<app ID>.<executor ID (or "driver")>.<source name>
+    	如果两个ID都不可用直接使用 <source name>.
+    
+    def registerSinks(): Unit
+    功能: 注册sinks
+    1. 获取sink列表
+        val instConfig = metricsConfig.getInstance(instance)
+        val sinkConfigs = metricsConfig.subProperties(instConfig, MetricsSystem.SINK_REGEX)
+ 	2. 注册sinks
+ 	```scala
+      sinkConfigs.foreach { kv =>
+      val classPath = kv._2.getProperty("class")
+      if (null != classPath) {
+        try {
+          if (kv._1 == "servlet") {
+            val servlet = Utils.classForName[MetricsServlet](classPath)
+              .getConstructor(
+                classOf[Properties], classOf[MetricRegistry], classOf[SecurityManager])
+              .newInstance(kv._2, registry, securityMgr)
+            metricsServlet = Some(servlet)
+          } else if (kv._1 == "prometheusServlet") {
+            val servlet = Utils.classForName[PrometheusServlet](classPath)
+              .getConstructor(
+                classOf[Properties], classOf[MetricRegistry], classOf[SecurityManager])
+              .newInstance(kv._2, registry, securityMgr)
+            prometheusServlet = Some(servlet)
+          } else {
+            val sink = Utils.classForName[Sink](classPath)
+              .getConstructor(
+                classOf[Properties], classOf[MetricRegistry], classOf[SecurityManager])
+              .newInstance(kv._2, registry, securityMgr)
+            sinks += sink
+          }
+        } catch {
+          case e: Exception =>
+            logError("Sink class " + classPath + " cannot be instantiated")
+            throw e
+        }
+      }
+    ```
+ }
+```
+```markdown
+private[spark] object MetricsSystem{
+	属性:
+	#name @SINK_REGEX= "^sink\\.(.+)\\.(.+)".r	sink正则
+	#name @SOURCE_REGEX = "^source\\.(.+)\\.(.+)".r	source正则
+	#name @MINIMAL_POLL_UNIT = TimeUnit.SECONDS	最小测试单位
+	#name @MINIMAL_POLL_PERIOD=1	最小测试周期值
+	操作集:
+	def createMetricsSystem(instance: String, conf: SparkConf, securityMgr: SecurityManager)
+		: MetricsSystem
+	功能: 创建一个度量系统
+	val= new MetricsSystem(instance, conf, securityMgr)
+	
+	def checkMinimalPollingPeriod(pollUnit: TimeUnit, pollPeriod: Int): Unit
+	功能: 检查周期值设置的是否合理
+	
+}
+```
 
+```markdown
+private[spark] object MetricsSystemInstances{
+	介绍: 度量系统实例
+	属性:
+	#name @MASTER="master"	Spark独立的master进程
+	#name @APPLICATIONS = "applications"	master组件
+	#name @WORKER = "worker"	spark独立的worker进程
+	#name @EXECUTOR = "executor"	spark执行器
+	#name @DRIVER = "driver"	spark执行器内容
+	#name @SHUFFLE_SERVICE = "shuffleService"	spark shuffle服务
+	#name @APPLICATION_MASTER="applicationMaster"	yarn模式下任务管理器@ApplicationMaster
+	#Name @MESOS_CLUSTER="mesos_cluster"	Mesos集群模式下调度器
+}
+```
 
 #### 基础拓展
 
