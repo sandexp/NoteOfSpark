@@ -21,6 +21,249 @@
 
 #### sort
 
+1.  [SortShuffleManager.scala](# SortShuffleManager)
+
+2.  [SortShuffleWriter.scala](# SortShuffleWriter)
+
+   ---
+
+   #### SortShuffleManager
+
+   ```markdown
+   private[spark] class SortShuffleManager(conf: SparkConf){
+   	关系: father --> ShuffleManager
+   		sibling --> Logging
+   	属性:
+   	#name @taskIdMapsForShuffle = new ConcurrentHashMap[Int, OpenHashSet[Long]]()
+   		shuffle任务id
+   	#name @shuffleExecutorComponents = loadShuffleExecutorComponents(conf)
+   		shuffle执行组件
+   	#name @shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
+   		shuffle块处理器
+   	操作集:
+   	def registerShuffle[K, V, C](shuffleId: Int,
+         dependency: ShuffleDependency[K, V, C]): ShuffleHandle
+   	功能: 注册shuffle，并返回shuffle处理器
+   	val= SortShuffleWriter.shouldBypassMergeSort(conf, dependency) ?
+   		BypassMergeSortShuffleHandle[K, V](shuffleId,
+           	dependency.asInstanceOf[ShuffleDependency[K, V, V]]) :
+           SortShuffleManager.canUseSerializedShuffle(dependency) ?
+           SerializedShuffleHandle[K, V](shuffleId, 
+           	dependency.asInstanceOf[ShuffleDependency[K, V, V]]) :
+           new BaseShuffleHandle(shuffleId, dependency)
+           
+      	def stop(): Unit = {shuffleBlockResolver.stop()}
+   	功能: 关闭shuffle处理器@shuffleBlockResolver
+   	
+   	def unregisterShuffle(shuffleId: Int): Boolean
+   	功能: 从shuffle管理器中移除指定shuffle的元数据
+           Option(taskIdMapsForShuffle.remove(shuffleId)).foreach { mapTaskIds =>
+             mapTaskIds.iterator.foreach { mapTaskId =>
+               shuffleBlockResolver.removeDataByMap(shuffleId, mapTaskId)
+             }
+           }
+   	
+   	def getReader[K, C](handle: ShuffleHandle,startPartition: Int,endPartition: Int,
+         context: TaskContext,metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C]
+   	功能: 获取指定区域reduce分区的阅读器,有执行器上的reduce任务调用
+   	输入参数:
+   		handle	shuffle处理器
+   		startPartition	起始分区
+   		endPartition	截止分区
+   		context	任务上下文
+   		metrics	shuffle读取度量器
+   	操作逻辑:
+   	1. 获取块信息
+   	val blocksByAddress = SparkEnv.get.mapOutputTracker.getMapSizesByExecutorId(
+         	handle.shuffleId, startPartition, endPartition)
+        #name @blocksByAddress #type @Iterator[(BlockManagerId, Seq[(BlockId, Long, Int)])] 
+   	2. 返回可以存储块信息的shuffle阅读器@BlockStoreShuffleReader
+   	val= BlockStoreShuffleReader(handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
+       	blocksByAddress, context, metrics,shouldBatchFetch = canUseBatchFetch(startPartition,
+           endPartition, context))
+   	
+   	def getWriter[K, V](handle: ShuffleHandle,mapId: Long,
+         context: TaskContext,metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V]
+   	功能: 获取指定分区的写出器
+   	1. 获取map任务id列表
+       val mapTaskIds = taskIdMapsForShuffle.computeIfAbsent(
+       	handle.shuffleId, _ => new OpenHashSet[Long](16))
+       mapTaskIds.synchronized { mapTaskIds.add(context.taskAttemptId()) }
+   	2. 根据不同类型的shuffle处理器@handle返回不同的shuffle写出器
+   	val= 
+   	handle match {
+         case unsafeShuffleHandle: SerializedShuffleHandle[K @unchecked, V @unchecked] =>
+           new UnsafeShuffleWriter(
+             env.blockManager,
+             context.taskMemoryManager(),
+             unsafeShuffleHandle,
+             mapId,
+             context,
+             env.conf,
+             metrics,
+             shuffleExecutorComponents)
+         case bypassMergeSortHandle: BypassMergeSortShuffleHandle[K @unchecked, V @unchecked] =>
+           new BypassMergeSortShuffleWriter(
+             env.blockManager,
+             bypassMergeSortHandle,
+             mapId,
+             env.conf,
+             metrics,
+             shuffleExecutorComponents)
+         case other: BaseShuffleHandle[K @unchecked, V @unchecked, _] =>
+           new SortShuffleWriter(
+             shuffleBlockResolver, other, mapId, context, shuffleExecutorComponents)
+   	
+   	
+   	def getReaderForOneMapper[K, C](handle: ShuffleHandle,mapIndex: Int,startPartition: Int,
+         endPartition: Int,context: TaskContext,
+         metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C] 
+   	功能: 获取指定map@mapIndex的shuffle阅读器
+   	1. 获取map任务id列表
+   	val blocksByAddress = SparkEnv.get.mapOutputTracker.getMapSizesByMapIndex(
+         handle.shuffleId, mapIndex, startPartition, endPartition)
+        2. 获取包含块存储信息的shuffle阅读器@BlockStoreShuffleReader
+        val= BlockStoreShuffleReader(handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
+        	blocksByAddress, context, metrics,
+         shouldBatchFetch = canUseBatchFetch(startPartition, endPartition, context))
+   }
+   ```
+
+   ```markdown
+   private[spark] object SortShuffleManager{
+   	关系: father --> Logging
+   	属性:
+   	#name @MAX_SHUFFLE_OUTPUT_PARTITIONS_FOR_SERIALIZED_MODE =
+       	PackedRecordPointer.MAXIMUM_PARTITION_ID + 1
+   	在序列化模式下最大shuffle输出分区数量
+   	#name @FETCH_SHUFFLE_BLOCKS_IN_BATCH_ENABLED_KEY =
+       	"__fetch_continuous_blocks_in_batch_enabled"
+   	允许连续获取shuffle块
+   	
+   	操作集:
+   	def canUseBatchFetch(startPartition: Int, endPartition: Int, context: TaskContext): Boolean
+   	功能: 是否可以批量获取
+   	val= endPartition - startPartition > 1 &&
+         context.getLocalProperty(FETCH_SHUFFLE_BLOCKS_IN_BATCH_ENABLED_KEY) == "true"
+        
+       def canUseSerializedShuffle(dependency: ShuffleDependency[_, _, _]): Boolean 
+       功能: 是否可以使用序列化shuffle
+       1. 获取shuffleId和分区数量
+       val shufId = dependency.shuffleId
+       val numPartitions = dependency.partitioner.numPartitions
+   	2. 确定是否能够使用序列化shuffle
+   	val= !dependency.serializer.supportsRelocationOfSerializedObjects ? false :
+   		dependency.mapSideCombine ? false : 
+   		numPartitions > MAX_SHUFFLE_OUTPUT_PARTITIONS_FOR_SERIALIZED_MODE ? false : true
+   	
+   	def loadShuffleExecutorComponents(conf: SparkConf): ShuffleExecutorComponents
+   	功能: 加载shuffle执行器组件
+   	1. 获取执行器组件
+   	val executorComponents = ShuffleDataIOUtils.loadShuffleDataIO(conf).executor()
+   	2. 获取配置列表
+   	val extraConfigs = conf.getAllWithPrefix(ShuffleDataIOUtils.SHUFFLE_SPARK_CONF_PREFIX).toMap
+   	3. 初始化组件信息，并返回
+   	executorComponents.initializeExecutor(conf.getAppId,SparkEnv.get.executorId,
+         	extraConfigs.asJava)
+   	val= executorComponents
+   }
+   ```
+
+   ```markdown
+   private[spark] class SerializedShuffleHandle[K, V] (
+     shuffleId: Int,dependency: ShuffleDependency[K, V, V]){
+   	关系: father --> BaseShuffleHandle(shuffleId, dependency)
+       介绍: BaseShuffleHandle子类，用于标识序列化shuffle
+   }
+   
+   private[spark] class BypassMergeSortShuffleHandle[K, V] (
+     shuffleId: Int,dependency: ShuffleDependency[K, V, V]){
+    	关系: father --> BaseShuffleHandle(shuffleId, dependency)
+       介绍: BaseShuffleHandle子类，用于标记可以绕开归并排序的shuffle路径
+    }
+   
+   ```
+
+   
+
+   #### SortShuffleWriter
+
+   ```markdown
+   private[spark] class SortShuffleWriter[K, V, C] (
+       shuffleBlockResolver: IndexShuffleBlockResolver,
+       handle: BaseShuffleHandle[K, V, C],mapId: Long,
+       context: TaskContext,shuffleExecutorComponents: ShuffleExecutorComponents){
+   	关系: father --> ShuffleWriter[K, V]
+       sibling --> Logging
+       构造器属性:
+       	shuffleBlockResolver	shuffle块处理器
+       	handle	基本处理器
+       	context	任务上下文
+       	mapId	mapId
+       	shuffleExecutorComponents	shuffle执行器组件
+       属性:
+       	#name @dep = handle.dependency	依赖
+       	#name @blockManager = SparkEnv.get.blockManager	块管理器
+       	#name @sorter: ExternalSorter[K, V, _] = null	外部排序器
+       	#name @stopping = false	停止状态位
+   		#name @mapStatus: MapStatus = null	Map侧状态
+           #name @writeMetrics= context.taskMetrics().shuffleWriteMetrics	写度量器
+       操作集:
+       def write(records: Iterator[Product2[K, V]]): Unit
+       功能: 写出记录
+       1. 获取排序器
+       sorter=dep.mapSideCombine?new ExternalSorter[K, V, C](context, dep.aggregator,
+       		Some(dep.partitioner), dep.keyOrdering, dep.serializer):
+       		new ExternalSorter[K, V, V](context, aggregator = None, Some(dep.partitioner),
+               ordering = None, dep.serializer)
+   	2. 插入所有记录
+   	sorter.insertAll(records)
+   	3. 获取map输出写出器
+   	val mapOutputWriter = shuffleExecutorComponents.createMapOutputWriter(
+         	dep.shuffleId, mapId, dep.partitioner.numPartitions)
+   	4. 写出分区内容并提交
+       sorter.writePartitionedMapOutput(dep.shuffleId, mapId, mapOutputWriter)
+       val partitionLengths = mapOutputWriter.commitAllPartitions()
+       5. 更新map侧状态
+       mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths, mapId)
+       
+       def stop(success: Boolean): Option[MapStatus]
+       功能: 关闭写出器
+       1. 关闭写出器
+           if (stopping) {
+               return None
+             }
+             stopping = true
+             if (success) {
+               return Option(mapStatus)
+             } else {
+               return None
+             }
+       2. 情况排序器
+           if (sorter != null) {
+               val startTime = System.nanoTime()
+               sorter.stop()
+               writeMetrics.incWriteTime(System.nanoTime - startTime)
+               sorter = null
+             }
+   }
+   ```
+
+   ```markdown
+   private[spark] object SortShuffleWriter{
+   	def shouldBypassMergeSort(conf: SparkConf, dep: ShuffleDependency[_, _, _]): Boolean
+   	功能: 确定是否需要合并排序
+   	val= if (dep.mapSideCombine) { // map侧合并就不会引起合并排序
+         false
+       } else {
+         val bypassMergeThreshold: Int = conf.get(config.SHUFFLE_SORT_BYPASS_MERGE_THRESHOLD)
+         dep.partitioner.numPartitions <= bypassMergeThreshold
+       }
+   }
+   ```
+
+   
+
 #### BaseShuffleHandle
 
 ```markdown
@@ -86,8 +329,6 @@ private[spark] class BlockStoreShuffleReader[K, C] (
 }
 ```
 
-
-
 #### FetchFailedException
 
 ```markdown
@@ -125,7 +366,8 @@ private[spark] class FetchFailedException(bmAddress: BlockManagerId,shuffleId: I
 ```
 
 ```markdown
-private[spark] class MetadataFetchFailedException(shuffleId: Int,reduceId: Int,message: String){
+private[spark] class MetadataFetchFailedException(shuffleId: Int,reduceId: Int,message: 
+){
 	介绍: 获取元数据失败
 	关系: father --> FetchFailedException(null, shuffleId, -1L, -1, reduceId, message)
 	构造器属性:
@@ -136,6 +378,189 @@ private[spark] class MetadataFetchFailedException(shuffleId: Int,reduceId: Int,m
 ```
 
 #### IndexShuffleBlockResolver
+
+```markdown
+介绍:
+	创建和维护shuffle块逻辑块与物理文件位置的映射。同一个map任务的shuffle块数据存储在单个统一的数据文件中。数据块在数据文件中的偏移量存储在一个分散的索引文件中。
+	我们使用带有reduceID的shuffle数据的shuffle块编号@shuffleBlockId，将其设置为0，且添加.data作为数据文件的后缀。.index为索引文件后缀。
+	注意: 这个文件的格式改变需要使用#class@org.apache.spark.network.shuffle.ExternalShuffleBlockResolver
+	#method @getSortBasedShuffleBlockData()同步保存。
+```
+
+```markdown
+private[spark] class IndexShuffleBlockResolver(conf: SparkConf,_blockManager: BlockManager = null){
+	关系: father --> ShuffleBlockResolver
+		sibling --> Logging
+	构造器属性:
+		conf 	应用程序配置集
+		_blockManager	块管理器
+	属性:
+	#name @blockManager= Option(_blockManager).getOrElse(SparkEnv.get.blockManager) lazy 块管理器
+	#name @transportConf = SparkTransportConf.fromSparkConf(conf, "shuffle")	传输配置
+    操作集:
+     def getDataFile(shuffleId: Int, mapId: Long): File=getDataFile(shuffleId, mapId, None)
+     功能: 根据shuffleId,mapId获取数据文件
+     
+     def getDataFile(shuffleId: Int, mapId: Long, dirs: Option[Array[String]]): File
+     功能: 获取shuffle的数据文件,当目录为None时，使用磁盘管理器的本地目录。
+     1. 获取块编号#class @BlockId #class @ShuffleDataBlockId
+     val blockId = ShuffleDataBlockId(shuffleId, mapId, NOOP_REDUCE_ID)
+     2. 获取数据文件
+     dirs.map(ExecutorDiskUtils.getFile(_, blockManager.subDirsPerLocalDir, blockId.name))
+      	.getOrElse(blockManager.diskBlockManager.getFile(blockId))
+	
+	def getIndexFile(shuffleId: Int,mapId: Long,dirs: Option[Array[String]] = None): File 
+	功能: 获取索引文件，当输入目录为空则读入磁盘管理器的本地目录
+	1. 获取块编号
+	val blockId = ShuffleIndexBlockId(shuffleId, mapId, NOOP_REDUCE_ID)
+	2. 获取索引文件
+	dirs.map(ExecutorDiskUtils.getFile(_, blockManager.subDirsPerLocalDir, blockId.name))
+      	.getOrElse(blockManager.diskBlockManager.getFile(blockId))
+	
+	def removeDataByMap(shuffleId: Int, mapId: Long): Unit
+	功能: 移除一个map中包含输出数据的数据文件和索引文件
+	1. 获取数据文件
+	var file = getDataFile(shuffleId, mapId)
+	2. 删除数据文件
+	if (file.exists()) {
+      if (!file.delete()) {
+        logWarning(s"Error deleting data ${file.getPath()}")
+      }
+    }
+    3. 获取索引文件
+    file = getIndexFile(shuffleId, mapId)
+    4. 删除索引文件
+    if (file.exists()) {
+      if (!file.delete()) {
+        logWarning(s"Error deleting index ${file.getPath()}")
+      }
+    }
+	
+	def checkIndexAndDataFile(index: File, data: File, blocks: Int): Array[Long] 
+	功能: 检查索引文件和数据文件是否匹配，如果匹配则返回数据文件中的分区数量，否则返回null
+	1. 必须要有block+1个长度，否则返回null
+	if (index.length() != (blocks + 1) * 8L) { return null }
+	2. 指定长度列表信息
+	val lengths = new Array[Long](blocks)
+	3. 获取每个数据块的长度
+        val in = try {
+          new DataInputStream(new NioBufferedFileInputStream(index))
+        } catch {
+          case e: IOException =>
+            return null
+        }
+        try {
+          var offset = in.readLong()
+          if (offset != 0L) {
+            return null
+          }
+          var i = 0
+          while (i < blocks) {
+            val off = in.readLong()
+            lengths(i) = off - offset
+            offset = off
+            i += 1
+          }
+        } catch {
+          case e: IOException =>
+            return null
+        } finally {
+          in.close()
+        }
+	4. 检查数据文件和索引文件是否匹配
+        if (data.length() == lengths.sum) {
+          lengths
+        } else {
+          null
+        }
+   
+    def writeIndexFileAndCommit(shuffleId: Int,mapId: Long,
+      lengths: Array[Long],dataTmp: File): Unit
+    功能：写出索引文件并提交
+    1. 获取索引文件
+    val indexFile = getIndexFile(shuffleId, mapId)
+    val indexTmp = Utils.tempFileWith(indexFile)
+    2. 获取数据文件
+    val dataFile = getDataFile(shuffleId, mapId)
+    3. 确保检查索引文件与数据文件的匹配性
+    	synchronized {
+        	val existingLengths = checkIndexAndDataFile(indexFile, dataFile, lengths.length)
+            if (existingLengths != null) {
+              System.arraycopy(existingLengths, 0, lengths, 0, lengths.length)
+              if (dataTmp != null && dataTmp.exists()) {
+                dataTmp.delete()
+              }
+        } else {
+          val out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(indexTmp)))
+          Utils.tryWithSafeFinally {
+            var offset = 0L
+            out.writeLong(offset)
+            for (length <- lengths) {
+              offset += length
+              out.writeLong(offset)
+            }
+          } {
+            out.close()
+          }
+   	4. 删除索引文件和数据文件
+   	if (indexFile.exists()) { indexFile.delete() }
+    if (dataFile.exists()) { dataFile.delete()}
+	5. 临时文件重命名工作
+	if(!indexTmp.renameTo(indexFile)) {
+        throw new IOException("fail to rename file " + indexTmp + " to " + indexFile)
+     }
+     if (dataTmp != null && dataTmp.exists() && !dataTmp.renameTo(dataFile)) {
+        throw new IOException("fail to rename file " + dataTmp + " to " + dataFile)
+     }
+	6. 删除临时文件
+	if (indexTmp.exists() && !indexTmp.delete()) {
+        logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
+      }
+    
+    def stop(): Unit = {}
+    功能: 关闭
+    
+    def getBlockData(blockId: BlockId,dirs: Option[Array[String]]): ManagedBuffer
+	功能: 获取数据块
+	1. 获取shuffleId,mapId,起始reduceId，结束reduceId
+	val (shuffleId, mapId, startReduceId, endReduceId) = blockId match {
+      case id: ShuffleBlockId =>
+        (id.shuffleId, id.mapId, id.reduceId, id.reduceId + 1)
+      case batchId: ShuffleBlockBatchId =>
+        (batchId.shuffleId, batchId.mapId, batchId.startReduceId, batchId.endReduceId)
+      case _ =>
+        throw new IllegalArgumentException("unexpected shuffle block id format: " + blockId)
+    }
+    2. 获取索引文件
+    val indexFile = getIndexFile(shuffleId, mapId, dirs)
+    3. 设置字节通道初始位置
+    val channel = Files.newByteChannel(indexFile.toPath)
+    channel.position(startReduceId * 8L)
+    4. 获取起始与结束偏移量
+    val in = new DataInputStream(Channels.newInputStream(channel))
+    val startOffset = in.readLong()
+    channel.position(endReduceId * 8L)
+    val endOffset = in.readLong()
+    val actualPosition = channel.position()
+    val expectedPosition = endReduceId * 8L + 8
+    if (actualPosition != expectedPosition) {
+    	throw new Exception(s"SPARK-22982: Incorrect channel position after index file reads: " +
+    	s"expected $expectedPosition but actual position was $actualPosition.")
+    }
+    5. 返回一个缓冲区
+    val= FileSegmentManagedBuffer(transportConf,getDataFile(shuffleId, mapId, dirs),
+        startOffset,endOffset - startOffset)
+}
+```
+
+```markdown
+private[spark] object IndexShuffleBlockResolver {
+	属性: 
+	#name @NOOP_REDUCE_ID = 0	与磁盘操作中没有操作的reduce ID
+}
+```
+
+
 
 #### Metrics
 
@@ -319,60 +744,57 @@ private[spark] class ShufflePartitionPairsWriter(
         }
         throw e
     }
-	```
-	
+
 	def closeIfNonNull[T <: Closeable](closeable: T): T
 	功能: 非空情况下关闭
 	if (closeable != null) { closeable.close()}
-    null.asInstanceOf[T]
-    
-    def recordWritten(): Unit
-    功能: 提示写出器有多少字节的记录已经使用输出流写入
-        numRecordsWritten += 1 // 以写记录+1
-        writeMetrics.incRecordsWritten(1) // 汇报器属性+=1
-        if (numRecordsWritten % 16384 == 0) {updateBytesWritten()}
+	null.asInstanceOf[T]
+	
+	def recordWritten(): Unit
+	功能: 提示写出器有多少字节的记录已经使用输出流写入
+	    numRecordsWritten += 1 // 以写记录+1
+	    writeMetrics.incRecordsWritten(1) // 汇报器属性+=1
+	    if (numRecordsWritten % 16384 == 0) {updateBytesWritten()}
 	
 	def updateBytesWritten(): Unit
 	功能: 更新已经写出的字节数量
-	```scala
 	    val numBytesWritten = partitionWriter.getNumBytesWritten
-        val bytesWrittenDiff = numBytesWritten - curNumBytesWritten
-        writeMetrics.incBytesWritten(bytesWrittenDiff)
-        curNumBytesWritten = numBytesWritten
-	```
-	
+	    val bytesWrittenDiff = numBytesWritten - curNumBytesWritten
+	    writeMetrics.incBytesWritten(bytesWrittenDiff)
+	    curNumBytesWritten = numBytesWritten
+
+
 	def close(): Unit 
 	功能: 关闭写出器
 	操作条件: 写出器没有关闭@isClosed=false
 	操作逻辑:
 	1. 内部所有流置空
-	```scala
 		Utils.tryWithSafeFinally {
-            Utils.tryWithSafeFinally {
-              objOut = closeIfNonNull(objOut)
-              wrappedStream = null
-              timeTrackingStream = null
-              partitionStream = null
-        } {
-          Utils.tryWithSafeFinally {
-            wrappedStream = closeIfNonNull(wrappedStream)\
-            timeTrackingStream = null
-            partitionStream = null
-          } {
-            Utils.tryWithSafeFinally {
-              timeTrackingStream = closeIfNonNull(timeTrackingStream)
-              partitionStream = null
-            } {
-              partitionStream = closeIfNonNull(partitionStream)
-            }
-          }
-        }
-        updateBytesWritten()
-      }
-	```
+	        Utils.tryWithSafeFinally {
+	          objOut = closeIfNonNull(objOut)
+	          wrappedStream = null
+	          timeTrackingStream = null
+	          partitionStream = null
+	    } {
+	      Utils.tryWithSafeFinally {
+	        wrappedStream = closeIfNonNull(wrappedStream)\
+	        timeTrackingStream = null
+	        partitionStream = null
+	      } {
+	        Utils.tryWithSafeFinally {
+	          timeTrackingStream = closeIfNonNull(timeTrackingStream)
+	          partitionStream = null
+	        } {
+	          partitionStream = closeIfNonNull(partitionStream)
+	        }
+	      }
+	    }
+	    updateBytesWritten()
+	  }
 	2. 更新标志位
 	isClosed = true
 }
+
 ```
 
 #### ShuffleReader
@@ -402,20 +824,20 @@ private[spark] class ShuffleWriteProcessor{
 	val= context.taskMetrics().shuffleWriteMetrics
 	
 	def write(rdd: RDD[_],dep: ShuffleDependency[_, _, _],mapId: Long,
-      	context: TaskContext,partition: Partition): MapStatus
-     功能: 对于指定分区进行写的过程，通过@ShuffleWriter控制生命周期，从shuffle管理器@ShuffleManager获取并触		发RDD计算。最后返回当前任务的@MapStatus
-     1. 获取shuffle写出器(作为生命周期开始，但是实际的值需要指定)
-     var writer: ShuffleWriter[Any, Any] = null
-     2. 获取shuffle管理器
-     val manager = SparkEnv.get.shuffleManager
-     3. shuffle管理器指定shuffle写出器
-      writer = manager.getWriter[Any, Any](dep.shuffleHandle,mapId,context,
-      	createMetricsReporter(context))
+	  	context: TaskContext,partition: Partition): MapStatus
+	 功能: 对于指定分区进行写的过程，通过@ShuffleWriter控制生命周期，从shuffle管理器@ShuffleManager获取并触		发RDD计算。最后返回当前任务的@MapStatus
+	 1. 获取shuffle写出器(作为生命周期开始，但是实际的值需要指定)
+	 var writer: ShuffleWriter[Any, Any] = null
+	 2. 获取shuffle管理器
+	 val manager = SparkEnv.get.shuffleManager
+	 3. shuffle管理器指定shuffle写出器
+	  writer = manager.getWriter[Any, Any](dep.shuffleHandle,mapId,context,
+	  	createMetricsReporter(context))
 	4. 写出RDD中的数据
 	writer.write(rdd.iterator(partition, context).asInstanceOf[Iterator[_ <: Product2[Any, Any]]])
 	5. 停止写出
 	writer.stop(success = true).get
-	
+
 }
 ```
 
