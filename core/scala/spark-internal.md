@@ -1,4 +1,4 @@
-## **spark-internal**
+## *spark-internal**
 
 ---
 
@@ -406,34 +406,725 @@ worker信息配置
 
 #### FileCommitProtocol
 
+```markdown
+介绍 :
+文件提交协议，这是一个定义单个spark job如何提交输出的方式的接口。注意如下三点:
+1. 实现必须要是可序列化的，因为提交者@commiter实例初始化在driver上，会在executor上供任务使用。
+2. 实现时构造器需要包含2-3个参数。
+	(jobId: String, path: String)  
+	或者
+	(jobId: String, path: String, dynamicPartitionOverwrite: Boolean)
+3. 提交者不应当在多个spark job 中重新使用
+合适的调用顺序为:
+1. driver端调用设置job @setupJob()
+2. 作为每个任务的执行，执行器调用@setupTask() 和 @commitTask()去提交任务(如果失败，则使用@abortTask()放弃提交)
+3. 当所有必要的任务全部成功完成，驱动器提交job。如果job执行失败(有过多的失败task)，那么这个job会调用@abortJob,弃用这个job。
+```
+```markdown
+abstract class FileCommitProtocol{
+	关系 : father --> Logging
+	操作集:
+	def setupJob(jobContext: JobContext): Unit
+	功能: 建立job工作，必须在驱动器上调用，且需要在其他方法调用前使用
+	
+	def commitJob(jobContext: JobContext, taskCommits: Seq[TaskCommitMessage]): Unit
+	功能: 写成功之后提交job工作，必须在驱动器上调用
+	
+	def abortJob(jobContext: JobContext): Unit
+	功能: 写失败放弃工作job,必须在驱动器上调用，调用函数尽最大努力，原因是驱动器在弃用job之前可能会被kill或宕		掉。
+	
+	def setupTask(taskContext: TaskAttemptContext): Unit
+	功能: 在一个job中建立一个任务，必须要在其他任务相关方法调用之前使用
+	
+	def newTaskTempFile(taskContext: TaskAttemptContext, dir: Option[String], ext: String): String
+	功能: 新建任务临时文件
+	注意添加文件的提交协议，且获取应当使用的全路径，当运行任务时必须在执行器上调用。
+	注意返回的临时文件可能含有一个专有(arbitrary)文件,提交协议只会保证文件提交到job提交的参数位置。全路径包含	如下几个部分:
+	1. 基本路径
+	2. 基本路径下的子文件目录，用于指定分区
+	3. 文件前缀，使用唯一的带有task id的job Id
+	4. 桶(bucket)id
+	5. 特点的文件名扩展(e.g. ".snappy.parquet")
+	目录蚕食指定2,"ext" 参数指定4和5.其他类型有实现决定。
+	
+	def newTaskTempFileAbsPath(taskContext: TaskAttemptContext, absoluteDir: String, 
+		ext: String): String
+	功能: 类似于@newTaskTempFile，但是允许文件提交到绝对路径中，依赖于实现，但是会对添加文件这种方式的可靠性	降低。重点： 如果任务需要写出多个文件到相同目录中,添加独特标志内容到'ext'中。这些都是调用者需要做的工作。这	个文件提交协议只保证不同任务写出的文件不会冲突。
+	
+	def commitTask(taskContext: TaskAttemptContext): TaskCommitMessage
+	功能: 写出成功之后提交任务，必须要在运行任务中且在执行器中提交
+	
+	def abortTask(taskContext: TaskAttemptContext): Unit
+	功能: 写出失败放弃提交任务，必须在运行任务中且在执行器中提交
+		调用时尽最大努力，因为可能执行器宕机或者被kill掉
+	
+	def deleteWithJob(fs: FileSystem, path: Path, recursive: Boolean): Boolean
+	功能: 指定需要删除的文件，且带有job的提交默认实现立即删除文件。
+	val= fs.delete(path, recursive)
+	
+	def onTaskCommit(taskCommit: TaskCommitMessage): Unit
+	功能: 任务提交之后调用驱动器，这个可以在job完成之前获取task提交信息。如果整个job成功，这些任务提交信息会		被传递给@commitJob()
+}
+```
+```markdown
+object FileCommitProtocol{
+	关系: father --> Logging
+	内部类:
+	class TaskCommitMessage(val obj: Any) extends Serializable
+		任务提交信息
+	object EmptyTaskCommitMessage extends TaskCommitMessage(null)
+		空任务提交信息
+	操作集:
+	def instantiate(className: String,jobId: String,outputPath: String,
+      dynamicPartitionOverwrite: Boolean = false): FileCommitProtocol 
+	功能: 使用给定类型初始化文件传输协议
+	1. 获取指定类名@className对应的实例
+	val clazz = Utils.classForName[FileCommitProtocol](className)
+	+ 尝试构造器(jobId: String, outputPath: String,dynamicPartitionOverwrite: Boolean)
+	val ctor = clazz.getDeclaredConstructor(classOf[String], classOf[String], classOf[Boolean])
+	ctor.newInstance(jobId, outputPath, dynamicPartitionOverwrite.asInstanceOf[java.lang.Boolean])
+	+ 获取构造器1失败，获取构造器2  (jobId: string, outputPath: String)
+	val ctor = clazz.getDeclaredConstructor(classOf[String], classOf[String])
+    ctor.newInstance(jobId, outputPath)
+}
+```
+
 #### HadoopMapRedCommitProtocol
+
+```markdown
+介绍:
+	Hadoop MapReduce 提交协议
+	这是一种文件传输协议的实现，由底层hadoop 输出提交器实现。
+	与hadoop 输出提交器@OutputCommitter不同的是，这个实现是可序列化的。
+```
+
+```markdown
+class HadoopMapRedCommitProtocol(jobId: String, path: String){
+	关系 : father --> HadoopMapReduceCommitProtocol(jobId, path)
+	操作集:
+	def setupCommitter(context: NewTaskAttemptContext): OutputCommitter 
+	功能: 建立提交器
+	val config = context.getConfiguration.asInstanceOf[JobConf]
+    val committer = config.getOutputCommitter
+    val= committer
+}
+```
 
 #### HadoopMapReduceCommitProtocol
 
+```markdown
+介绍:
+	文件传输协议，由底层hadoop 输出提交器返回@OutputCommitter，与输出提交器@OutputCommitter不同的是，实现是可以序列化的。
+```
+
+```markdown
+class HadoopMapReduceCommitProtocol(jobId: String,path: String,
+    dynamicPartitionOverwrite: Boolean = false){
+	关系: father --> FileCommitProtocol
+    sibling --> Serializable/Logging
+    构造器属性:
+    	jobId	job/stage ID
+    	path	job提交路径，为null时nop
+    	dynamicPartitionOverwrite 为true，spark则会在运行时覆盖分区目录，首次写文件时在stage目录下携带有分		区路径，比如说/path/to/staging/a=1/b=1/xxx.parquet。 当提交工作时，首先清除目标路径相应分区目录,例		如/path/to/destination/a=1/b=1，然后移动stage目录到相应分区目录且在目标路径下。
+    属性:
+    	#name @committer=_ #type @OutputCommitter transient		输出提交器
+    		由于hadoop输出提交器没有序列化，所以需要添加注解@transient，让它序列化
+    	#name @hasValidPath=Try { new Path(path) }.isSuccess	是否是合法路径
+    		检查文件是否被提交到了合法路径上
+    	#name @addedAbsPathFiles=null #type @mutable.Map[String, String]	已添加的绝对路径
+    		本任务绝对定位的输出路径，这些输出不是由hadoop 输出提交器管理@OutputCommitter，所以必须要移动这			些最终地址到任务提交中。临时输出文件与最终需求的映射由这个维护。
+    	#name @partitionPaths=null #type @mutable.Set[String]	分区长度
+    		使用默认路径定位分区这种默认路径含有由任务写入的新文件,例如a=1/b=2文件.在这些分区底下的文件需要保		存在stage 目录，且再最后移动到目的目录下。这些操作进行在@dynamicPartitionOverwrite设置为true的情况			下。
+	操作集:
+	def stagingDir = new Path(path, ".spark-staging-" + jobId)
+	功能: 获取写job的stage目录，spark使用这个处理绝对路径的输出，或者通过设置@dynamicPartitionOverwrite
+	=true将数据写出到分区目录下。
+	
+	def setupCommitter(context: TaskAttemptContext): OutputCommitter
+	功能: 建立对指定任务上下文@context的输出提交器
+	1. 获取输出类型并格式化
+	val format = context.getOutputFormatClass.getConstructor().newInstance()
+	format match {
+      case c: Configurable => c.setConf(context.getConfiguration)
+      case _ => ()
+    }    
+    2. 获取提交器
+    format.getOutputCommitter(context)
+    
+    def newTaskTempFile(taskContext: TaskAttemptContext, dir: Option[String], ext: String): String
+	功能: 常见任务临时文件
+    输入参数:
+    	taskContext	任务上下文管理器
+    	dir	目录名称
+    	ext	???
+    1. 获取文件名称
+    val filename = getFilename(taskContext, ext)
+    2. 获取stage的目录
+    val stagingDir: Path = committer match {
+    	//  可以动态覆盖分区内容，则stage目录为本类的stage目录
+      case _ if dynamicPartitionOverwrite => 
+        assert(dir.isDefined,
+          "The dataset to be written must be partitioned when dynamicPartitionOverwrite is true.")
+        partitionPaths += dir.get
+        this.stagingDir
+		//匹配文件输出提交器，路径就是自己的工作路径
+      case f: FileOutputCommitter =>
+        new Path(Option(f.getWorkPath).map(_.toString).getOrElse(path))
+      case _ => new Path(path)
+    }
+    3. 获取目录的名称
+    dirmap { d =>new Path(new Path(stagingDir, d), filename).toString}
+    .getOrElse{ new Path(stagingDir, filename).toString}
+    
+    def getFilename(taskContext: TaskAttemptContext, ext: String): String
+    功能: 获取文件名
+    文件名称形如part-00000-2dd664f9-d2c4-4ffe-878f-c6c70c1fb0cb_00003-c000.parquet 注意到%05d不会清楚分	片数量，所以当任务数量超过100000个任务时，文件名称仍就完好且不会溢出。
+    1. 获取分片id
+    part-00000-2dd664f9-d2c4-4ffe-878f-c6c70c1fb0cb_00003-c000.parquet
+    2. 返回文件名称
+    val= f"part-$split%05d-$jobId$ext"
+    
+    def setupJob(jobContext: JobContext): Unit 
+    功能: 建立job
+    1. 设置id(jobId 工作id,taskId任务id,taskAttemptId任务请求id)
+	val jobId = SparkHadoopWriterUtils.createJobID(new Date, 0)
+    val taskId = new TaskID(jobId, TaskType.MAP, 0)
+    val taskAttemptId = new TaskAttemptID(taskId, 0)
+    2. 设置相关配置信息
+    jobContext.getConfiguration.set("mapreduce.job.id", jobId.toString)
+    jobContext.getConfiguration.set("mapreduce.task.id", taskAttemptId.getTaskID.toString)
+    jobContext.getConfiguration.set("mapreduce.task.attempt.id", taskAttemptId.toString)
+    jobContext.getConfiguration.setBoolean("mapreduce.task.ismap", true)
+    jobContext.getConfiguration.setInt("mapreduce.task.partition", 0)
+    3. 
+    
+}
+```
+
+
+
 #### HadoopWriteConfigUtil
+
+```markdown
+介绍:
+	创建输出格式/提交器/写出器的接口，用于保存RDD的过程中，使用Hadoop的输出方式@OutputFormat(可以兼容新旧Hadoop API)
+	注意:
+	1. 当错误的hadoop API使用时会抛出异常
+	2. 实现类必须要是可序列化的，因为实例初始化在driver端，且用于executor端的任务中
+	3. 实现需要有确定一个的构造器参数
+```
+
+```markdown
+abstract class HadoopWriteConfigUtil[K, V: ClassTag] {
+	关系: father --> Serializable
+	操作集:
+	def createJobContext(jobTrackerId: String, jobId: Int): JobContext
+	功能: 创建job的上下文实例
+	
+	def createTaskAttemptContext(jobTrackerId:String,jobId:Int,splitId:Int,
+      taskAttemptId: Int): TaskAttemptContext
+    功能: 创建任务上下文对象
+    
+    def createCommitter(jobId: Int): HadoopMapReduceCommitProtocol
+    功能: 创建提交器
+    
+    def initWriter(taskContext: TaskAttemptContext, splitId: Int): Unit
+    功能: 初始化写出器
+    
+    def write(pair: (K, V)): Unit
+    功能: 写出键值对
+    
+    def closeWriter(taskContext: TaskAttemptContext): Unit
+    功能: 关闭写出器
+    
+    def initOutputFormat(jobContext: JobContext): Unit
+    功能: 初始化输出器
+    
+    def assertConf(jobContext: JobContext, conf: SparkConf): Unit
+    功能: 配置断言
+}
+```
 
 #### SparkHadoopWriter
 
 #### SparkHadoopWriterUtils
 
+```markdown
+介绍:
+	辅助对象，用于提供通用工具，用于保存RDD期间使用Hadoop输出@OutputFormat
+```
+
+```markdown
+private[spark] object SparkHadoopWriterUtils{
+	属性:
+	#name @RECORDS_BETWEEN_BYTES_WRITTEN_METRIC_UPDATES=256	写出字节度量更新数量(默认256)
+	#name @disableOutputSpecValidation=new DynamicVariable[Boolean](false)
+		允许@spark.hadoop.validateOutputSpecs按情况检查失效情况，参照SPARK-4835去寻找更多的细节。
+	操作集:
+	def createJobID(time: Date, id: Int): JobID
+	功能: 创建任务ID
+	1. 根据指定时间获取job 追踪ID
+	val jobtrackerID = @createJobTrackerID(time)
+	2. 获取jobID
+	val= new JobID(jobtrackerID, id)
+	
+	def createJobTrackerID(time: Date): String 
+	功能: 获取job追踪器ID
+	val= new SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(time)
+		job追踪器格式: yyyyMMddHHmmss
+	
+	def createPathFromString(path: String, conf: JobConf): Path
+	功能: 创建指定@path的路径
+	操作条件: 输出串非空@path!=null，指定文件系统非空@outputPath.getFileSystem(conf)!=null
+        val outputPath = new Path(path)
+        val fs = outputPath.getFileSystem(conf)
+		outputPath.makeQualified(fs.getUri, fs.getWorkingDirectory)
+	
+	def isOutputSpecValidationEnabled(conf: SparkConf): Boolean
+	功能: 输出是否允许批准
+	1. 确认批准是否失效
+	val validationDisabled = disableOutputSpecValidation.value
+	2. 是否允许配置
+	val enabledInConf = conf.getBoolean("spark.hadoop.validateOutputSpecs", true)
+	val= enabledInConf && !validationDisabled
+	
+	def initHadoopOutputMetrics(context: TasgkContext): (OutputMetrics, () => Long)
+	功能: 初始化Hadoop输出度量器
+	1. 获取写出字节数量
+	val bytesWrittenCallback = SparkHadoopUtil.get.getFSBytesWrittenOnThreadCallback()
+	val= (context.taskMetrics().outputMetrics, bytesWrittenCallback)
+	
+	def maybeUpdateOutputMetrics(outputMetrics: OutputMetrics,callback: () => Long,
+      recordsWritten: Long): Unit 
+     功能: 更新输出度量器
+     1. 更新条件 recordsWritten % RECORDS_BETWEEN_BYTES_WRITTEN_METRIC_UPDATES == 0
+     + 更新操作
+      outputMetrics.setBytesWritten(callback())	// 更新已经写出的字节数量
+      outputMetrics.setRecordsWritten(recordsWritten) // 更新已经写出的记录数量
+}
+```
+
 ---
-
-
 
 #### plugin
 
-1.  [PluginContainer.scala](# PluginContainer)
+1. [PluginContainer.scala](# PluginContainer)
 
 2. [PluginContextImpl.scala](# PluginContextImpl)
-
-3.  [PluginEndpoint.scala](# PluginEndpoint)
+   
+3. [PluginEndpoint.scala](# PluginEndpoint)
 
    ---
 
    #### PluginContainer
 
+   ```markdown
+   sealed abstract class PluginContainer{
+   	操作集:
+   	def shutdown(): Unit
+   	功能: 关闭插件容器
+   	def registerMetrics(appId: String): Unit
+   	功能: 注册度量参数
+   }
+   ```
+   
+   ```markdown
+   private class DriverPluginContainer(sc: SparkContext, plugins: Seq[SparkPlugin]){
+   	关系: father --> PluginContainer
+   	sibling --> Logging
+   	介绍: 驱动器插件容器
+   	构造器属性:
+   		sc	应用程序配置集
+   		plugins	插件序列
+   	属性:
+   	#name @driverPlugins #type @ Seq[(String, DriverPlugin, PluginContextImpl)]	驱动器插件
+   	plugins.flatMap { p =>
+   		val driverPlugin = p.driverPlugin()
+   		if (driverPlugin != null) {
+   			val name = p.getClass().getName()
+   			val ctx = new PluginContextImpl(name, sc.env.rpcEnv, sc.env.metricsSystem,
+               	sc.conf,sc.env.executorId)
+   			// 获取并初始化额外信息
+   			val extraConf = driverPlugin.init(sc, ctx)
+   			if (extraConf != null) {
+                   extraConf.asScala.foreach { case (k, v) =>
+             		sc.conf.set(s"${PluginContainer.EXTRA_CONF_PREFIX}$name.$k", v)
+           	}
+               // 注册插件信息
+         		Some((p.getClass().getName(), driverPlugin, ctx))
+         	}else
+         		None
+        
+        初始化操作:
+        if (driverPlugins.nonEmpty) {
+       	val pluginsByName = driverPlugins.map { case (name, plugin, _) => (name, plugin) }.toMap
+       	sc.env.rpcEnv.setupEndpoint(classOf[PluginEndpoint].getName(),
+         	new PluginEndpoint(pluginsByName, sc.env.rpcEnv))
+     	}
+     	功能: 获取插件列表对应的插件末端点数据信息@PluginEndpoint
+       
+       操作集:
+       def registerMetrics(appId: String): Unit
+       功能: 登记度量器
+       	driverPlugins.foreach { case (_, plugin, ctx) =>
+        	 	plugin.registerMetrics(appId, ctx)
+         		ctx.registerMetrics()
+       	}
+       
+       def shutdown(): Unit
+       功能: 关闭
+       driverPlugins.foreach { case (name, plugin, _) =>
+       	plugin.shutdown() : Throwable}
+   }
+   ```
+   
+   ```markdown
+   private class ExecutorPluginContainer(env: SparkEnv, plugins: Seq[SparkPlugin]){
+   	关系: father --> PluginContainer
+   		sibling --> Logging
+   	构造器属性:
+   		env		spark环境变量
+   		plugins	插件列表
+   	属性:
+   	#name @executorPlugins	#type @Seq[(String, ExecutorPlugin)]	执行器插件列表
+   	1. 获取其余配置信息
+   	val allExtraConf = env.conf.getAllWithPrefix(PluginContainer.EXTRA_CONF_PREFIX)
+   	2. 注册执行器插件信息
+   	plugins.flatMap { p =>
+         val executorPlugin = p.executorPlugin()
+         if (executorPlugin != null) {
+           val name = p.getClass().getName()
+           val prefix = name + "."
+           val extraConf = allExtraConf
+             .filter { case (k, v) => k.startsWith(prefix) }
+             .map { case (k, v) => k.substring(prefix.length()) -> v }
+             .toMap
+             .asJava
+           val ctx = new PluginContextImpl(name, env.rpcEnv, env.metricsSystem, env.conf,
+             env.executorId)
+   		// 初始化配置信息
+           executorPlugin.init(ctx, extraConf)
+           ctx.registerMetrics()
+           Some(p.getClass().getName() -> executorPlugin)
+        }else
+        	None
+        	
+       def registerMetrics(appId: String): Unit
+       	throw IllegalStateException ("Should not be called for the executor container.")
+       
+       def shutdown(): Unit
+       功能: 关闭
+       executorPlugins.foreach { case (name, plugin) =>
+       	plugin.shutdown() : Throwable }
+   }
+   ```
+   
+   ```markdown
+   object PluginContainer {
+   	属性: 
+   	#name @EXTRA_CONF_PREFIX="spark.plugins.internal.conf."	配置前缀
+   	操作集：
+   	def apply(sc: SparkContext): Option[PluginContainer] = PluginContainer(Left(sc))
+   	功能: 根据指定的spark上下文@sc获取一个插件容器
+   	
+   	def apply(env: SparkEnv): Option[PluginContainer] = PluginContainer(Right(env))
+   	功能： 根据spark环境变量@env获取一个插件容器
+   	
+   	def apply(ctx: Either[SparkContext, SparkEnv]): Option[PluginContainer]
+   	功能: 根据任意一种情况，获取插件容器
+   	val conf = ctx.fold(_.conf, _.conf)
+       val plugins = Utils.loadExtensions(classOf[SparkPlugin], conf.get(PLUGINS).distinct, conf)
+           if (plugins.nonEmpty) {
+             ctx match {
+               case Left(sc) => Some(new DriverPluginContainer(sc, plugins))
+               case Right(env) => Some(new ExecutorPluginContainer(env, plugins))
+             }
+           } else {
+             None
+           }
+   }
+   ```
+   
+   
+   
    #### PluginContextImpl
-
+   
+   ```markdown
+   private class PluginContextImpl(pluginName: String,rpcEnv: RpcEnv,metricsSystem: MetricsSystem,
+       override val conf: SparkConf,override val executorID: String){
+   	关系: father --> PluginContext
+       	sibling --> Logging
+       构造器属性:
+       	pluginName	插件名称
+       	rpcEnv		rpc环境
+       	metricsSystem	度量系统
+       	conf		应用程序配置集
+       	executorID	执行器ID
+       属性:
+       	#name @registry=new MetricRegistry()	度量登记器
+       	#name @driverEndpoint	driver末端点
+       	val=RpcUtils.makeDriverRef(classOf[PluginEndpoint].getName(), conf, rpcEnv) : null
+       操作集:
+       def metricRegistry(): MetricRegistry = registry
+       功能: 获取度量登记器
+       
+       def send(message: AnyRef): Unit
+       功能: 发送信息
+       操作条件: 存在有driver末端点 driverEndpoint == null
+       driverEndpoint.send(PluginMessage(pluginName, message))
+       
+       def ask(message: AnyRef): AnyRef
+       功能: 请求获取信息
+       操作条件: 存在有driver末端点
+       val= driverEndpoint.askSync[AnyRef](PluginMessage(pluginName, message))
+       
+       def registerMetrics(): Unit 
+       功能: 注册度量器
+       操作条件： 度量器非空
+       val= !registry.getMetrics().isEmpty() ? 
+       	{val src = new PluginMetricsSource(s"plugin.$pluginName", registry)
+       	metricsSystem.registerSource(src)} : Nop
+       	
+       内部类:
+       class PluginMetricsSource(override val sourceName: String,
+         	override val metricRegistry: MetricRegistry)
+   	关系: father --> Source
+   }
+   ```
    #### PluginEndpoint
+   
+   ```markdown
+   private class PluginEndpoint(plugins: Map[String, DriverPlugin],override val rpcEnv: RpcEnv){
+   	关系: father --> IsolatedRpcEndpoint
+   		sibling --> Logging
+   	构造器属性: 
+   		plugins	参数列表
+   		rpcEnv	rpc环境
+   	操作集:
+   	def receive: PartialFunction[Any, Unit]
+   	功能: 接受局部函数
+   	1. 匹配插件信息
+   	case PluginMessage(pluginName, message) =>
+   		plugins.get(pluginName) match {
+   			case Some(plugin) =>{ 
+   				val reply = plugin.receive(message)
+   				val= reply
+   			}
+   			case None => throw IllegalArgumentException
+   		}
+   	
+   	def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit]
+   	功能: 很久指定RPC调用上下文环境@context获取局部函数
+   	val= case PluginMessage(pluginName, message) =>
+   			plugins.get(pluginName) match {
+   				case Some(plugin) =>
+   					context.reply(plugin.receive(message))
+   				case None
+   					throw IllegalArgumentException
+   }
+   ```
+   
+   
 
 #### Logging
+
+```markdown
+介绍:
+	对于希望对数据做日志记录的类来说的一个实用特征。创建一个slf4j的日记记录器，允许日志信息使用懒加载的估算值,并登记到不同等级的日志中去。
+```
+
+```markdown
+trait Logging {
+	属性:
+	#name @log_=null #type @Logger
+		使得日志属性变成@transient,以至于带有Logging的对象能够被序列化，且使用在其他的机器上
+	操作集:
+	def logName: String={this.getClass.getName.stripSuffix("$")}
+	功能: 获取本对象的记录器名称
+	
+	def log: Logger
+	功能: 获取或者创造本类对象的记录器
+	1. 获取log_ 日志管理器
+    	(log_==null)? 
+		{initializeLogIfNecessary(false)
+		log_ = LoggerFactory.getLogger(logName)}:Nop
+	2. val=log_
+	
+	def logInfo(msg: => String): Unit = if (log.isInfoEnabled) log.info(msg)
+	功能: 记录info级别的日志信息
+	
+	def logDebug(msg: => String): Unit = if (log.isDebugEnabled) log.debug(msg)
+	功能: 记录debug级别的日志信息
+	
+	def logTrace(msg: => String): Unit = if (log.isTraceEnabled) log.trace(msg)
+	功能：记录trace级别日志信息
+	
+	def logWarning(msg: => String): Unit = if (log.isWarnEnabled) log.warn(msg)
+	功能: 记录warning级别的日志
+	
+	def logError(msg: => String): Unit = if (log.isErrorEnabled) log.error(msg)
+	功能: 记录error级别的日志
+	
+	def logInfo(msg: => String, throwable: Throwable): Unit
+	功能: 允许接收异常的info级别日志记录
+	
+	def logDebug(msg: => String, throwable: Throwable): Unit
+	功能: 允许接收异常的debug级别日志记录
+	
+	def logTrace(msg: => String, throwable: Throwable): Unit
+	功能: 允许接收异常的trace级别日志记录
+	
+	def logWarning(msg: => String, throwable: Throwable): Unit
+	功能: 允许接收异常的warning级别日志记录
+	
+	def logError(msg: => String, throwable: Throwable): Unit
+	功能: 允许接收异常的error级别日志
+	
+	def isTraceEnabled(): Boolean = { log.isTraceEnabled }
+	功能: 确定是否可以追踪
+	
+	def initializeLogIfNecessary(isInterpreter: Boolean): Unit
+	功能: 如果有必要的话，对日志文件进行初始化
+		initializeLogIfNecessary(isInterpreter, silent = false)
+	
+	def initializeLogIfNecessary(isInterpreter: Boolean,
+      silent: Boolean = false): Boolean
+    功能: 初始化日志
+    操作条件: 日志系统没有初始化
+    val= 
+    if (!Logging.initialized) {
+    	Logging.initLock.synchronized {
+    		if (!Logging.initialized) { // 双重检索式保证线程安全
+    			initializeLogging(isInterpreter, silent)
+          		return true
+          	}
+         }
+     }
+     false
+     
+	def initializeForcefully(isInterpreter: Boolean, silent: Boolean): Unit 
+	功能: 强力初始化
+		initializeLogging(isInterpreter, silent)
+	
+	def initializeLogging(isInterpreter: Boolean, silent: Boolean): Unit
+	功能: 初始化日志
+	操作条件: 日志类型为log4j类型日志
+	0. Logging.isLog4j12() ? Jump 1 : Nop
+	1. 确认日志管理器是否初始化完毕
+	val log4j12Initialized = LogManager.getRootLogger.getAllAppenders.hasMoreElements
+	!log4j12Initialized? Jump 2 : Nop
+	2. 获取默认参数
+	Logging.defaultSparkLog4jConfig = true // 开启soark log4j配置
+	val defaultLogProps = "org/apache/spark/log4j-defaults.properties" // 默认日志属性
+	Option(Utils.getSparkClassLoader.getResource(defaultLogProps)) match {
+		case Some(url) => PropertyConfigurator.configure(url)
+		if (!silent)
+			System.err.println(s"Using Spark's default log4j profile: $defaultLogProps")
+		case None =>
+			System.err.println(s"Spark was unable to load $defaultLogProps")
+	}
+	3. 获取根日志管理器
+	val rootLogger = LogManager.getRootLogger()
+    if (Logging.defaultRootLevel == null) 
+        Logging.defaultRootLevel = rootLogger.getLevel()
+	
+	4. 中断处理
+	isInterpreter ? JUMP 5 :Nop
+	5. 获取响应日志和响应等级
+	val replLogger = LogManager.getLogger(logName)
+    val replLevel = Option(replLogger.getLevel()).getOrElse(Level.WARN)
+	6. 更新控制台添加器(spark-shell)容量为响应等级@replLevel
+	if (replLevel != rootLogger.getEffectiveLevel()) {
+		if (!silent) {
+            System.err.printf("Setting default log level to \"%s\".\n", replLevel)
+            System.err.println("To adjust logging level use sc.setLogLevel(newLevel). " +
+              "For SparkR, use setLogLevel(newLevel).")
+         }
+         Logging.sparkShellThresholdLevel = replLevel
+         rootLogger.getAllAppenders().asScala.foreach {
+            case ca: ConsoleAppender =>
+              ca.addFilter(new SparkShellLoggingFilter())
+            case _ => // no-op
+         }
+	}
+	7. 完成初始化
+	Logging.initialized = true
+	val= log
+}
+```
+
+```markdown
+private[spark] object Logging {
+	属性:
+	#name @initialized=false #type @Boolean volatile	日志管理器初始化状态
+    #name @defaultRootLevel=null #type @Level volatile 	默认根目录等级
+    #name @defaultSparkLog4jConfig=false #type @Boolean volatile 默认spark Log4j配置状态位
+	#name @sparkShellThresholdLevel=null #type @Level volatile 默认spark shell 容量等级
+	#name @initLock = new Object() 初始化锁
+	初始化操作:
+	try{
+		// 通过反射用来处理用户移除slf4j-to-jul桥，用于定位其JUL log位置
+        val bridgeClass = Utils.classForName("org.slf4j.bridge.SLF4JBridgeHandler")
+        bridgeClass.getMethod("removeHandlersForRootLogger").invoke(null)
+        val installed = bridgeClass.getMethod("isInstalled").invoke(null).asInstanceOf[Boolean]
+        if (!installed) bridgeClass.getMethod("install").invoke(null)
+	}catch {
+		case e: ClassNotFoundException => // Nop
+	}
+	
+	操作集：
+	def isLog4j12(): Boolean
+	功能: 分辨是否为log4j 1.2绑定
+	val=binderClass = StaticLoggerBinder.getSingleton.getLoggerFactoryClassStr
+    "org.slf4j.impl.Log4jLoggerFactory".equals(binderClass)
+    
+    def uninitialize(): Unit 
+    功能: 标记日志系统当前处于未初始化状态,尽最大努力重置日志系统到达其初始状态，以便于下个类触发时，运行在初始		状态下。
+	// 重置defaultSparkLog4jConfig,sparkShellThresholdLevel属性
+	if (isLog4j12()) {
+      if (defaultSparkLog4jConfig) {
+        defaultSparkLog4jConfig = false
+        LogManager.resetConfiguration()
+      } else {
+        val rootLogger = LogManager.getRootLogger()
+        rootLogger.setLevel(defaultRootLevel)
+        sparkShellThresholdLevel = null
+      }
+    }
+    // 修改标志
+    this.initialized = false
+}
+```
+
+```markdown
+private class SparkShellLoggingFilter{
+	关系: father --> Filter
+	def decide(loggingEvent: LoggingEvent): Int
+	功能: 决定接受还是质疑日志事件
+	介绍: 如果spark-shell 容量等级@sparkShellThresholdLevel没有定义，那么过滤器不会进行操作
+	如果日志等级不等于根目录等级(root level),那么这个日志事件被允许。否则则决定于日志是来自于日志是否来自于
+    root或者用户配置
+    if (Logging.sparkShellThresholdLevel == null) {
+      Filter.NEUTRAL // 接受sparkshell容量未定义状态
+    } else if (loggingEvent.getLevel.isGreaterOrEqual(Logging.sparkShellThresholdLevel)) {
+      Filter.NEUTRAL // 接受等级是否满足要求
+    } else {
+      var logger = loggingEvent.getLogger()
+      while (logger.getParent() != null) {
+        if (logger.getLevel != null || logger.getAllAppenders.hasMoreElements) {
+          return Filter.NEUTRAL // 向root获取日志信息，则接受
+        }
+        logger = logger.getParent()
+      }
+      Filter.DENY  // 不在root一系列的树型结构中，质疑
+    }
+}
+```
+
+
+
+基础拓展
+
+1.  scala apply方法
+2.  注解@transient
+3.   #class @OutputCommitter
