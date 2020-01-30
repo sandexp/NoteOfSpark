@@ -1,3 +1,5 @@
+
+
 ## *spark-internal**
 
 ---
@@ -55,7 +57,387 @@
 
 #### ConfigBuilder
 
+```markdown
+private object ConfigHelpers {
+	功能: 辅助配置
+	操作集:
+	def toNumber[T](s: String, converter: String => T, key: String, configType: String): T
+	功能: 将字符串类型转化为数字类型T
+	val= converter(s.trim)
+	
+	def toBoolean(s: String, key: String): Boolean
+	功能: 转化为boolean类型
+	val= s.trim.toBoolean
+	
+	def stringToSeq[T](str: String, converter: String => T): Seq[T]
+	功能: 字符串转序列
+	val= Utils.stringToSeq(str).map(converter)
+	
+	def seqToString[T](v: Seq[T], stringConverter: T => String): String 
+	功能: 序列转串
+	val= v.map(stringConverter).mkString(",")
+	
+	def timeFromString(str: String, unit: TimeUnit): Long = JavaUtils.timeStringAs(str, unit)
+	功能: 获取串对应的时间值(long型)
+	
+	def timeToString(v: Long, unit: TimeUnit): String = TimeUnit.MILLISECONDS.convert(v, unit) + "ms"
+	功能: 时间转串
+	
+	def byteFromString(str: String, unit: ByteUnit): Long
+	功能: 串转字节
+	val (input, multiplier) =
+      if (str.length() > 0 && str.charAt(0) == '-') {
+        (str.substring(1), -1)
+      } else {
+        (str, 1)
+      }
+    multiplier * JavaUtils.byteStringAs(input, unit)
+	
+	def byteToString(v: Long, unit: ByteUnit): String = unit.convertTo(v, ByteUnit.BYTE) + "b"
+	功能: 字节转串
+	
+	def regexFromString(str: String, key: String): Regex
+	功能: 串转正则表达式
+	try str.r catch {
+		case e: PatternSyntaxException =>
+			throw IllegalArgumentException
+	}
+}
+```
+
+```markdown
+private[spark] class TypedConfigBuilder[T] (val parent: ConfigBuilder,val converter: String => T,
+  	val stringConverter: T => String){
+ 	介绍: 类型安全的配置组件，提供了转换输入数据以及创建最终配置键值对的方法。
+    	返回@ConfigEntry配置键值对的方法，必须要能够可以使用在sparkConf下。
+    构造器:
+    	parent	上级配置组件器
+    	converter	转换函数(String --> T)
+    	stringConverter	串转换函数(T--> String)
+    操作集:
+    def transform(fn: T => T): TypedConfigBuilder[T]
+    功能: 转换为类型安全的配置组件@TypedConfigBuilder，转换函数为指定@fn
+    val= new TypedConfigBuilder(parent, s => fn(converter(s)), stringConverter)
+    
+    def checkValue(validator: T => Boolean, errorMsg: String): TypedConfigBuilder[T]
+    功能: 检查用户给出的value值是否匹配,返回类型安全的配置组件@TypedConfigBuilder
+ 	输入参数: validator	验证函数
+ 			errorMsg	错误信息
+ 	val= transform { v =>
+      		if (!validator(v)) throw new IllegalArgumentException(errorMsg)
+      		v
+    	}
+    
+    def checkValues(validValues: Set[T]): TypedConfigBuilder[T]
+    功能: 检查用户提供的值是否满足预设集合
+    val= transform { v =>
+      if (!validValues.contains(v)) 
+        throw new IllegalArgumentException
+      v
+    }
+    
+    def toSequence: TypedConfigBuilder[Seq[T]]
+    功能: 转换配置键值对成底层类型序列@TypedConfigBuilder[Seq[T]]
+    val= new TypedConfigBuilder(parent, stringToSeq(_, converter), seqToString(_, stringConverter))
+    
+    def createOptional: OptionalConfigEntry[T] 
+    功能: 创建一个配置键值对@OptionalConfigEntry[T]
+ 	1. 获取键值对信息
+ 	val entry = new OptionalConfigEntry[T](parent.key, parent._prependedKey,
+      	parent._prependSeparator, parent._alternatives, converter, stringConverter, parent._doc,
+      	parent._public)
+ 	2. 创建获取的键值对
+ 	parent._onCreate.foreach(_(entry))
+ 	val= entry
+ 	
+ 	def createWithDefault(default: T): ConfigEntry[T]
+ 	功能: 使用默认值@default创建配置键值对@ConfigEntry
+ 	default.isInstanceOf[String] ?
+ 		createWithDefaultString(default.asInstanceOf[String]) :
+ 		{	
+ 			// 获取默认值对应的字符串
+ 			val transformedDefault = converter(stringConverter(default))
+             // 获取字符串对应的键值对
+             val entry = new ConfigEntryWithDefault[T](parent.key, parent._prependedKey,
+                parent._prependSeparator, parent._alternatives, transformedDefault, converter,
+                stringConverter, parent._doc, parent._public)
+ 			val= entry
+ 		}
+ 	
+ 	def createWithDefaultString(default: String): ConfigEntry[T]
+ 	功能: 根据默认的串创建配置键值对@ConfigEntry
+ 	val entry = new ConfigEntryWithDefaultString[T](parent.key, parent._prependedKey,
+      parent._prependSeparator, parent._alternatives, default, converter, stringConverter,
+      parent._doc, parent._public)
+    parent._onCreate.foreach(_(entry)) // 创建配置键值对
+    val= entry
+    
+    def createWithDefaultFunction(defaultFunc: () => T): ConfigEntry[T]
+    功能: 根据默认函数@defaultFunc 创建配置键值对
+    val entry = new ConfigEntryWithDefaultFunction[T](parent.key, parent._prependedKey,
+      parent._prependSeparator, parent._alternatives, defaultFunc, converter, stringConverter,
+      parent._doc, parent._public)
+    parent._onCreate.foreach(_ (entry))
+    val= entry
+ }
+```
+
+```markdown
+private[spark] case class ConfigBuilder(key: String) {
+	介绍: spark配置的基础组件器@ConfigBuilder
+	属性:
+	#name @_prependedKey=None #type @Option[String] 	预先添加的key值
+	#name @_prependSeparator="" #type @String	预先添加的分离字符串
+	#name @_public = true	是否为公用标志
+	#name @_doc="" 	说明文档
+	#name @_onCreate=None #type @Option[ConfigEntry[_] => Unit]	创建函数
+	#name @_alternatives=List.empty[String] 可代替选择列表
+	
+	操作集:
+	def internal(): ConfigBuilder
+	功能: 禁止外部访问
+        _public = false
+        val=this
+	
+	def doc(s: String): ConfigBuilder
+	功能: 设置文档内容
+        _doc = s
+        val=this
+	
+	def onCreate(callback: ConfigEntry[_] => Unit): ConfigBuilder 
+	功能: 配置键值对最终实例化时，注册回调函数@callback，当前用于SQLConf用于追踪SQL配置键值对
+        _onCreate = Option(callback)
+        this
+	
+	def withPrepended(key: String, separator: String = " "): ConfigBuilder
+	功能: 预读@key与分割字符串@separator
+        _prependedKey = Option(key)
+        _prependSeparator = separator
+        this
+	
+	def withAlternative(key: String): ConfigBuilder
+	功能: 可代替列表中添加key值
+        _alternatives = _alternatives :+ key
+        this
+	
+	def intConf: TypedConfigBuilder[Int]
+	功能: int型配置
+        checkPrependConfig
+        val= new TypedConfigBuilder(this, toNumber(_, _.toInt, key, "int"))
+	
+	def longConf: TypedConfigBuilder[Long]
+	功能: long 型配置
+        checkPrependConfig
+        new TypedConfigBuilder(this, toNumber(_, _.toLong, key, "long"))
+	
+	def doubleConf: TypedConfigBuilder[Double]
+	功能: double 型配置
+	val= new TypedConfigBuilder(this, toNumber(_, _.toDouble, key, "double"))
+	
+	 def timeConf(unit: TimeUnit): TypedConfigBuilder[Long]
+	 功能: time 型配置
+         checkPrependConfig
+         val= new TypedConfigBuilder(this, timeFromString(_, unit), timeToString(_, unit))
+	
+	def stringConf: TypedConfigBuilder[Long] 
+	功能: string 配置
+	val= new TypedConfigBuilder(this, v => v)
+	
+	def bytesConf(unit: ByteUnit): TypedConfigBuilder[Long]
+	功能: byte型 配置
+	checkPrependConfig
+     val= new TypedConfigBuilder(this, byteFromString(_, unit), byteToString(_, unit))
+	
+	def regexConf: TypedConfigBuilder[Regex]
+	功能: 正则配置
+	checkPrependConfig
+     val= new TypedConfigBuilder(this, regexFromString(_, this.key), _.toString)
+	
+	def fallbackConf[T](fallback: ConfigEntry[T]): ConfigEntry[T]
+	功能: 回退配置
+	输入参数: fallback 回退配置键值对(恢复到fallback的配置)
+	val entry = new FallbackConfigEntry(key, _prependedKey, _prependSeparator, _alternatives, _doc,
+      _public, fallback)
+    _onCreate.foreach(_(entry))
+    val= entry
+	
+	def checkPrependConfig:Unit
+	功能: 检查预置配置
+		if (_prependedKey.isDefined)
+			throw new IllegalArgumentException
+}	
+```
+
+
+
 #### ConfigEntry
+
+```markdown
+介绍:
+	这个entry(键值对信息)包含配置的元数据信息。
+	当设置变量替代一个配置值的时候。仅仅前缀为spark.的才会被考虑在默认命名空间内。对于已知的spark配置键值(使用ConfigBuilder配置的键值)，当其存在时，也会考虑默认值。
+	变量扩展也使用在有默认值的键值对信息中，这些信息含有一个string格式的默认值。
+```
+
+```markdown
+private[spark] abstract class ConfigEntry[T] (val key: String,val prependedKey: Option[String],
+    val prependSeparator: String,val alternatives: List[String],val valueConverter: String => T,
+    val stringConverter: T => String,val doc: String,val isPublic: Boolean)
+    构造器属性:
+    	key	配置的key值
+    	prependedKey	预置key值
+    	prependSeparator	预置分离字符串
+    	valueConverter	value转换函数(String --> T)
+    	stringConverter	string转换函数
+    	doc	配置文档
+    	isPublic	是否对用于公开
+ 	
+ 	def defaultValueString: String
+ 	功能: 获取默认value的串信息
+ 	
+ 	def readString(reader: ConfigReader): Option[String]
+ 	功能: 获取配置阅读器@reader的
+ 	1. 获取预置信息中的value列表
+ 	val values = Seq(
+      prependedKey.flatMap(reader.get(_)),
+      alternatives.foldLeft(reader.get(key))((res, nextKey) => res.orElse(reader.get(nextKey)))
+    ).flatten
+    2. 返回value列表信息
+    val= values.nonEmpty ? Some(values.mkString(prependSeparator)) : None
+    
+    def readFrom(reader: ConfigReader): T
+    功能: 获取阅读器@reader的值
+    
+    def defaultValue: Option[T] = None
+    功能: 获取默认值
+    
+    def toString: String
+    功能: 显示信息值
+ }
+```
+
+```markdown
+private class ConfigEntryWithDefault[T] (
+    key: String,
+    prependedKey: Option[String],
+    prependSeparator: String,
+    alternatives: List[String],
+    _defaultValue: T,
+    valueConverter: String => T,
+    stringConverter: T => String,
+    doc: String,
+    isPublic: Boolean){
+	介绍: 默认状态下获取配置键值对信息
+    关系: father --> ConfigEntry(key,prependedKey,prependSeparator,alternatives,valueConverter,
+    		stringConverter,doc,isPublic)
+	操作集:
+	def defaultValue: Option[T] = Some(_defaultValue)
+	功能: 获取默认value值
+	
+	def defaultValueString: String = stringConverter(_defaultValue)
+	功能: 获取默认value值的串表达形式
+	
+	def readFrom(reader: ConfigReader): T
+	功能: 获取阅读器的默认value值，类型为T
+	readString(reader).map(valueConverter).getOrElse(_defaultValue)
+}
+```
+
+```markdown
+private class ConfigEntryWithDefaultString[T] (key: String,prependedKey: Option[String],
+    prependSeparator: String,alternatives: List[String],_defaultValue: String,
+    valueConverter: String => T,stringConverter: T => String,
+    doc: String,isPublic: Boolean){
+	关系: father -->  ConfigEntry(key,prependedKey,prependSeparator,alternatives,valueConverter,
+    		stringConverter,doc,isPublic)
+    介绍: 默认串情景下配置键值对的处理方式
+    操作集:
+    def defaultValue: Option[T] = Some(valueConverter(_defaultValue))
+    功能: 获取默认值
+    
+    def defaultValueString: String = _defaultValue
+    功能: 获取默认值的串表达形式
+    
+    def readFrom(reader: ConfigReader): T
+    功能: 获取阅读器默认value值
+    val value = readString(reader).getOrElse(reader.substitute(_defaultValue))// String
+    val= valueConverter(value)
+}
+```
+
+```markdown
+private class ConfigEntryWithDefaultFunction[T] (key: String,prependedKey: Option[String],
+    prependSeparator: String,alternatives: List[String],_defaultFunction: () => T,
+    valueConverter: String => T,stringConverter: T => String,
+    doc: String,isPublic: Boolean){
+	关系: father --> ConfigEntry(key,prependedKey,prependSeparator,alternatives,valueConverter,
+    		stringConverter,doc,isPublic)
+     操作集:
+     def defaultValue: Option[T] = Some(_defaultFunction())
+     功能: 获取默认value值
+     
+     def defaultValueString: String = stringConverter(_defaultFunction())
+     功能: 获取默认value值的串表达方式
+     
+     def readFrom(reader: ConfigReader): T
+     功能: 获取阅读器默认value值
+     val= readString(reader).map(valueConverter).getOrElse(_defaultFunction())
+}
+```
+
+```markdown
+private[spark] class OptionalConfigEntry[T] (key: String,prependedKey: Option[String],
+    prependSeparator: String,alternatives: List[String],
+    val rawValueConverter: String => T,val rawStringConverter: T => String,
+    doc: String,isPublic: Boolean){
+	关系: father -->  ConfigEntry[Option[T]](key,prependedKey,prependSeparator,alternatives,
+    	s => Some(rawValueConverter(s)),v => v.map(rawStringConverter).orNull,doc,isPublic)
+     介绍: 可以包含空的配置键值对
+	操作集:
+	def defaultValueString: String = ConfigEntry.UNDEFINED
+	功能: 获取默认value的串表达形式
+	
+	def readFrom(reader: ConfigReader): Option[T]
+	功能: 获取阅读器的默认值
+	val=readString(reader).map(rawValueConverter)
+}
+```
+
+```markdown
+private[spark] class FallbackConfigEntry[T] (key: String,prependedKey: Option[String],
+    prependSeparator: String,alternatives: List[String],
+    doc: String,isPublic: Boolean,val fallback: ConfigEntry[T]))
+	关系: father --> ConfigEntry[T](key,prependedKey,prependSeparator,alternatives,
+    		fallback.valueConverter,fallback.stringConverter,doc,isPublic)
+	介绍: 为回退而设置的配置键值对信息
+	操作集:
+	def defaultValueString: String = s"<value of ${fallback.key}>"
+	功能: 获取默认value的串表达形式
+	
+	def readFrom(reader: ConfigReader): T
+	功能: 获取1默认值的value值
+	val= readString(reader).map(valueConverter).getOrElse(fallback.readFrom(reader))
+}
+```
+
+```markdown
+private[spark] object ConfigEntry {
+	属性:
+    #name @UNDEFINED = "<undefined>" 	未定义信息
+    #name @knownConfigs = new java.util.concurrent.ConcurrentHashMap[String, ConfigEntry[_]]()
+    	已知配置列表
+    操作集:
+    def registerEntry(entry: ConfigEntry[_]): Unit 
+	功能: 注册键值对
+	val existing = knownConfigs.putIfAbsent(entry.key, entry)
+    require(existing == null, s"Config entry ${entry.key} already registered!")
+	
+	def findEntry(key: String): ConfigEntry[_] = knownConfigs.get(key)
+	功能: 查找key对应的value串表达信息
+}
+```
+
+
 
 #### ConfigProvider
 
@@ -596,12 +978,84 @@ class HadoopMapReduceCommitProtocol(jobId: String,path: String,
     jobContext.getConfiguration.set("mapreduce.task.attempt.id", taskAttemptId.toString)
     jobContext.getConfiguration.setBoolean("mapreduce.task.ismap", true)
     jobContext.getConfiguration.setInt("mapreduce.task.partition", 0)
-    3. 
+    3. 建立job
+    val taskAttemptContext = new TaskAttemptContextImpl(jobContext.getConfiguration, taskAttemptId)
+    committer = setupCommitter(taskAttemptContext)
+    committer.setupJob(jobContext)
     
+    def commitJob(jobContext: JobContext, taskCommits: Seq[TaskCommitMessage]): Unit
+    功能: 提交job
+    1. 提交job
+    committer.commitJob(jobContext)
+    2. 操作条件 
+    	路径合法 hasValidPath=true
+ 		hasValidPath ? Jmp 3 : Nop
+    3. 获取绝对路径信息/所有分区长度
+    	val (allAbsPathFiles, allPartitionPaths) =
+        	taskCommits.map(_.obj.asInstanceOf[(Map[String, String], Set[String])]).unzip
+	4. 获取需要移动的列表信息
+	    val fs = stagingDir.getFileSystem(jobContext.getConfiguration)
+		val filesToMove = allAbsPathFiles.foldLeft(Map[String, String]())(_ ++ _)
+	5. 删除需要移除列表的文件
+		if (dynamicPartitionOverwrite) {
+        	val absPartitionPaths = filesToMove.values.map(new Path(_).getParent).toSet
+        	absPartitionPaths.foreach(fs.delete(_, true))}
+    6. 重命名文件src->dst
+    	for ((src, dst) <- filesToMove) fs.rename(new Path(src), new Path(dst))
+	7. 创建最终目录文件
+	val partitionPaths = allPartitionPaths.foldLeft(Set[String]())(_ ++ _) // 获取分区长度列表
+	for (part <- partitionPaths) {
+		val finalPartPath = new Path(path, part)
+		// 删除最终路径文件
+         if (!fs.delete(finalPartPath, true) && !fs.exists(finalPartPath.getParent)) {
+         	// 常见最终路径的上级文件
+         	fs.mkdirs(finalPartPath.getParent)
+         }
+         // 重命名stagingDir下文件为最终路径
+         fs.rename(new Path(stagingDir, part), finalPartPath)
+	}
+	8. 删除stageDir目录，下的文件
+	fs.delete(stagingDir, true)
+	
+	def abortJob(jobContext: JobContext): Unit
+	功能: 放弃提交job
+	1. commiter放弃提交任务
+	committer.abortJob(jobContext, JobStatus.State.FAILED)
+	2. 删除stageDir目录
+	if (hasValidPath) {
+        val fs = stagingDir.getFileSystem(jobContext.getConfiguration)
+        fs.delete(stagingDir, true)}
+    
+    def setupTask(taskContext: TaskAttemptContext): Unit 
+    功能: 建立task任务
+    1. 创建commiter
+    committer = setupCommitter(taskContext)
+    2. 创建任务
+    committer.setupTask(taskContext)
+    3. 获取已添加的路径文件/分区路径列表
+    addedAbsPathFiles = mutable.Map[String, String]()
+    partitionPaths = mutable.Set[String]()
+    
+    def commitTask(taskContext: TaskAttemptContext): TaskCommitMessage
+    功能: 提交task
+    1. 获取任务请求id
+    val attemptId = taskContext.getTaskAttemptID
+    2. 提交任务
+    SparkHadoopMapRedUtil.commitTask(
+      committer, taskContext, attemptId.getJobID.getId, attemptId.getTaskID.getId)
+    3. 获取任务提交信息
+    val= new TaskCommitMessage(addedAbsPathFiles.toMap -> partitionPaths.toSet)
+    
+    def abortTask(taskContext: TaskAttemptContext): Unit 
+    功能: 抛弃任务task
+    1. 放弃任务
+    committer.abortTask(taskContext)
+    2. 尽最大努力去清除其他stage 文件
+    for ((src, _) <- addedAbsPathFiles) {
+        val tmp = new Path(src)
+        tmp.getFileSystem(taskContext.getConfiguration).delete(tmp, false)}
 }
 ```
-
-
 
 #### HadoopWriteConfigUtil
 
@@ -646,6 +1100,256 @@ abstract class HadoopWriteConfigUtil[K, V: ClassTag] {
 ```
 
 #### SparkHadoopWriter
+
+```markdown
+介绍: 使用hadoop @OutputFormat 保存RDD的辅助类
+```
+
+```markdown
+private[spark] object SparkHadoopWriter{
+	关系: father --> Logging
+	操作集:
+	def write[K, V: ClassTag](rdd: RDD[(K, V)],config: HadoopWriteConfigUtil[K, V]): Unit 
+	功能: 这个操作的工作流为:
+		1. 驱动器侧建立，准备数据源和hadoop配置用于写需要解决的job
+		2. 处理包含一个或者多个执行器任务的写工作，每个都会在RDD分区中写出所有列
+		3. 如果任务中没有抛出异常，提交任务，否则抛弃任务。如果提交过程中抛出异常，也会抛弃这个task
+		4. 如果所有task都提交了，则提交job，否则抛弃job。如果异常在job提交过程中发生，抛弃这个job。
+	1. 获取RDD信息
+	val sparkContext = rdd.context
+    val commitJobId = rdd.id
+    2. 创建一个job
+    val jobTrackerId = createJobTrackerID(new Date()) // 获取job追踪id
+    val jobContext = config.createJobContext(jobTrackerId, commitJobId) //获取job上下文对象
+    config.initOutputFormat(jobContext)
+    3. 配置信息断言检测
+    config.assertConf(jobContext, rdd.conf)
+    4. 创建job信息
+    val committer = config.createCommitter(commitJobId)
+    committer.setupJob(jobContext)
+    5. 作为hadoop @OutputFormat 写出RDD分区
+      // 启动job任务
+      val ret = sparkContext.runJob(rdd, (context: TaskContext, iter: Iterator[(K, V)]) => {
+        // 创建唯一的请求id,主要根据stage,task请求编号。假定不会超过short最大值。
+        val attemptId = (context.stageAttemptNumber << 16) | context.attemptNumber
+        // 写RDD分区到单个spark任务中
+        executeTask(
+          context = context,
+          config = config,
+          jobTrackerId = jobTrackerId,
+          commitJobId = commitJobId,
+          sparkPartitionId = context.partitionId,
+          sparkAttemptNumber = attemptId,
+          committer = committer,
+          iterator = iter)
+      })
+    6. 提交任务
+    	committer.commitJob(jobContext, ret)
+    7. 任务中途失败
+    	committer.abortJob(jobContext)
+    	throw SparkException
+	
+	def executeTask[K, V: ClassTag](context: TaskContext,config: HadoopWriteConfigUtil[K, V],
+      jobTrackerId: String,commitJobId: Int,sparkPartitionId: Int,sparkAttemptNumber: Int,
+      committer: FileCommitProtocol,iterator: Iterator[(K, V)]): TaskCommitMessage
+	功能: 写出RDD分区到单个spark任务task中
+	输入参数:
+		context	任务上下文
+		config	配置工具信息
+		jobTrackerId	job追踪信息
+		commitJobId		提交job的id
+		sparkPartitionId	spark分区id
+		sparkAttemptNumber	spark请求编号
+		committer	文件提交协议
+		iterator	迭代器
+	1. 创建task
+    val taskContext = config.createTaskAttemptContext(
+      jobTrackerId, commitJobId, sparkPartitionId, sparkAttemptNumber)
+    committer.setupTask(taskContext)
+	2. 初始化写出器
+	config.initWriter(taskContext, sparkPartitionId)
+    var recordsWritten = 0L
+    3. 初始化hadoop输出度量器
+    val (outputMetrics, callback) = initHadoopOutputMetrics(context)
+    4. 写出rdd分区中的所有行
+    val ret = Utils.tryWithSafeFinallyAndFailureCallbacks {
+        // 写出记录，并更新度量值
+        while (iterator.hasNext) {
+          val pair = iterator.next()
+          config.write(pair)
+          maybeUpdateOutputMetrics(outputMetrics, callback, recordsWritten)
+          recordsWritten += 1 }
+        config.closeWriter(taskContext)
+        committer.commitTask(taskContext)
+      }(catchBlock = { // 如果图中存在错误，释放资源，并放弃提交任务
+        try 
+          config.closeWriter(taskContext)
+        finally
+          committer.abortTask(taskContext)})
+    5. 更新度量器信息
+    outputMetrics.setBytesWritten(callback())
+    outputMetrics.setRecordsWritten(recordsWritten)
+}
+```
+
+```markdown
+private[spark] class HadoopMapRedWriteConfigUtil[K, V: ClassTag] (conf: SerializableJobConf){
+	关系: father --> HadoopWriteConfigUtil[K, V]
+		sibling --> Logging
+	构造器属性:
+		conf	序列化job配置
+	属性:
+		#name @outputFormat=null #type @Class[_ <: OutputFormat[K, V]] 	输出形式
+		#name @writer=null #type @RecordWriter[K, V]	记录写出器
+	操作集:
+	def getConf: JobConf = conf.value
+	功能: 获取配置信息
+	
+	def createJobContext(jobTrackerId: String, jobId: Int): NewJobContext
+	功能: 获取job上下文
+	1. 获取job请求id
+	val jobAttemptId = new SerializableWritable(new JobID(jobTrackerId, jobId))
+	2. 获取job上下文对象
+	val= new JobContextImpl(getConf, jobAttemptId.value)
+	
+	def createTaskAttemptContext(jobTrackerId: String,jobId: Int,
+      splitId: Int,taskAttemptId: Int): NewTaskAttemptContext
+	功能: 获取任务请求上下文
+	1. 更新job配置conf
+	HadoopRDD.addLocalConfiguration(jobTrackerId, jobId, splitId, taskAttemptId, conf.value)
+	2. 获取请求id
+	val attemptId = new TaskAttemptID(jobTrackerId, jobId, TaskType.MAP, splitId, taskAttemptId)
+    3. 获取任务上下文
+    val= new TaskAttemptContextImpl(getConf, attemptId)
+	
+	def createCommitter(jobId: Int): HadoopMapReduceCommitProtocol
+	功能: 创建提交器
+	1. 更新job conf
+	HadoopRDD.addLocalConfiguration("", 0, 0, 0, getConf)
+	2. 创建提交协议
+	FileCommitProtocol.instantiate(
+      className = classOf[HadoopMapRedCommitProtocol].getName,
+      jobId = jobId.toString,outputPath = getConf.get("mapred.output.dir")
+    ).asInstanceOf[HadoopMapReduceCommitProtocol]
+	
+	def initWriter(taskContext: NewTaskAttemptContext, splitId: Int): Unit
+	功能: 初始化写出器
+	1. 获取输出名称
+        val numfmt = NumberFormat.getInstance(Locale.US)
+        numfmt.setMinimumIntegerDigits(5)
+        numfmt.setGroupingUsed(false)
+        val outputName = "part-" + numfmt.format(splitId)
+	2. 获取文件系统fs
+        val path = FileOutputFormat.getOutputPath(getConf)
+        val fs: FileSystem = {
+          if (path != null) 
+            path.getFileSystem(getConf)
+          else
+            FileSystem.get(getConf)
+        }
+     3. 获取输出器，并对其进行断言检测
+         writer = getConf.getOutputFormat
+          .getRecordWriter(fs, getConf, outputName, Reporter.NULL)
+          .asInstanceOf[RecordWriter[K, V]]
+        require(writer != null, "Unable to obtain RecordWriter")
+	
+	def write(pair: (K, V)): Unit 
+	功能: 写出键值对信息
+		writer.write(pair._1, pair._2)
+	
+	def closeWriter(taskContext: NewTaskAttemptContext): Unit
+	功能: 关闭写出器
+        if (writer != null) 
+          writer.close(Reporter.NULL)
+	
+	def initOutputFormat(jobContext: NewJobContext): Unit
+	功能: 初始化输出格式
+        if (outputFormat == null) {
+          outputFormat = getConf.getOutputFormat.getClass
+            .asInstanceOf[Class[_ <: OutputFormat[K, V]]] }
+	
+	def getOutputFormat(): OutputFormat[K, V]
+	功能: 获取输出格式
+	val= outputFormat.getConstructor().newInstance()
+	
+	def assertConf(jobContext: NewJobContext, conf: SparkConf): Unit
+	功能: 断言配置
+}
+```
+
+```markdown
+private[spark] class HadoopMapReduceWriteConfigUtil[K,V: ClassTag] (conf: SerializableConfiguration){
+	关系: father --> HadoopWriteConfigUtil[K, V]
+		sibling --> Logging
+	属性:
+		#name @outputFormat=null #type @Class[_ <: NewOutputFormat[K, V]]
+			输出格式
+		#name @writer=null #type @NewRecordWriter[K, V]
+			写出器
+	操作集:
+	def getConf: Configuration = conf.value
+	功能: 获取配置值
+	
+	def createJobContext(jobTrackerId: String, jobId: Int): NewJobContext
+	功能: 创建job上下文
+		val jobAttemptId = new NewTaskAttemptID(jobTrackerId, jobId, TaskType.MAP, 0, 0)
+    	new NewTaskAttemptContextImpl(getConf, jobAttemptId)
+	
+	def createTaskAttemptContext(jobTrackerId: String,jobId: Int,splitId: Int,
+      taskAttemptId: Int): NewTaskAttemptContext
+     功能: 创建任务请求上下文
+         val attemptId = new NewTaskAttemptID(
+          jobTrackerId, jobId, TaskType.REDUCE, splitId, taskAttemptId)
+        new NewTaskAttemptContextImpl(getConf, attemptId)
+	
+	def createCommitter(jobId: Int): HadoopMapReduceCommitProtocol
+	功能: 创建提交器(MR提交协议)
+        FileCommitProtocol.instantiate(
+          className = classOf[HadoopMapReduceCommitProtocol].getName,
+          jobId = jobId.toString,
+          outputPath = getConf.get("mapreduce.output.fileoutputformat.outputdir")
+        ).asInstanceOf[HadoopMapReduceCommitProtocol]
+	
+	def initWriter(taskContext: NewTaskAttemptContext, splitId: Int): Unit
+	功能: 初始化写出器
+	1. 获取任务输出格式
+	val taskFormat = getOutputFormat()
+    taskFormat match {
+      case c: Configurable => c.setConf(getConf)
+      case _ => ()}
+    2. 获取写出器，并断言检测
+    writer = taskFormat.getRecordWriter(taskContext)
+      .asInstanceOf[NewRecordWriter[K, V]]
+    require(writer != null, "Unable to obtain RecordWriter")
+	
+	def write(pair: (K, V)): Unit
+    功能: 写出键值对
+        require(writer != null, "Must call createWriter before write.")
+        writer.write(pair._1, pair._2)
+
+	def closeWriter(taskContext: NewTaskAttemptContext): Unit
+	功能: 关闭写出器
+	if (writer != null) {
+      writer.close(taskContext)
+      writer = null}
+     
+     def initOutputFormat(jobContext: NewJobContext): Unit
+     功能: 初始化输出格式
+     if (outputFormat == null) {
+      	outputFormat = jobContext.getOutputFormatClass
+        .asInstanceOf[Class[_ <: NewOutputFormat[K, V]]]}
+     
+     def getOutputFormat(): NewOutputFormat[K, V]
+     功能: 获取输出形式
+     require(outputFormat != null, "Must call initOutputFormat first.")
+     outputFormat.getConstructor().newInstance()
+	
+	def assertConf(jobContext: NewJobContext, conf: SparkConf): Unit
+	功能: 配置断言
+}
+```
+
+
 
 #### SparkHadoopWriterUtils
 
