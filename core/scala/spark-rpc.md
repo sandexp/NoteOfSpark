@@ -1,3 +1,5 @@
+
+
 ## **spark-rpc**
 
 ---
@@ -12,6 +14,7 @@
 8.  [RpcEnv.scala](# RpcEnv)
 9.  [RpcEnvStoppedException.scala](# RpcEnvStoppedException)
 10.  [RpcTimeout.scala](# RpcTimeout)
+11.   基础拓展
 
 ---
 
@@ -37,12 +40,492 @@ private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int){
 	构造器参数:
 		nettyEnv	netty环境
 		numUsableCores	可使用核心数量，设置为0则会使用主机上的CPU核心
+	属性:
+		#name @endpoints=@ConcurrentHashMap[String, MessageLoop]	RPC端点映射表
+		#name @endpointRefs=@ConcurrentHashMap[RpcEndpoint, RpcEndpointRef]	RPC端点与端点参考映射
+		#name @shutdownLatch=@CountDownLatch(1)	关闭闭锁
+		#name @sharedLoop=@SharedMessageLoop(nettyEnv.conf, this, numUsableCores)	共享消息环
+		#name @stopped = false @GuardedBy("this") 分发器状态位(为true表示分发器停止工作)
+			一旦分发器停止工作，所有发送的消息都会反弹
+    操作集:
+    def getMessageLoop(name: String, endpoint: RpcEndpoint): MessageLoop
+	功能: 获取消息环
+	根据端点类型确定消息环的类型，如果是独立RPC端点@IsolatedRpcEndpoint，则需要返回一个专用的消息环，否则只
+    需要将端点信息注册到消息环并返回默认消息环@sharedLoop
+        endpoint match {
+          case e: IsolatedRpcEndpoint =>
+            new DedicatedMessageLoop(name, e, this)
+          case _ =>
+            sharedLoop.register(name, endpoint)
+            sharedLoop
+        }
+        
+    def registerRpcEndpoint(name: String, endpoint: RpcEndpoint): NettyRpcEndpointRef
+    功能: 注册RPC端点
+    1. 获取RPC端点地址以及RPC端点参考信息
+        val addr = RpcEndpointAddress(nettyEnv.address, name)
+        val endpointRef = new NettyRpcEndpointRef(nettyEnv.conf, addr, nettyEnv)
+	2. 状态检测
+	synchronized {
+      if (stopped) throw IllegalStateException
+      if (endpoints.putIfAbsent(name, getMessageLoop(name, endpoint)) != null) 
+        throw IllegalArgumentException
+    }
+    3. 将RPC端点信息存入RPC端点与端点参考映射中@endpointRefs
+    endpointRefs.put(endpoint, endpointRef)
+    val= endpointRef
+    
+    def getRpcEndpointRef(endpoint: RpcEndpoint): RpcEndpointRef = endpointRefs.get(endpoint)
+    功能: 获取指定RPC端点@endpoint的RPC端点参考
+    val= endpointRefs.get(endpoint)
+    
+    def removeRpcEndpointRef(endpoint: RpcEndpoint): Unit = endpointRefs.remove(endpoint)
+    功能: 移除指定RPC端点@endpoint 的RPC端点参考
+    
+    def unregisterRpcEndpoint(name: String): Unit
+    功能: 解除注册名称为@name的RPC端点信息
+    1. 解除端点映射@endpoints 中的记录
+    val loop = endpoints.remove(name)
+    2. 从消息环中解除注册@name信息
+    if (loop != null) loop.unregister(na
+   	注意: 这里不需要解除注册RPC端点参考映射关系@endpointRefs,因为可能有部分信息正在处理,它们可能在使用
+   	@getRpcEndpointRef 获取RPC端点参考,所有@endpointRefs 的清除工作通过#class @Inbox 的@method 
+   	@removeRpcEndpointRef 方法清理。
+   	
+   	def stop(rpcEndpointRef: RpcEndpointRef): Unit 
+   	功能: 停止指定的RPC端点参考@rpcEndpointRef(解除@rpcEndpointRef 的注册信息)
+   	synchronized {
+      if (stopped) 
+        return
+      unregisterRpcEndpoint(rpcEndpointRef.name)
+    }
+    
+    def postToAll(message: InboxMessage): Unit
+    功能: 发送指定消息@message给此进程中登记的所有RPC端点@RpcEndpoint
+ 	这个可以用于制造与其他端点的网络链接
+ 	1. 获取RPC端点信息
+ 	val iter = endpoints.keySet().iterator()
+    2. 发送消息到RPC端点中
+    while (iter.hasNext) {
+      val name = iter.next
+        postMessage(name, message, (e) => { e match {
+          case e: RpcEnvStoppedException => logDebug (s"Message $message dropped. ${e.getMessage}")
+          case e: Throwable => logWarning(s"Message $message dropped. ${e.getMessage}")
+        }}
+      )}
+      
+   def postRemoteMessage(message: RequestMessage, callback: RpcResponseCallback): Unit
+   功能: 发送指定消息@message给远程RPC端点
+   1. 获取远程RPC端点回调
+   val rpcCallContext =new RemoteNettyRpcCallContext(nettyEnv, callback, message.senderAddress)
+   2. 产生RPC消息
+   val rpcMessage = RpcMessage(message.senderAddress, message.content, rpcCallContext)
+   3. 发送RPC消息到远程RPC端点
+   @postMessage(message.receiver.name, rpcMessage, (e) => callback.onFailure(e))
+    
+   def postLocalMessage(message: RequestMessage, p: Promise[Any]): Unit
+   功能: 发送指定消息@message给本地端点
+   1. 获取本地RPC回调
+   val rpcCallContext =new LocalNettyRpcCallContext(message.senderAddress, p)
+   2. 产生RPC消息
+   val rpcMessage = RpcMessage(message.senderAddress, message.content, rpcCallContext)
+   3. 发送消息给本地
+   postMessage(message.receiver.name, rpcMessage, (e) => p.tryFailure(e))
+   
+   def postOneWayMessage(message: RequestMessage): Unit 
+   功能: 发送消息@message 传输是单程的，不需要回应
+   postMessage(message.receiver.name, OneWayMessage(message.senderAddress, message.content),
+      (e) => throw e)
+   
+   def postMessage(endpointName: String,message: InboxMessage,
+   	callbackIfStopped: (Exception) => Unit): Unit
+   功能: 给指定RPC端点@endpointName 发送消息@message,并给出了异常处理函数@callbackIfStopped
+   1. 获取消息环信息，并使用消息环@MessageLoop 发送消息给指定RPC端点,同时统计错误信息
+       val error = synchronized {
+          val loop = endpoints.get(endpointName)
+          if (stopped) Some(new RpcEnvStoppedException())
+          else if (loop == null) Some(new SparkException)
+          else {
+            loop.post(endpointName, message)
+            None
+          }
+        }
+    2. 统一处理异常
+    error.foreach(callbackIfStopped)
+    
+    def stop(): Unit
+    功能: 停止分发器
+    1. 停止分发器
+    synchronized {
+      if (stopped) {
+        return
+      }
+      stopped = true
+    }
+    2. 停止共享消息环@sharedLoop
+    var stopSharedLoop = false
+    endpoints.asScala.foreach { case (name, loop) =>
+      unregisterRpcEndpoint(name) // 解除所有注册的RPC端点信息
+      if (!loop.isInstanceOf[SharedMessageLoop]) {
+        loop.stop()
+      } else {
+        stopSharedLoop = true // 标记停止
+      }
+    }
+    if (stopSharedLoop) { // 停止共享消息环
+      sharedLoop.stop()
+    }
+    3. 关闭闭锁资源量-1
+    shutdownLatch.countDown()
+    
+    def awaitTermination(): Unit
+    功能: 等待线程终止
+    shutdownLatch.await()
+    
+    def verify(name: String): Boolean
+    功能: 确认是否存在指定的RPC端点描述@name
+    val= endpoints.containsKey(name)
 }
 ```
 
 #### Inbox
 
+收件箱
+
+```markdown
+private[netty] sealed trait InboxMessage 
+介绍: 收件箱消息
+
+private[netty] case class OneWayMessage(senderAddress: RpcAddress,content: Any) extends InboxMessage
+介绍: 单程消息
+参数:
+	senderAddress	发送器RPC地址
+	content		发送内容
+
+private[netty] case class RpcMessage(senderAddress: RpcAddress,content: Any,
+    context: NettyRpcCallContext)
+介绍: RPC 消息
+参数:
+	senderAddress	发送器RPC地址
+	content	发送内容
+	context	回调信息
+
+private[netty] case object OnStart extends InboxMessage
+功能: 启动实例
+
+private[netty] case object OnStop extends InboxMessage
+功能: 关闭实例
+
+private[netty] case class RemoteProcessConnected(remoteAddress: RpcAddress) extends InboxMessage
+功能: 远程处理连接，用于告知所有RPC端点连接远端成功
+
+private[netty] case class RemoteProcessDisconnected(remoteAddress: RpcAddress) extends InboxMessage
+功能: 远程关闭连接，告知所有RPC端点断开与远端的连接
+
+private[netty] case class RemoteProcessConnectionError(cause: Throwable, remoteAddress: RpcAddress)
+  extends InboxMessage
+功能: 远端连接错误
+```
+
+```markdown
+private[netty] class Inbox(val endpointName: String, val endpoint: RpcEndpoint){
+	关系: father --> Logging
+	构造器属性：
+		endpointName	端点名称
+		endpoint	RPC端点
+	属性:
+	#name @messages = new java.util.LinkedList[InboxMessage]() @GuardedBy("this")	收件箱消息列表
+	#name @stopped = false @GuardedBy("this")	收件箱停止状态位
+	#name @enableConcurrent = false @GuardedBy("this")	是否允许并发处理消息
+	#name @numActiveThreads = 0 @GuardedBy("this") 收件箱中处理消息的线程数量
+	初始化操作:
+	inbox.synchronized {
+    	messages.add(OnStart)
+  	}
+  	功能: 添加初始化消息
+  	
+  	def post(message: InboxMessage): Unit
+  	功能: 发送消息@message到消息列表@messages，如果收件箱管理了，则扔掉该消息
+  	inbox.synchronized {
+        if (stopped) {
+          @onDrop(message) // 扔掉该消息
+        } else {
+          messages.add(message)
+          false
+        } 
+  	}
+  	
+  	def isEmpty: Boolean = inbox.synchronized { messages.isEmpty }
+  	功能: 确认消息列表是否为空
+  	
+  	def onDrop(message: InboxMessage): Unit
+  	功能: 放弃消息时调用，用于测试
+  		logWarning(s"Drop $message because endpoint $endpointName is stopped")
+  	
+  	def safelyCall(endpoint: RpcEndpoint)(action: => Unit): Unit
+  	功能: 调用动作关闭，在异常的情况下调用RPC端点的错误处理函数@onError
+        try action catch {
+          case NonFatal(e) =>	// RPC异常
+            try endpoint.onError(e) catch {
+              case NonFatal(ee) =>
+                if (stopped) {
+                  logDebug("Ignoring error", ee)
+                } else {
+                  logError("Ignoring error", ee)
+                }
+            }
+        }
+  	
+	def stop(): Unit
+	功能: 关闭收件箱
+	inbox.synchronized {
+  		// 下面的代码需要同步，主要是确保@OnStop 是最后一条消息
+        if (!stopped) {
+		// 注意这里需要关闭并发,当RpcEndpoint.onStop 调用时,仅仅只有这个线程在处理消息,这样
+		// RpcEndpoint.onStop 能够安全的释放资源	
+          enableConcurrent = false
+          stopped = true
+          messages.add(OnStop)
+        }
+  	}
+  	
+  	def process(dispatcher: Dispatcher): Unit 
+  	功能: 处理存储起来的消息
+  	1. 获取消息已经处理线程数量
+        var message: InboxMessage = null
+        inbox.synchronized {
+          if (!enableConcurrent && numActiveThreads != 0) {
+            return
+          }
+          message = messages.poll() // 拿去消息列表中第一个元素
+          if (message != null) {
+            numActiveThreads += 1 // 增加1个处理线程
+          } else {
+            return
+          }
+        }
+     2. 根据消息类型,进行不同的处理
+     safelyCall(endpoint) {
+        message match {
+        	...
+        }
+     + 收到RPC类型消息
+	case RpcMessage(_sender, content, context) =>
+		endpoint.receiveAndReply(context).applyOrElse[Any, Unit](content, { msg =>
+        	throw new SparkException(s"Unsupported message $message from ${_sender}")})
+     + 收到单程消息
+     case OneWayMessage(_sender, content) =>
+     	endpoint.receive.applyOrElse[Any, Unit](content, { msg =>
+              throw new SparkException(s"Unsupported message $message from ${_sender}")})
+          
+     + 收到启动消息
+     case OnStart =>
+     	endpoint.onStart()
+        if (!endpoint.isInstanceOf[ThreadSafeRpcEndpoint]) {
+        	inbox.synchronized {
+                if (!stopped) { enableConcurrent = true }
+             }
+        }
+     
+     + 收到停止消息
+     case OnStop =>
+         val activeThreads = inbox.synchronized { inbox.numActiveThreads }
+         // 线程数量断言
+         assert(activeThreads == 1,
+         s"There should be only a single active thread but found $activeThreads threads.")
+         // 移除RPC端点信息
+         dispatcher.removeRpcEndpointRef(endpoint)
+         // 停止RPC端点
+         endpoint.onStop()
+         // 断言检查收件箱是否为空
+         assert(isEmpty, "OnStop should be the last message")
+            
+     + 收到远端进程连接
+     case RemoteProcessConnected(remoteAddress) =>
+     	endpoint.onConnected(remoteAddress)
+     
+     + 收到远端断开连接
+     case RemoteProcessDisconnected(remoteAddress) =>
+     	endpoint.onDisconnected(remoteAddress)
+     
+     + 收到远端进程连接出错信息
+     case RemoteProcessConnectionError(cause, remoteAddress) =>
+     	endpoint.onNetworkError(cause, remoteAddress)
+}
+```
+
 #### MessageLoop
+
+消息环
+
+```markdown
+private sealed abstract class MessageLoop(dispatcher: Dispatcher) {
+	关系: father --> Logging
+	介绍: 分配器@Dispatcher所使用的消息环，用于发送数据到RPC端点
+	属性:
+	#name @active = new LinkedBlockingQueue[Inbox]() 
+		带有待定消息的收件箱列表，使用消息环处理
+	#name @receiveLoopRunnable=new Runnable() {override def run(): Unit = receiveLoop() }
+		接受环任务
+	#name @threadpool #type @ExecutorService	线程池
+	#name @stopped = false	停止标志
+	操作集:
+	def post(endpointName: String, message: InboxMessage): Unit
+	功能: 发送消息@message到指定的RPC端点@endpointName
+	
+	def unregister(name: String): Unit
+	功能: 解除RPC端点名称为name的注册信息
+	
+	def stop(): Unit
+	功能: 停止消息环
+	1. 停止消息环
+	synchronized {
+      if (!stopped) {
+        setActive(MessageLoop.PoisonPill)
+        threadpool.shutdown()
+        stopped = true
+      }
+    }
+    2. 等待线程执行完毕
+    threadpool.awaitTermination(Long.MaxValue, TimeUnit.MILLISECONDS)
+    
+    def setActive(inbox: Inbox): Unit = active.offer(inbox)
+    功能: 将指定收件箱插@inbox插入激活队列@active尾部
+    
+    def receiveLoop(): Unit 
+    功能： 接受环操作
+    对激活队列@active中的每一个元素进行处理
+    while(true){
+    	try {
+          // 获取一个收件箱
+          val inbox = active.take()
+          // 检测到时阻碍收件箱则将其放回队列并停止处理
+          if (inbox == MessageLoop.PoisonPill) {
+            setActive(MessageLoop.PoisonPill)
+            return
+          }
+          // 处理分发器的消息
+          inbox.process(dispatcher)
+        } catch {
+          case NonFatal(e) => logError(e.getMessage, e)
+        }
+    }
+}
+```
+
+```markdown
+private object MessageLoop {
+	属性:
+	#name @PoisonPill = new Inbox(null, null) 
+		阻碍收件箱，表名消息环应当终止读取消息
+}
+```
+
+```markdown
+private class SharedMessageLoop(conf: SparkConf,dispatcher: Dispatcher,numUsableCores: Int){
+	关系: father --> MessageLoop(dispatcher)
+	介绍: 服务于多个RPC端点的消息环，使用共享线程池
+	构造器属性:
+		conf	应用程序配置集
+		dispatcher	分发器
+		numUsableCores	可用核心数量
+	属性:
+	#name=endpoints = new ConcurrentHashMap[String, Inbox]() 端点映射表
+	#name=threadpool #type @ThreadPoolExecutor	线程池执行器(用于分发消息到RPC端点)
+	val= {
+        // 获取线程数量
+        val numThreads = getNumOfThreads(conf)
+        val pool = ThreadUtils.newDaemonFixedThreadPool(numThreads, "dispatcher-event-loop")
+        for (i <- 0 until numThreads) {
+          // 执行分配工作
+          pool.execute(receiveLoopRunnable)
+        }
+        pool
+      }
+	操作集:
+	def getNumOfThreads(conf: SparkConf): Int
+	功能: 获取线程数量
+	1. 获取可使用核心数量,如果给定核心数量合法则为用户分配的核心数量，否则系统给定核心数量
+	val availableCores =
+      if (numUsableCores > 0) numUsableCores else Runtime.getRuntime.availableProcessors()
+     2. 获取分配器线程数量
+     val modNumThreads = conf.get(RPC_NETTY_DISPATCHER_NUM_THREADS)
+      .getOrElse(math.max(2, availableCores))
+     3. 确定执行ID对应的身份以及线程数量
+     conf.get(EXECUTOR_ID).map { id =>
+          val role = if (id == SparkContext.DRIVER_IDENTIFIER) "driver" else "executor"
+          conf.getInt(s"spark.$role.rpc.netty.dispatcher.numThreads", modNumThreads)
+     }.getOrElse(modNumThreads)
+	
+	def post(endpointName: String, message: InboxMessage): Unit
+	功能: 发送消息到指定RPC端点
+        val inbox = endpoints.get(endpointName)
+        inbox.post(message)
+        setActive(inbox)
+	
+	def unregister(name: String): Unit
+	功能: 解除注册@name对应的RPC端点
+        val inbox = endpoints.remove(name)
+        if (inbox != null) {
+          inbox.stop()
+          //设置active用户处理结束@onStop消息
+          setActive(inbox)
+        }
+    
+    def register(name: String, endpoint: RpcEndpoint): Unit
+    功能: 注册名称为@name RPC端点为@endpoint的收件箱
+    val inbox = new Inbox(name, endpoint)
+    endpoints.put(name, inbox)
+    // Mark active to handle the OnStart message.
+    setActive(inbox)
+}
+```
+
+```markdown
+private class DedicatedMessageLoop(name: String,endpoint: IsolatedRpcEndpoint,dispatcher: Dispatcher){
+	介绍: 专用消息环，用于处理单个RPC端点问题
+	关系: father --> MessageLoop(dispatcher)
+	构造器属性:
+		name	RPC端点名称
+		endpoint	RPC端点
+		dispatch	分发器
+	属性:
+		#name @inbox = new Inbox(name, endpoint)	收件箱
+		#name @threadpool 线程池
+			val= if (endpoint.threadCount() > 1)
+			ThreadUtils.newDaemonCachedThreadPool(s"dispatcher-$name", endpoint.threadCount())
+			else
+			ThreadUtils.newDaemonSingleThreadExecutor(s"dispatcher-$name")
+	初始化操作:
+	(1 to endpoint.threadCount()).foreach { _ =>
+    	threadpool.submit(receiveLoopRunnable)
+  	}
+  	功能: 线程池提交接受环任务
+  	
+  	setActive(inbox)
+  	功能: 注册收件箱，并用其处理onStart消息
+    
+	操作集:
+	def post(endpointName: String, message: InboxMessage): Unit 
+	功能: 发送消息@message 给指定端点@endpointName
+	    require(endpointName == name)
+        inbox.post(message)
+        setActive(inbox)
+	
+	def unregister(endpointName: String): Unit
+	功能: 解除名称为@endpointName的端点注册
+     synchronized {
+        require(endpointName == name)
+        inbox.stop()
+        // Mark active to handle the OnStop message.
+        setActive(inbox)
+        setActive(MessageLoop.PoisonPill)
+        threadpool.shutdown()
+      }
+}
+```
+
+
 
 #### NettyRpcCallContext
 
@@ -93,8 +576,290 @@ private[netty] class RemoteNettyRpcCallContext(nettyEnv: NettyRpcEnv,callback: R
 }
 ```
 
-
 #### NettyRpcEnv
+
+```markdown
+
+```
+
+```markdown
+private[netty] object NettyRpcEnv{
+	关系: father --> Logging
+	属性:
+	#name @currentEnv = new DynamicVariable[NettyRpcEnv](null)	当前环境变量
+		反序列化@NettyRpcEndpointRef，需要一个@NettyRpcEnv的引用，使用@currentEnv去包装反序列化代码。
+		例如:
+		{{{
+			NettyRpcEnv.currentEnv.withValue(this) {
+   		   	 	your deserialization codes
+   			}
+		}}}
+	#name @currentClient = new DynamicVariable[TransportClient](null)	当前客户端
+		与当前环境变量@currentEnv相似,这个可变的参考客户端实例，与RPC相关，在这种情况下，需要在反序列化过	程中找到远端地址
+}
+```
+```markdown
+private[netty] class NettyRpcEndpointRef(@transient private val conf: SparkConf,
+    private val endpointAddress: RpcEndpointAddress,
+    @transient @volatile private var nettyEnv: NettyRpcEnv){
+	关系: father --> RpcEndpointRef(conf)
+    介绍:	RPC端点参考的NettyRPC环境变量。这个类根据创建位置的不同表现形式不同。在拥有RPC端点节点上,它就是一个	具有保证简单RPC端点地址信息的实例对象。
+    在其他机器上,接受序列化完成的参考值,这样行为就发生了变化。这个实例会保持对发送参考值的客户端
+    @TransportClient的定位,所以发送给RPC端点的信息通过客户端连接发送，而非使用一个新的链接。
+    RPC地址的参考值可以为空,意味着参考值ref可能仅仅的通过客户端连接，因此处理RPC端点不是通过监听即将到来的节	点。这些参考值refs需要被第三方共享，因此它们不会发送信息给RPC端点。
+    构造器属性:
+    conf	spark配置
+    endpointAddress	RPC端点地址
+    nettyEnv	这个参考值的RPC环境
+    属性:
+    #name @client: TransportClient = _  传输客户度
+    操作集:
+    def address: RpcAddress
+    功能: 获取RPC地址
+    val= if (endpointAddress.rpcAddress != null) endpointAddress.rpcAddress else null
+    
+    def readObject(in: ObjectInputStream): Unit
+    功能: 读取数据
+        in.defaultReadObject()
+        nettyEnv = NettyRpcEnv.currentEnv.value
+        client = NettyRpcEnv.currentClient.value
+   	
+   	def writeObject(out: ObjectOutputStream): Unit
+   	功能: 写出数据
+   		out.defaultWriteObject()
+   	
+   	def name: String = endpointAddress.name
+   	功能: 获取端点地址名称
+   	
+   	def askAbortable[T: ClassTag](
+      message: Any, timeout: RpcTimeout): AbortableRpcFuture[T]
+    功能: 可放弃式读取数据
+    val= nettyEnv.askAbortable(new RequestMessage(nettyEnv.address, this, message), timeout)
+    
+    def ask[T: ClassTag](message: Any, timeout: RpcTimeout): Future[T]
+    功能: 使用@message请求消息
+	
+	def send(message: Any): Unit
+	功能: 发送消息
+        require(message != null, "Message is null")
+        nettyEnv.send(new RequestMessage(nettyEnv.address, this, message))
+	
+	def toString: String = s"NettyRpcEndpointRef(${endpointAddress})"
+	功能: 显示信息
+	
+	def equals(that: Any): Boolean
+	功能: 判断对象相等逻辑
+	val= Boolean = that match {
+    	case other: NettyRpcEndpointRef => endpointAddress == other.endpointAddress
+    	case _ => false}
+	
+	def hashCode(): Int
+	功能: 计算hash值
+	val= if (endpointAddress == null) 0 else endpointAddress.hashCode()
+}
+```
+
+```markdown
+private[rpc] class NettyRpcEnvFactory{
+	关系: father --> RpcEnvFactory
+		sibling --> Logging
+	介绍: Netty的RPC环境工程
+	操作集:
+	def create(config: RpcEnvConfig): RpcEnv
+	功能: 创建RPC环境
+	输入参数: config	RPC环境配置
+	1. 序列化配置信息
+	val sparkConf = config.conf
+	val javaSerializerInstance =
+      new JavaSerializer(sparkConf).newInstance().asInstanceOf[JavaSerializerInstance]
+     注意: 这里使用java序列化，是线程安全的，未来打算使用Kryo序列化，因此必须使用@ThreadLocal去存储序列化对象
+	2. 获取netty环境
+	val nettyEnv =new NettyRpcEnv(sparkConf, javaSerializerInstance, config.advertiseAddress,
+        config.securityManager, config.numUsableCores)
+	3. 在客户端模式关闭时,需要根据实际端口映射到netty的环境变量和端口地址
+	if (!config.clientMode) {
+      val startNettyRpcEnv: Int => (NettyRpcEnv, Int) = { actualPort =>
+        nettyEnv.startServer(config.bindAddress, actualPort)
+        (nettyEnv, nettyEnv.address.port)
+      }
+      try {
+      	// 启动端口上的服务
+        Utils.startServiceOnPort(config.port, startNettyRpcEnv, sparkConf, config.name)._1
+      } catch {
+        case NonFatal(e) =>
+          nettyEnv.shutdown()
+          throw e
+      }
+    }
+}
+```
+```markdown
+private[netty] object RequestMessage{
+	操作集:
+	def readRpcAddress(in: DataInputStream): RpcAddress
+	功能: 读取RPC地址
+	val= val hasRpcAddress = in.readBoolean()
+        if (hasRpcAddress) {
+          RpcAddress(in.readUTF(), in.readInt())
+        } else {
+          null
+        }
+	
+	def apply(nettyEnv: NettyRpcEnv, client: TransportClient, bytes: ByteBuffer): RequestMessage
+	功能: 获取一个请求消息实例
+	输入参数:
+		nettyEnv	netty环境
+		client	客户端
+		bytes	字节缓冲
+	1. 读取sender地址信息
+    val bis = new ByteBufferInputStream(bytes)
+    val in = new DataInputStream(bis)
+    val senderAddress = readRpcAddress(in)
+    2. 读取端点参考信息
+    val endpointAddress = RpcEndpointAddress(readRpcAddress(in), in.readUTF())
+    val ref = new NettyRpcEndpointRef(nettyEnv.conf, endpointAddress, nettyEnv)
+    3. 设置RPC端点参考的客户端
+    ref.client = client
+    4. 获取实例
+    new RequestMessage(
+        senderAddress,
+        ref,
+        // 剩余字节内容是消息内容
+        nettyEnv.deserialize(client, bytes))
+}
+```
+```markdown
+private[netty] class RequestMessage(val senderAddress: RpcAddress,val receiver: NettyRpcEndpointRef,
+    val content: Any){
+	介绍: 请求消息
+    构造器属性:
+    	senderAddress	发送器地址
+    	receiver	接收端RPC端点参考
+    	content		消息内容
+    操作集:
+    def serialize(nettyEnv: NettyRpcEnv): ByteBuffer
+    功能: 手动序列化@RequestMessage 去缩小消息大小
+    1. 写出消息内容到缓冲
+        val bos = new ByteBufferOutputStream()
+        val out = new DataOutputStream(bos)
+        try {
+          writeRpcAddress(out, senderAddress)
+          writeRpcAddress(out, receiver.address)
+          out.writeUTF(receiver.name)
+          val s = nettyEnv.serializeStream(out)
+          try {
+            s.writeObject(content)
+          } finally {
+            s.close()
+          }
+        } finally {
+          out.close()
+        }
+	2. 获取写出的内容
+		val= bos.toByteBuffer
+	
+	def writeRpcAddress(out: DataOutputStream, rpcAddress: RpcAddress): Unit
+	功能: 写出RPC地址
+        if (rpcAddress == null) {
+          out.writeBoolean(false)
+        } else {
+          out.writeBoolean(true)
+          out.writeUTF(rpcAddress.host)
+          out.writeInt(rpcAddress.port)
+        }
+    
+    def toString: String = s"RequestMessage($senderAddress, $receiver, $content)"
+    功能: 信息显示
+}
+```
+
+```markdown
+private[netty] case class RpcFailure(e: Throwable)
+功能: 接受侧异常的回应表示
+```
+
+```markdown
+private[netty] class NettyRpcHandler(dispatcher: Dispatcher,nettyEnv: NettyRpcEnv,
+    streamManager: StreamManager){
+	关系: father --> RPCHandler
+    	sibling --> Logging
+    构造器属性:
+    	dispatch	分发器
+    	nettyEnv	netty环境
+    	streamManager	流管理器
+    属性:
+    #name @remoteAddresses = new ConcurrentHashMap[RpcAddress, RpcAddress]() 远端地址映射表
+    操作集:
+    def receive(client: TransportClient,message: ByteBuffer,callback: RpcResponseCallback): Unit
+	功能: 使用客户端@client接受消息@message,回调函数为@callback
+	1. 接受来自远端的消息
+	val messageToDispatch = internalReceive(client, message)
+	2. 分发消息到指定的RPC端点
+	dispatcher.postRemoteMessage(messageToDispatch, callback)
+
+	def receive(client: TransportClient,message: ByteBuffer): Unit
+	功能: 接受消息@message,本地发送单向消息
+        val messageToDispatch = internalReceive(client, message)
+        dispatcher.postOneWayMessage(messageToDispatch)
+    
+    def getStreamManager: StreamManager = streamManager
+    功能: 获取流管理器@streamManager
+    
+    def exceptionCaught(cause: Throwable, client: TransportClient): Unit
+    功能: 异常捕获
+    1. 将异常分发到所有RPC端点上，以供监听
+    val addr = client.getChannel.remoteAddress().asInstanceOf[InetSocketAddress]
+    if (addr != null) {
+    	val clientAddr = RpcAddress(addr.getHostString, addr.getPort)
+      	// 监听本机
+      	dispatcher.postToAll(RemoteProcessConnectionError(cause, clientAddr))
+	   // 监听远端
+		val remoteEnvAddress = remoteAddresses.get(clientAddr)
+      	if (remoteEnvAddress != null) {
+        	dispatcher.postToAll(RemoteProcessConnectionError(cause, remoteEnvAddress))
+      	}
+	}
+	
+	def internalReceive(client: TransportClient, message: ByteBuffer): RequestMessage 
+	功能: 远端接受请求消息@RequestMessage
+        val addr = client.getChannel().remoteAddress().asInstanceOf[InetSocketAddress]
+        assert(addr != null)
+        val clientAddr = RpcAddress(addr.getHostString, addr.getPort)
+        val requestMessage = RequestMessage(nettyEnv, client, message)
+        if (requestMessage.senderAddress == null) {
+          new RequestMessage(clientAddr, requestMessage.receiver, requestMessage.content)
+        } else {
+          val remoteEnvAddress = requestMessage.senderAddress
+          if (remoteAddresses.putIfAbsent(clientAddr, remoteEnvAddress) == null) {
+            dispatcher.postToAll(RemoteProcessConnected(remoteEnvAddress))
+          }
+          requestMessage
+        }
+	
+	def channelActive(client: TransportClient): Unit
+	功能: 激活通道
+        val addr = client.getChannel().remoteAddress().asInstanceOf[InetSocketAddress]
+        assert(addr != null)
+        val clientAddr = RpcAddress(addr.getHostString, addr.getPort)
+        dispatcher.postToAll(RemoteProcessConnected(clientAddr))
+	
+	def channelInactive(client: TransportClient): Unit
+	功能: 通道失活(从发件箱@OutBox中移除客户端)
+        val addr = client.getChannel.remoteAddress().asInstanceOf[InetSocketAddress]
+        if (addr != null) {
+          val clientAddr = RpcAddress(addr.getHostString, addr.getPort)
+          nettyEnv.removeOutbox(clientAddr)
+          dispatcher.postToAll(RemoteProcessDisconnected(clientAddr))
+          val remoteEnvAddress = remoteAddresses.remove(clientAddr)
+          // If the remove RpcEnv listens to some address, we should also  fire a
+          // RemoteProcessDisconnected for the remote RpcEnv listening address
+          if (remoteEnvAddress != null) {
+            dispatcher.postToAll(RemoteProcessDisconnected(remoteEnvAddress))
+          }
+}
+```
+
+
 
 #### NettyStreamManager
 
@@ -152,6 +917,240 @@ private[netty] class NettyStreamManager(rpcEnv: NettyRpcEnv){
 
 #### Outbox
 
+发件箱
+
+```markdown
+private[netty] sealed trait OutboxMessage {
+	介绍: 发件箱消息
+	操作集:
+	def sendWith(client: TransportClient): Unit
+	功能: 客户端发送消息
+	
+	def onFailure(e: Throwable): Unit
+	功能: 异常处理
+}
+
+private[netty] case class OneWayOutboxMessage(content: ByteBuffer){
+	关系: father --> OutboxMessage
+		sibling --> Logging
+	介绍: 单向消息发件箱
+	构造器参数:
+	content	消息内容
+	
+	操作集:
+	def sendWith(client: TransportClient): Unit =  client.send(content)
+	功能: 客户端发送详细内容
+	
+	def onFailure(e: Throwable): Unit 
+	功能: 错误/异常处理
+        e match {
+          case e1: RpcEnvStoppedException => logDebug(e1.getMessage)
+          case e1: Throwable => logWarning(s"Failed to send one-way RPC.", e1) }
+}
+
+private[netty] case class RpcOutboxMessage(content: ByteBuffer,
+    _onFailure: (Throwable) => Unit,_onSuccess: (TransportClient, ByteBuffer) => Unit){
+	关系: father --> OutboxMessage
+    	sibling --> RpcResponseCallback --> Logging
+    介绍: RPC发件箱消息
+    构造器参数:
+    	content	消息内容
+    	_onFailure	异常处理函数
+    	_onSuccess	成功处理函数
+    属性:
+    #name @client=_ #type @TransportClient	客户端
+    #name @requestId=_ #type @Long	请求ID
+    操作集:
+    def sendWith(client: TransportClient): Unit
+    功能: 设置客户端,即请求编号属性,并发送消息@content
+        this.client = client
+        this.requestId = client.sendRpc(content, this)
+    
+    def removeRpcRequest(): Unit
+    功能: 移除RPC请求(客户端中移除编号为@requestId的请求)
+    	client != null ? client.removeRpcRequest(requestId) : 
+    	logError("Ask terminated before connecting successfully")
+    
+    def onTimeout(): Unit
+    功能: 超时处理
+    removeRpcRequest() // 移除当前请求id
+    
+    def onAbort(): Unit 
+    功能: 放弃处理
+    removeRpcRequest()
+    
+    def onFailure(e: Throwable): Unit
+    功能: 失败处理
+    _onFailure(e)
+    
+    def onSuccess(response: ByteBuffer): Unit
+    功能: 成功处理
+    _onSuccess(client, response)
+}
+```
+
+```markdown
+private[netty] class Outbox(nettyEnv: NettyRpcEnv, val address: RpcAddress) {
+	介绍: RPC收件箱
+	构造器参数:
+		nettyEnv	RPC环境
+		address		RPC地址
+	属性:
+	#name @messages = new java.util.LinkedList[OutboxMessage] @GuardedBy("this") 消息列表
+	#name @client=null #type @TransportClient GuardedBy("this") 客户端
+	#name @connectFuture=null #type @java.util.concurrent.Future[Unit] GuardedBy("this") 连接任务
+		指向连接任务,没有连接任务的时候,这个值为null
+	#name @stopped=false GuardedBy("this") 	发件箱状态
+	#name @draining=false GuardedBy("this")	是否设置一个线程排出消息队列
+	操作集:
+	def send(message: OutboxMessage): Unit
+	功能: 发送消息，如果不存在可以使用的链接，则对消息进行缓存且启动一个新的链接。如果发件箱@Outbox被停止了，	那么发送器会被@SparkException通知
+	1. 获取停止标记位
+        val dropped = synchronized {
+          if (stopped)
+            true
+          else 
+            messages.add(message)
+            false
+        }
+	2. 如果发件箱停止了，则需要发送器处理异常。否则从消息队列中排出消息。
+	if(dropped) 
+		message.onFailure(new SparkException("Message is dropped because Outbox is stopped"))
+	else
+		drainOutbox()
+	
+	def drainOutbox(): Unit
+	功能: 排出发件箱中的消息。消费消息队列中的消息，如果有其他消费线程就退出。如果链接还没有建立，则会运行
+	@nettyEnv.clientConnectionExecutor 去创建一个链接。
+	1. 同步检定
+        var message: OutboxMessage = null
+        synchronized {
+          if (stopped) {// 发件箱停止退出
+            return
+          }
+          if (connectFuture != null) {
+            // 链接任务存在退出
+            return
+          }
+          if (client == null) {
+           // 客户端不存在处理
+            launchConnectTask()
+            return
+          }
+          if (draining) {
+            // 存在有其他消费队列 退出
+            return
+          }
+          // 获取消息列表中的首个元素
+          message = messages.poll()
+          if (message == null) {
+            return
+          }
+          draining = true
+        }
+	2. 使用while(true)循环发出消息
+         while (true) {
+              try {
+              	1. 发送消息
+                    val _client = synchronized { client }
+                    if (_client != null) {
+                      message.sendWith(_client)
+                    } else {
+                      // 客户端不存在下状态断言
+                      assert(stopped)
+                    }
+                  } catch {
+                    case NonFatal(e) =>
+                      // 处理网络异常
+                      handleNetworkFailure(e)
+                      return
+                  }
+                2. 检定当前消息队列是否为空  
+                  synchronized {
+                    if (stopped) {
+                      return
+                    }
+                    message = messages.poll()
+                    if (message == null) {
+                      draining = false
+                      return
+                    }
+              }
+        }
+     
+       def launchConnectTask(): Unit
+       功能: 运行连接任务
+       val callable=new Callable[Unit]{
+       override def call(): Unit = {
+            try {
+             1. 初始化客户端
+              val _client = nettyEnv.createClient(address)
+              outbox.synchronized {
+                client = _client
+                if (stopped) {
+                  closeClient()
+                }
+              }
+            } catch {
+              case ie: InterruptedException =>
+                return
+              case NonFatal(e) =>
+                outbox.synchronized { connectFuture = null }
+                handleNetworkFailure(e)
+                return
+            }
+            outbox.synchronized { connectFuture = null }
+            // 从这里就需要开始排出数据了，否则必须等到下一条消息到达才能排出消息
+            drainOutbox()	
+       }
+       connectFuture = nettyEnv.clientConnectionExecutor.submit(callable)
+
+       def handleNetworkFailure(e: Throwable): Unit
+       功能: 处理网络异常/错误
+       1. 关闭客户端，停止发件箱
+           synchronized {
+              assert(connectFuture == null)
+              if (stopped) {
+                return
+              }
+              stopped = true
+              closeClient()
+            }
+       2. 移除当前RPC地址对应的发件箱，以便于新进入的消息会使用新链接创建新的发件箱 
+       nettyEnv.removeOutbox(address)
+       3. 排出消息队列中剩余的消息
+        由于在更新消息时，需要检查stopped标志，所以可以保证没有线程可以更新这些消息，所以排出这些消息时安全的
+           var message = messages.poll()
+            while (message != null) {
+              message.onFailure(e)
+              message = messages.poll()
+            }
+            // 最后最检定
+            assert(messages.isEmpty)
+
+        def stop(): Unit
+        功能: 停止发件箱@OutBox,发件箱的剩余消息会使用@SparkException提示
+        1. 停止客户端,发件箱,取消链接任务(先停止发件箱，再取消链接任务，最后关闭客户端)
+            synchronized {
+              if (stopped) {
+                return
+              }
+              stopped = true
+              if (connectFuture != null) {
+                connectFuture.cancel(true)
+              }
+              closeClient()
+            }
+         2. 剩余消息处理
+            直接将消息排出，由于stop=true，其他线程不会更新这些消息，所以可以直接处理，如果处理消息引发异常，			则进行异常处理
+        	var message = messages.poll()
+         	while (message != null) {
+              message.onFailure(new SparkException("Message is dropped because Outbox is stopped"))
+              message = messages.poll() }
+         
+}
+```
+
 #### RpcEndpointVerifier
 
 ```markdown
@@ -173,16 +1172,12 @@ private[netty] class RpcEndpointVerifier(override val rpcEnv: RpcEnv, dispatcher
 ```markdown
 private[netty] object RpcEndpointVerifier {
 	属性:
-	#name @NAME="endpoint-verifier" 	名称
+	#name @NAME="endpoint-verifier"名称
 	
 	case class CheckExistence(name: String)
 	功能: 检查远程RPC端点验证器，是否有端点存在@RpcEndpoint
 }
 ```
-
-
-
-
 
 #### RpcAddress
 
@@ -635,3 +1630,6 @@ private[spark] object RpcTimeout {
 }
 ```
 
+#### 基础拓展
+
+1.  幂等性
