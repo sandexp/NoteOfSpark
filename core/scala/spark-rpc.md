@@ -14,7 +14,7 @@
 8.  [RpcEnv.scala](# RpcEnv)
 9.  [RpcEnvStoppedException.scala](# RpcEnvStoppedException)
 10.  [RpcTimeout.scala](# RpcTimeout)
-11.   基础拓展
+11.   [基础拓展](# 基础拓展)
 
 ---
 
@@ -579,7 +579,415 @@ private[netty] class RemoteNettyRpcCallContext(nettyEnv: NettyRpcEnv,callback: R
 #### NettyRpcEnv
 
 ```markdown
+private[netty] class NettyRpcEnv(val conf: SparkConf,javaSerializerInstance: JavaSerializerInstance,
+    host: String,securityManager: SecurityManager,numUsableCores: Int){
+	关系: father --> RpcEnv(conf)
+    	sibling --> Logging
+    构造器属性:
+    	conf	spark属性配置集
+    	javaSerializerInstance	java序列化实例
+    	host	主机名称
+    	securityManager	安全管理器
+    	numUsableCores	可使用的核心数量
+    属性:
+    #name @role #type @String 当前任务@EXECUTOR_ID 身份
+    val= conf.get(EXECUTOR_ID).map { id =>
+    	if (id == SparkContext.DRIVER_IDENTIFIER) "driver" else "executor" }
+    
+    #name @transportConf #type @TransportConf 传输配置信息
+    val= SparkTransportConf.fromSparkConf(
+   	 	conf.clone.set(RPC_IO_NUM_CONNECTIONS_PER_PEER, 1),"rpc",
+    	conf.get(RPC_IO_THREADS).getOrElse(numUsableCores),role)
+	
+	#name @dispatcher #type @Dispatcher	RPC分发器
+	val= new Dispatcher(this, numUsableCores)
+	
+	#name @streamManager #type @NettyStreamManager 	流管理器
+	val= new NettyStreamManager(this)
+	
+	#name @transportContext #type @TransportContext	传输上下文
+	val= new TransportContext(transportConf,new NettyRpcHandler(dispatcher, this, streamManager))
+	
+	#name @clientFactory=transportContext.createClientFactory(createClientBootstraps())	客户端工厂
+	
+	#name @fileDownloadFactory #type @TransportClientFactory  volatile	文件下载工厂(传输客户端工厂)
+		这是一个单独用于文件下载的客户端工厂,为了避免使用主RPC上下文中相同的RPC处理器.所以这些客户端引起的事		件保存在主RPC网之外的独立空间中.同样,它允许特定属性的不同配置,比如单点链接数量等等.
+	 	
+	#name @timeoutScheduler=
+		ThreadUtils.newDaemonSingleThreadScheduledExecutor("netty-rpc-env-timeout")
+		超时调度器
+	
+	#name clientConnectionExecutor
+    val = ThreadUtils.newDaemonCachedThreadPool("netty-rpc-connection",conf.get(RPC_CONNECT_THREADS))
+	客户端连接执行器
+		由于TransportClientFactory.createClient 是阻塞的,需要将其运行在一个线程池中,去实现非阻塞式消息的发		送与请求
+	
+	#name @server #type @TransportServer 	传输服务器
+	
+	#name @stopped=new AtomicBoolean(false)	停止标记位(原子性)
+	
+	#name @outboxes=new ConcurrentHashMap[RpcAddress, Outbox]()
+	发件箱映射表
+	-> 维护RPC地址@RpcAddress与收件箱@Outbox的映射关系,当连接上远端RPC时,只需要将消息置入发件箱,去实现一个非		阻塞式的@send 方法.
+	
+	#name @address #type @RpcAddress lazy Nullable
+	RPC地址信息
+	val=if (server != null) RpcAddress(host, server.getPort()) else null
+	
+	操作集:
+	def removeOutbox(address: RpcAddress): Unit
+	功能: 移除指定RPC地址@address的发件箱
+    val outbox = outboxes.remove(address) // 移除记录
+    if (outbox != null) { // 停止发件箱
+      outbox.stop()}
+	
+	def createClientBootstraps(): java.util.List[TransportClientBootstrap]
+	功能: 创建客户端启动器
+	val= securityManager.isAuthenticationEnabled() ?
+		java.util.Arrays.asList(new AuthClientBootstrap(transportConf,
+        	securityManager.getSaslUser(), securityManager)) :
+         java.util.Collections.emptyList[TransportClientBootstrap] // 权限不足,返回空表
+	
+	def startServer(bindAddress: String, port: Int): Unit
+	功能: 开启服务器
+	1. 获取启动的客户端列表
+	val bootstraps: java.util.List[TransportServerBootstrap] =
+      if (securityManager.isAuthenticationEnabled()) {
+        java.util.Arrays.asList(new AuthServerBootstrap(transportConf, securityManager))
+      } else {
+        java.util.Collections.emptyList()
+      }
+    2. 创建服务器
+    server = transportContext.createServer(bindAddress, port, bootstraps)
+    3. 注册RPC端点信息
+    dispatcher.registerRpcEndpoint(
+      RpcEndpointVerifier.NAME, new RpcEndpointVerifier(this, dispatcher))
+      
+    def setupEndpoint(name: String, endpoint: RpcEndpoint): RpcEndpointRef
+    功能: 创建RPC端点
+    val= dispatcher.registerRpcEndpoint(name, endpoint)
+    
+    def stop(endpointRef: RpcEndpointRef): Unit
+    功能: 停止指定的RPC端点@endpointRef
+    require(endpointRef.isInstanceOf[NettyRpcEndpointRef])
+    dispatcher.stop(endpointRef)
+    
+    def asyncSetupEndpointRefByURI(uri: String): Future[RpcEndpointRef]
+    功能: 通过URI异步创建RPC端点,获取的是一个任务
+    1. 获取RPC端点参考信息@RpcEndpointRef
+    val addr = RpcEndpointAddress(uri)
+    val endpointRef = new NettyRpcEndpointRef(conf, addr, this)
+    2. 获取RPC端点验证器
+    val verifier = new NettyRpcEndpointRef(
+      conf, RpcEndpointAddress(addr.rpcAddress, RpcEndpointVerifier.NAME), this)
+    3. 检查端点@endpointRef,是否存在,存在则进行成功处理任务,否则处理失败场景
+    verifier.ask[Boolean](RpcEndpointVerifier.CheckExistence(endpointRef.name)).flatMap { find =>
+      if (find) {
+        Future.successful(endpointRef)
+      } else {
+        Future.failed(new RpcEndpointNotFoundException(uri))
+      }
+    }(ThreadUtils.sameThread)
+    
+    def postToOutbox(receiver: NettyRpcEndpointRef, message: OutboxMessage): Unit
+    功能: 发送消息@message到发件箱
+    1.如果接收端存在,则直接将消息发送到接收端
+     if (receiver.client != null) {
+      message.sendWith(receiver.client)}
+    2. 否则需要先创建目标发件箱(RPC地址月给定@receive一致)
+    if(...){
+    	...
+    }else{
+    	// 存在性断言
+    	require(receiver.address != null,
+        "Cannot send message to client endpoint with no listen address.")
+    	val targetOutbox = {
+        val outbox = outboxes.get(receiver.address)
+        if (outbox == null) {
+          val newOutbox = new Outbox(this, receiver.address)
+          val oldOutbox = outboxes.putIfAbsent(receiver.address, newOutbox)
+          if (oldOutbox == null) {
+            newOutbox
+          } else {
+            oldOutbox
+          }
+        } else {
+          outbox
+        }
+      }
+    }
+ 	3. 考虑到发送消息时,可能RPC环境已经停止了@stop.value=true,所以需要清理发件箱
+ 	if(){
+ 		...
+ 	}else{
+ 		...
+ 		if (stopped.get) {
+            // It's possible that we put `targetOutbox` after stopping. So we need to clean it.
+            outboxes.remove(receiver.address)
+            targetOutbox.stop()
+          } else {
+            targetOutbox.send(message)
+          }
+ 	}
+    
+    def send(message: RequestMessage): Unit
+    功能: 发送请求消息
+    分为两种情况,一种时发送到本地,另一种是发送到远程
+    val remoteAddr = message.receiver.address
+    if (remoteAddr == address) {
+      // 发送到本地RPC端点
+      try {
+        dispatcher.postOneWayMessage(message)
+      } catch {
+        case e: RpcEnvStoppedException => logDebug(e.getMessage)
+      }
+    }else{
+    	// 发送到远程RPC端点
+    	postToOutbox(message.receiver, OneWayOutboxMessage(message.serialize(this)))
+    }
+    
+    def createClient(address: RpcAddress): TransportClient
+    功能: 创建客户端
+    
+    def ask[T: ClassTag](message: RequestMessage, timeout: RpcTimeout): Future[T]
+    功能: 在规定时间内@timeout 获取@message的响应
+    val= askAbortable(message, timeout).toFuture
+    
+    def askAbortable[T: ClassTag](
+      message: RequestMessage, timeout: RpcTimeout): AbortableRpcFuture[T]
+    功能: 可放弃读取式请求,时间限制为@timeout,发出消息为@message,获取一个可以RPC任务@AbortableRpcFuture
+    需要对这个RPC任务设置:
+    1. 失败处理方案
+    def onFailure(e: Throwable): Unit = {
+      if (!promise.tryFailure(e)) {
+        e match {
+          case e : RpcEnvStoppedException => logDebug (s"Ignored failure: $e")
+          case _ => logWarning(s"Ignored failure: $e")
+        }
+      }
+    }
+    2. 处理成功处理方案
+    def onSuccess(reply: Any): Unit = reply match {
+      case RpcFailure(e) => onFailure(e)
+      case rpcReply =>
+        if (!promise.trySuccess(rpcReply)) {
+          logWarning(s"Ignored message: $reply")
+        }
+    }
+    3. 放弃请求处理方案
+    def onAbort(reason: String): Unit = {
+      onFailure(new RpcAbortException(reason))
+    }
+    4. 初始设置(线程进去就会执行的内容)
+    + 发送信息给目的RPC地址(分为本地和远程地址)
+        if (remoteAddr == address) {
+            val p = Promise[Any]()
+            p.future.onComplete {
+              case Success(response) => onSuccess(response)
+              case Failure(e) => onFailure(e)
+            }(ThreadUtils.sameThread)
+            dispatcher.postLocalMessage(message, p)
+          } else {
+            val rpcMessage = RpcOutboxMessage(message.serialize(this),
+              onFailure,
+              (client, response) => onSuccess(deserialize[Any](client, response)))
+            postToOutbox(message.receiver, rpcMessage)
+            promise.future.failed.foreach {
+              case _: TimeoutException => rpcMessage.onTimeout()
+              case _: RpcAbortException => rpcMessage.onAbort()
+              case _ =>
+            }(ThreadUtils.sameThread)
+          }
+     + 使用超时调度器@timeoutScheduler 调度连接任务
+         val timeoutCancelable = timeoutScheduler.schedule(new Runnable {
+            override def run(): Unit = {
+              onFailure(new TimeoutException(s"Cannot receive any reply from ${remoteAddr} " +
+                s"in ${timeout.duration}"))
+            }
+          }, timeout.duration.toNanos, TimeUnit.NANOSECONDS)
+    + 任务完成处理(取消超时)
+    promise.future.onComplete { v =>
+        timeoutCancelable.cancel(true)
+      }(ThreadUtils.sameThread)
+    + 返回经过上述设置的任务信息
+    val= new AbortableRpcFuture[T](
+      promise.future.mapTo[T].recover(timeout.addMessageIfTimeout)(ThreadUtils.sameThread),
+      onAbort)
+    
+    def serialize(content: Any): ByteBuffer 
+    功能: 序列化消息@content,使用java序列化
+    val= javaSerializerInstance.serialize(content)
+    
+    def serializeStream(out: OutputStream): SerializationStream
+    功能: 获取指定输出流@out的序列化流@SerializationStream
+    val= javaSerializerInstance.serializeStream(out)
+    
+    def deserialize[T: ClassTag](client: TransportClient, bytes: ByteBuffer): T
+    功能: 客户端反序列化@bytes
+    val= NettyRpcEnv.currentClient.withValue(client) {
+      deserialize { () => avaSerializerInstance.deserialize[T](bytes)}
+    }
+    
+    def endpointRef(endpoint: RpcEndpoint): RpcEndpointRef
+    功能: 获取指定RPC端点的参考信息
+    val= dispatcher.getRpcEndpointRef(endpoint)
+    
+    def shutdown(): Unit
+    功能: 关闭当前RPC环境
+    	cleanup()
+    
+    def awaitTermination(): Unit
+    功能: 等待分发器终止
+    	dispatcher.awaitTermination()
+    
+     def cleanup(): Unit
+     功能: 清除全部(超时调度器,分发器,服务器,客户端工厂,客户端连接执行器,文件下载工厂,传输上下文关闭)
+     	if (!stopped.compareAndSet(false, true)) {
+          return
+        }
 
+        val iter = outboxes.values().iterator()
+        while (iter.hasNext()) {
+          val outbox = iter.next()
+          outboxes.remove(outbox.address)
+          outbox.stop()
+        }
+        if (timeoutScheduler != null) {
+          timeoutScheduler.shutdownNow()
+        }
+        if (dispatcher != null) {
+          dispatcher.stop()
+        }
+        if (server != null) {
+          server.close()
+        }
+        if (clientFactory != null) {
+          clientFactory.close()
+        }
+        if (clientConnectionExecutor != null) {
+          clientConnectionExecutor.shutdownNow()
+        }
+        if (fileDownloadFactory != null) {
+          fileDownloadFactory.close()
+        }
+        if (transportContext != null) {
+          transportContext.close()
+        }
+    
+     def deserialize[T](deserializationAction: () => T): T
+     功能: 反序列化
+     输出参数: deserializationAction	反序列化函数
+     val=  NettyRpcEnv.currentEnv.withValue(this) {
+      	deserializationAction()}
+	
+    def fileServer: RpcEnvFileServer = streamManager
+    功能: 获取RPC文件服务器
+    
+    def openChannel(uri: String): ReadableByteChannel
+    功能: 读取指定uri通道中的字节
+    1. 获取URI,并进行断言检测
+    val parsedUri = new URI(uri)
+    require(parsedUri.getHost() != null, "Host name must be defined.")
+    require(parsedUri.getPort() > 0, "Port must be defined.")
+    require(parsedUri.getPath() != null && parsedUri.getPath().nonEmpty, "Path must be defined.")
+    2. 获取需要下载文件信息
+    val pipe = Pipe.open()
+    val source = new FileDownloadChannel(pipe.source())
+    3. 获取客户端中传输的流式数据
+    val= Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
+      val client = downloadClient(parsedUri.getHost(), parsedUri.getPort())
+      val callback = new FileDownloadCallback(pipe.sink(), source, client)
+      client.stream(parsedUri.getPath(), callback)
+    })(catchBlock = {
+      pipe.sink().close()
+      source.close()
+    })
+    
+    def downloadClient(host: String, port: Int): TransportClient
+    功能: 获取指定主机名和端口号的传输客户端@TransportClient
+    if (fileDownloadFactory == null) synchronized {
+      if (fileDownloadFactory == null) {
+   		// 双重检索,保证线程安全
+   		* 1. 获取模块名称,前缀名称,克隆配置信息
+   		val module = "files"
+        val prefix = "spark.rpc.io."
+        val clone = conf.clone()
+        * 2. 拷贝没有spark文件属性信息的RPC配置信息
+        conf.getAll.foreach { case (key, value) =>
+          if (key.startsWith(prefix)) {
+            val opt = key.substring(prefix.length())
+            clone.setIfMissing(s"spark.$module.io.$opt", value)
+          }
+        }
+        
+        * 3.设置io线程数量为1,配置下载(拷贝了一份conf配置)配置信息,已经配置上下文@TransportContext
+        val ioThreads = clone.getInt("spark.files.io.threads", 1)
+        val downloadConf = SparkTransportConf.fromSparkConf(clone, module, ioThreads)
+        val downloadContext = new TransportContext(downloadConf, new NoOpRpcHandler(), true)
+        
+        * 4.设置文件下载工厂(产生这个类型的传输客户端@TransportClient)
+        fileDownloadFactory = downloadContext.createClientFactory(createClientBootstraps())
+      }
+      5. 从工厂中获取一个实例
+      val= fileDownloadFactory.createClient(host, port)
+   }
+}
+```
+#subclass @NettyRpcEnv.FileDownloadChannel
+
+```markdown
+private class FileDownloadChannel(source: Pipe.SourceChannel){
+	关系: father --> ReadableByteChannel
+	介绍: 文件下载通道 
+	构造器属性:
+		source	数据源(通道)
+	属性:
+	#name @error #type @Throwable volatile	错误
+	操作集:
+	def setError(e: Throwable): Unit
+	功能: 设置错误原因
+	
+	def close(): Unit = source.close()
+	功能: 关闭通道读取
+	
+	def isOpen(): Boolean = source.isOpen()
+	功能: 确认通道是否开启
+	
+	def read(dst: ByteBuffer): Int
+	功能: 读取/下载目标@dst缓冲区
+	val= Try(source.read(dst)) match {
+	    case _ if error != null => throw error
+        case Success(bytesRead) => bytesRead
+        case Failure(readErr) => throw readErr
+	}
+}
+```
+
+#subclass @NettyRpcEnv.FileDownloadCallback
+
+```markdown
+private class FileDownloadCallback(sink: WritableByteChannel,source: FileDownloadChannel,
+      client: TransportClient){
+	介绍: 文件下载回调信息处理
+    构造器参数:
+    	sink	目标通道位置
+    	source	来源通道位置
+    	client	传输客户端
+    操作集:
+    def onData(streamId: String, buf: ByteBuffer): Unit
+    功能: 处理缓冲区中的数据
+    while (buf.remaining() > 0) {sink.write(buf)}
+	
+	def onComplete(streamId: String): Unit
+	功能: 完成处理措施(关闭sink链接)
+	sink.close()
+	
+	def onFailure(streamId: String, cause: Throwable): Unit
+	功能: 失败处理措施
+	logDebug(s"Error downloading stream $streamId.", cause)
+    source.setError(cause)
+    sink.close()
+}
 ```
 
 ```markdown
@@ -858,8 +1266,6 @@ private[netty] class NettyRpcHandler(dispatcher: Dispatcher,nettyEnv: NettyRpcEn
           }
 }
 ```
-
-
 
 #### NettyStreamManager
 
