@@ -1428,7 +1428,7 @@
 
 #### AppHistoryServerPlugin
 
-```markdown
+```scala
 private[spark] trait AppHistoryServerPlugin {
 	介绍: 这是一个创建历史监听器(用于重现事件日志)的接口，像SQL一样定义在其他模块中，设置插件的UI和重建历史UI
 	操作集:
@@ -1445,9 +1445,1015 @@ private[spark] trait AppHistoryServerPlugin {
 
 ####  AppStatusListener
 
+```markdown
+介绍:
+	spark应用监听器，将信用信息写到数据存储中，写出到数据存储器的类型请参照基于REST Api的@storeTypes 文
+```
+
+```scala
+private[spark] class AppStatusListener(kvstore: ElementTrackingStore,conf: SparkConf,live: Boolean,
+    appStatusSource: Option[AppStatusSource] = None,lastUpdateTime: Option[Long] = None)
+	extends SparkListener with Logging {
+	构造器参数:
+        	kvstore	KV存储器
+        	conf	spark配置集
+        	live	是否存活
+        	appStatusSource	应用状态来源
+        	lastUpdateTime	上传更新时间
+     属性:
+     	#name @sparkVersion = SPARK_VERSION	spark版本
+      	#name @appInfo: v1.ApplicationInfo = null	应用信息
+        #name @appSummary = new AppSummary(0, 0)	应用描述
+        #name @coresPerTask=1	单个任务核心数量
+        #name @liveUpdatePeriodNs=if (live) conf.get(LIVE_ENTITY_UPDATE_PERIOD) else -1L	
+        	存活更新周期(ns)
+        	决定了更新存活实例的周期，-1代表了永远不会更新
+        #name @liveUpdateMinFlushPeriod = conf.get(LIVE_ENTITY_UPDATE_MIN_FLUSH_PERIOD)
+        	存活实例更新最小刷新周期
+        	旧UI数据最小的刷新时间，主要用于解决到来的任务没有定期清除，而导致的UI数据过时的情况
+        #name @maxTasksPerStage = conf.get(MAX_RETAINED_TASKS_PER_STAGE)	单个stage最大任务数量
+        #name @maxGraphRootNodes = conf.get(MAX_RETAINED_ROOT_NODES)	图最大根节点数量
+        #name @liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()	存活stage表
+        #name @liveJobs = new HashMap[Int, LiveJob]()	存活job 表
+        #name @liveExecutors = new HashMap[String, LiveExecutor]()	存活执行器表
+        #name @deadExecutors = new HashMap[String, LiveExecutor]()	死亡执行器表
+        #name @liveTasks = new HashMap[Long, LiveTask]()	存活任务表
+        #name @liveRDDs = new HashMap[Int, LiveRDD]()	存活RDD表
+        #name @pools = new HashMap[String, SchedulerPool]()	调度池映射表
+        #name @SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"	sql执行ID的key值
+        #name @activeExecutorCount = 0 volatile		存活执行器数量
+        #name @lastFlushTimeNs = System.nanoTime()	上次刷新时间
+        初始化操作:
+        操作集:
+        def onOtherEvent(event: SparkListenerEvent): Unit
+        功能: 对事件日志的元数据@SparkListenerEvent 做处理
+        event match {
+            case SparkListenerLogStart(version) => sparkVersion = version // 指定事件为事件日志元数据
+            case _ =>
+        }
+        
+        def onApplicationStart(event: SparkListenerApplicationStart): Unit
+        功能: 应用开始处理方式
+        1. 断言事件@event 存在
+        assert(event.appId.isDefined, "Application without IDs are not supported.")
+        2. 获取应用请求信息
+        val attempt = v1.ApplicationAttemptInfo(event.appAttemptId,new Date(event.time),new Date(-1),
+          new Date(event.time),-1L,event.sparkUser,false,sparkVersion)
+        3. 获取应用信息
+        appInfo = v1.ApplicationInfo(event.appId.get,event.appName,None,None,None,None,Seq(attempt))
+		4. 将应用信息入库@kvStore
+        kvstore.write(new ApplicationInfoWrapper(appInfo))
+        kvstore.write(appSummary)
+        5. 使用本事件@event 的日志更新driver的块管理器(sparkContext在这之前已经将驱动器注册了)
+        event.driverLogs.foreach { logs =>
+        val driver = liveExecutors.get(SparkContext.DRIVER_IDENTIFIER) // 获取驱动器
+        driver.foreach { d =>
+            d.executorLogs = logs.toMap  // 获取当前驱动器的执行器日志
+            d.attributes = event.driverAttributes.getOrElse(Map.empty).toMap // 获取驱动器的属性列表
+            update(d, System.nanoTime()) // 更新执行器日志信息
+          }
+        }
+    	
+        def onEnvironmentUpdate(event: SparkListenerEnvironmentUpdate): Unit
+        功能: 环境更新处理方案
+        1. 获取相关信息
+        val details = event.environmentDetails // 获取@event指定的新的环境描述信息
+        val jvmInfo = Map(details("JVM Information"): _*)	// 获取环境中jvm信息
+        val runtime = new v1.RuntimeInfo(
+            jvmInfo.get("Java Version").orNull,
+            jvmInfo.get("Java Home").orNull,
+            jvmInfo.get("Scala Version").orNull) // 获取jvm的运行信息
+        val envInfo = new v1.ApplicationEnvironmentInfo(
+          runtime,
+          details.getOrElse("Spark Properties", Nil),
+          details.getOrElse("Hadoop Properties", Nil),
+          details.getOrElse("System Properties", Nil),
+          details.getOrElse("Classpath Entries", Nil))  // 获取应用环境信息
+        coresPerTask = envInfo.sparkProperties.toMap.get(CPUS_PER_TASK.key).map(_.toInt)
+        	.getOrElse(coresPerTask)  // 获取单个任务核心数量信息
+        2. 将环境信息更新到KV存储中
+        kvstore.write(new ApplicationEnvironmentInfoWrapper(envInfo))
+        
+        def onApplicationEnd(event: SparkListenerApplicationEnd): Unit
+        功能: 对应于应用结束事件@event 处理方案
+        1. 获取旧的应用请求信息
+        val old = appInfo.attempts.head
+        2. 获取任务结束后的任务请求信息(任务完成标志置位,更新任务持续时间duration)
+        val attempt = v1.ApplicationAttemptInfo(
+          old.attemptId,
+          old.startTime,
+          new Date(event.time),
+          new Date(event.time),
+          event.time - old.startTime.getTime(),
+          old.sparkUser,
+          true,
+          old.appSparkVersion)
+        3. 根据请求信息获取
+        appInfo = v1.ApplicationInfo(appInfo.id,appInfo.name,None,None,None,None,Seq(attempt))
+	    4. 写出到存储系统中
+        kvstore.write(new ApplicationInfoWrapper(appInfo)) 
+    	
+        def onExecutorAdded(event: SparkListenerExecutorAdded): Unit
+        功能: 检测到@event 添加执行器处理方案
+    		这个在驱动器dead后，执行器重新注册的情况下会更新
+        1. 获取一个存活执行器
+        val exec = getOrCreateExecutor(event.executorId, event.time)
+        2. 从指定检测事件@event 设置执行器的属性值
+    	exec.host = event.executorInfo.executorHost
+        exec.isActive = true
+        exec.totalCores = event.executorInfo.totalCores
+        exec.maxTasks = event.executorInfo.totalCores / coresPerTask
+        exec.executorLogs = event.executorInfo.logUrlMap
+        exec.resources = event.executorInfo.resourcesInfo
+        exec.attributes = event.executorInfo.attributes
+    	3. 处于启动状态下更新(热更新)执行器
+        liveUpdate(exec, System.nanoTime())
+        
+        def onExecutorRemoved(event: SparkListenerExecutorRemoved): Unit
+        功能: 处理执行器移除事件
+        1. 从执行器列表中移除事件@event中指定的执行器
+    	liveExecutors.remove(event.executorId).foreach { exec =>
+          // 获取并更新执行器移除相关信息,并更新执行器信息
+          val now = System.nanoTime()
+          activeExecutorCount = math.max(0, activeExecutorCount - 1)
+          exec.isActive = false
+          exec.removeTime = new Date(event.time)
+          exec.removeReason = event.reason
+          update(exec, now, last = true)
+          // 移除与移除执行器相关的RDD分布@RDDDistribution 并更新RDD分布信息
+          liveRDDs.values.foreach { rdd =>
+            if (rdd.removeDistribution(exec)) {
+              update(rdd, now)
+            }
+          }
+          // 移除与移除执行器相关的RDD分区 并更新RDD分区列表
+          liveRDDs.values.foreach { rdd =>
+            rdd.getPartitions.values
+              .filter(_.executors.contains(event.executorId))
+              .foreach { partition =>
+                if (partition.executors.length == 1) {
+                  rdd.removePartition(partition.blockName)
+                  rdd.memoryUsed = addDeltaToValue(rdd.memoryUsed, partition.memoryUsed * -1)
+                  rdd.diskUsed = addDeltaToValue(rdd.diskUsed, partition.diskUsed * -1)
+                } else {
+                  rdd.memoryUsed = addDeltaToValue(rdd.memoryUsed,
+                    (partition.memoryUsed / partition.executors.length) * -1)
+                  rdd.diskUsed = addDeltaToValue(rdd.diskUsed,
+                    (partition.diskUsed / partition.executors.length) * -1)
+                  partition.update(
+                    partition.executors.filter(!_.equals(event.executorId)),
+                    addDeltaToValue(partition.memoryUsed,
+                      (partition.memoryUsed / partition.executors.length) * -1),
+                    addDeltaToValue(partition.diskUsed,
+                      (partition.diskUsed / partition.executors.length) * -1))
+                }
+              }
+            update(rdd, now)
+          }
+            // 检测当前执行器是否对于当前stage处于激活状态,如果处于激活状态,则将其加入已死亡的执行器列表
+            // @deadExecutors 完成了执行器状态由运行转化为激活状态
+          if (isExecutorActiveForLiveStages(exec)) 
+            deadExecutors.put(event.executorId, exec)
+          }
+        }
+
+	def isExecutorActiveForLiveStages(exec: LiveExecutor): Boolean
+	功能: 检测指定执行器@LiveExecutor 是否对于当前stage是处于激活状态(根据提交时间和移除时间判断,移除时间在		后则说明当前执行器处于激活状态)
+	val= liveStages.values.asScala.exists { stage =>
+      stage.info.submissionTime.getOrElse(0L) < exec.removeTime.getTime
+    }
+	
+	def onExecutorBlacklisted(event: SparkListenerExecutorBlacklisted): Unit
+	功能: 检测到黑名单事件，将指定事件@event 加入到黑名单列表中
+	updateBlackListStatus(event.executorId, true)
+	
+	def onExecutorBlacklistedForStage(event: SparkListenerExecutorBlacklistedForStage): Unit
+	功能: 检测到stage处于黑名单中
+	1. 将当前stage加入黑名单列表
+	val now = System.nanoTime()
+    Option(liveStages.get((event.stageId, event.stageAttemptId))).foreach { stage =>
+      setStageBlackListStatus(stage, now, event.executorId) }
+	2. 将指定黑名单stage加入到执行器的stage黑名单列表
+	liveExecutors.get(event.executorId).foreach { exec =>
+      addBlackListedStageTo(exec, event.stageId, now) }
+	
+	def onNodeBlacklistedForStage(event: SparkListenerNodeBlacklistedForStage): Unit
+	功能: 检测到节点stage处于黑名单处理方案
+	1. 获取与节点相关的该stage所处的所有执行器，并设置该stage为黑名单状态
+	Option(liveStages.get((event.stageId, event.stageAttemptId))).foreach { stage =>
+      val executorIds = liveExecutors.values.filter(_.host == event.hostId).map(_.executorId).toSeq
+      setStageBlackListStatus(stage, now, executorIds: _*)}
+	2. 指定节点中添加该stage到执行器中(有且只是事件指定节点)
+	liveExecutors.values.filter(_.hostname == event.hostId).foreach { exec =>
+      addBlackListedStageTo(exec, event.stageId, now)}
+	
+	def addBlackListedStageTo(exec: LiveExecutor, stageId: Int, now: Long): Unit
+	功能: 将指定stage添加到指定执行器@exec中, 并更新指定执行器信息
+	exec.blacklistedInStages += stageId
+    liveUpdate(exec, now)
+	
+	def setStageBlackListStatus(stage: LiveStage, now: Long, executorIds: String*): Unit 
+	功能: 设置stage黑名单状态
+	1. 设置执行器中id的黑名单状态，如果有更新就去更新执行器描述@executorStageSummary
+	executorIds.foreach { executorId =>
+      val executorStageSummary = stage.executorSummary(executorId)
+      executorStageSummary.isBlacklisted = true
+      maybeUpdate(executorStageSummary, now)
+    }
+	2. 添加以及加入到黑名单的执行器编号，并更新stage信息
+	stage.blackListedExecutors ++= executorIds
+	maybeUpdate(stage, now)
+	
+	def onExecutorUnblacklisted(event: SparkListenerExecutorUnblacklisted): Unit
+	功能: 执行器解除黑名单
+	updateBlackListStatus(event.executorId, false)
+	
+	def onNodeBlacklisted(event: SparkListenerNodeBlacklisted): Unit
+	功能: 将节点加入黑名单
+	updateNodeBlackList(event.hostId, true)
+	
+	def onNodeUnblacklisted(event: SparkListenerNodeUnblacklisted): Unit
+	功能: 节点解除黑名单
+	updateNodeBlackList(event.hostId, false)
+	
+	def updateBlackListStatus(execId: String, blacklisted: Boolean): Unit
+	功能: 更新指定执行器黑名单状态为指定@blacklisted
+	liveExecutors.get(execId).foreach { exec =>
+      exec.isBlacklisted = blacklisted
+      if (blacklisted) {
+        appStatusSource.foreach(_.BLACKLISTED_EXECUTORS.inc())
+      } else {
+        appStatusSource.foreach(_.UNBLACKLISTED_EXECUTORS.inc())
+      }
+      liveUpdate(exec, System.nanoTime())
+    }
+	
+	def updateNodeBlackList(host: String, blacklisted: Boolean): Unit
+	功能: 更新节点黑名单状态为指定
+	val now = System.nanoTime()
+    liveExecutors.values.foreach { exec =>
+      if (exec.hostname == host) {
+        exec.isBlacklisted = blacklisted
+        liveUpdate(exec, now)
+      }
+    }
+
+	def onJobStart(event: SparkListenerJobStart): Unit
+	功能: 监听到job开始事件@event 处理措施
+	val now = System.nanoTime()
+	1. 计算这个job会运行的任务数量
+	val numTasks = {
+      val missingStages = event.stageInfos.filter(_.completionTime.isEmpty)
+      missingStages.map(_.numTasks).sum
+    }
+	2. 获取job相关信息
+	val lastStageInfo = event.stageInfos.sortBy(_.stageId).lastOption // 获取最后一条stage信息
+    val jobName = lastStageInfo.map(_.name).getOrElse("") // 获取job名称 
+    val description = Option(event.properties) 
+      .flatMap { p => Option(p.getProperty(SparkContext.SPARK_JOB_DESCRIPTION)) } // 获取job描述
+    val jobGroup = Option(event.properties)
+      .flatMap { p => Option(p.getProperty(SparkContext.SPARK_JOB_GROUP_ID)) } // 获取job所属组
+    val sqlExecutionId = Option(event.properties)
+      .flatMap(p => Option(p.getProperty(SQL_EXECUTION_ID_KEY)).map(_.toLong)) // 获取sql执行id
+	3. 获取存活job实例,并注册到存活job列表中
+	val job = new LiveJob(
+      event.jobId,
+      jobName,
+      description,
+      if (event.time > 0) Some(new Date(event.time)) else None,
+      event.stageIds,
+      jobGroup,
+      numTasks,
+      sqlExecutionId)
+     liveJobs.put(event.jobId, job)
+	liveUpdate(job, now) // 更新job时间信息
+	4. 将job信息加入到stage列表中,并更新
+	event.stageInfos.foreach { stageInfo =>
+      val stage = getOrCreateStage(stageInfo)
+      stage.jobs :+= job
+      stage.jobIds += event.jobIdRDDOperationGraphWrapper
+      liveUpdate(stage, now)
+    }
+	5. 为job所有的stage创建RDD操作图包装器@RDDOperationGraphWrapper
+	event.stageInfos.foreach { stage =>
+      val graph = RDDOperationGraph.makeOperationGraph(stage, maxGraphRootNodes)
+      val uigraph = new RDDOperationGraphWrapper(
+        stage.stageId,
+        graph.edges,
+        graph.outgoingEdges,
+        graph.incomingEdges,
+        newRDDOperationCluster(graph.rootCluster))
+      kvstore.write(uigraph)
+    }
+	
+	def newRDDOperationCluster(cluster: RDDOperationCluster): RDDOperationClusterWrapper
+	功能: 包装指定RDD集群操作器
+	val= new RDDOperationClusterWrapper(cluster.id,cluster.name,cluster.childNodes,
+      	cluster.childClusters.map(newRDDOperationCluster))
+	
+	def onJobEnd(event: SparkListenerJobEnd): Unit
+	功能: 监听到job结束的处理方案
+	1. 移除事件指定job的job信息
+	liveJobs.remove(event.jobId).foreach { job =>
+      val now = System.nanoTime()
+      // 检查是否与当前要删除job匹配的待定stage,如果有则标志为skipped 不去执行它
+      val it = liveStages.entrySet.iterator()
+      while (it.hasNext()) {
+        val e = it.next()
+        if (job.stageIds.contains(e.getKey()._1)) { // 匹配与结束job的stage处理
+          val stage = e.getValue() // 获取stage
+          // 处于待定且stage需要运行的任务数量大于0 则设置为skipped
+          if (v1.StageStatus.PENDING.equals(stage.status) && stage.info.numTasks > 0) {
+              // 修改待定stage状态为skipped
+            stage.status = v1.StageStatus.SKIPPED
+              // 度量信息设置
+            job.skippedStages += stage.info.stageId
+            job.skippedTasks += stage.info.numTasks
+            job.activeStages -= 1
+            pools.get(stage.schedulingPool).foreach { pool =>
+                //由于这个stage不会执行,所有需要将其从调度池中移除,之后便不会对其进行调度执行
+              pool.stageIds = pool.stageIds - stage.info.stageId
+              update(pool, now) // 更新调度池信息
+            }
+            it.remove() // 移除stage
+            update(stage, now, last = true) // 更新stage信息
+          }
+        }
+      }
+        // 根据job执行结果,对成功任务和失败任务进行计量
+      job.status = event.jobResult match {
+        case JobSucceeded =>
+          appStatusSource.foreach{_.SUCCEEDED_JOBS.inc()}
+          JobExecutionStatus.SUCCEEDED
+        case JobFailed(_) =>
+          appStatusSource.foreach{_.FAILED_JOBS.inc()}
+          JobExecutionStatus.FAILED
+      }
+        // job完成时间度量
+      job.completionTime = if (event.time > 0) Some(new Date(event.time)) else None
+        // 计算job持续时间
+      for {
+        source <- appStatusSource
+        submissionTime <- job.submissionTime
+        completionTime <- job.completionTime
+      } {
+        source.JOB_DURATION.value.set(completionTime.getTime() - submissionTime.getTime())
+      }
+        // 更新stage task度量值
+      appStatusSource.foreach { source =>
+        source.COMPLETED_STAGES.inc(job.completedStages.size)
+        source.FAILED_STAGES.inc(job.failedStages)
+        source.COMPLETED_TASKS.inc(job.completedTasks)
+        source.FAILED_TASKS.inc(job.failedTasks)
+        source.KILLED_TASKS.inc(job.killedTasks)
+        source.SKIPPED_TASKS.inc(job.skippedTasks)
+        source.SKIPPED_STAGES.inc(job.skippedStages.size)
+      }
+        // 更新job状态
+      update(job, now, last = true)
+        // 成功执行则将应用描述入库@kvStore
+      if (job.status == JobExecutionStatus.SUCCEEDED) {
+        appSummary = new AppSummary(appSummary.numCompletedJobs + 1, appSummary.numCompletedStages)
+        kvstore.write(appSummary)
+      }
+    }
+
+	def onStageSubmitted(event: SparkListenerStageSubmitted): Unit
+	功能: stage提交事件处理
+	1. 创建stage	
+	val now = System.nanoTime()
+    val stage = getOrCreateStage(event.stageInfo)
+	2. 设置stage参数值
+	stage.status = v1.StageStatus.ACTIVE
+    stage.schedulingPool = Option(event.properties).flatMap { p =>
+      Option(p.getProperty(SparkContext.SPARK_SCHEDULER_POOL))
+    }.getOrElse(SparkUI.DEFAULT_POOL_NAME)
+    stage.jobs = liveJobs.values
+      .filter(_.stageIds.contains(event.stageInfo.stageId))
+      .toSeq
+    stage.jobIds = stage.jobs.map(_.jobId).toSet
+    stage.description = Option(event.properties).flatMap { p =>
+      Option(p.getProperty(SparkContext.SPARK_JOB_DESCRIPTION))
+    }
+    stage.jobs.foreach { job =>
+      job.completedStages = job.completedStages - event.stageInfo.stageId
+      job.activeStages += 1
+      liveUpdate(job, now)
+    }
+	2. 更新调度池信息
+	val pool = pools.getOrElseUpdate(stage.schedulingPool, new SchedulerPool(stage.schedulingPool))
+    pool.stageIds = pool.stageIds + event.stageInfo.stageId
+    update(pool, now)
+	3. 更新RDD信息
+	event.stageInfo.rddInfos.foreach { info =>
+      if (info.storageLevel.isValid) {
+        liveUpdate(liveRDDs.getOrElseUpdate(info.id, new LiveRDD(info, info.storageLevel)), now)
+      }
+    }
+	4. 更新stage信息
+	liveUpdate(stage, now)
+
+	def onTaskStart(event: SparkListenerTaskStart): Unit
+	功能: 任务开始事件处理
+	1. 创建存活任务，并注册到存活任务列表中，并更新任务信息
+	val now = System.nanoTime()
+    val task = new LiveTask(event.taskInfo, event.stageId, event.stageAttemptId, lastUpdateTime)
+    liveTasks.put(event.taskInfo.taskId, task)
+    liveUpdate(task, now)
+	2. 获取事件指定stage编号，并进行处理
+	Option(liveStages.get((event.stageId, event.stageAttemptId))).foreach { stage =>
+      // 设置stage度量信息,并更新
+      stage.activeTasks += 1
+      stage.firstLaunchTime = math.min(stage.firstLaunchTime, event.taskInfo.launchTime)
+      val locality = event.taskInfo.taskLocality.toString()
+      val count = stage.localitySummary.getOrElse(locality, 0L) + 1L
+      stage.localitySummary = stage.localitySummary ++ Map(locality -> count)
+      stage.activeTasksPerExecutor(event.taskInfo.executorId) += 1
+      maybeUpdate(stage, now)
+      // 更新job度量信息,并更新
+      stage.jobs.foreach { job =>
+        job.activeTasks += 1
+        maybeUpdate(job, now)
+      }
+	  // 检测是否需要清空stage 如果保存的任务足够多则对其进行清理
+      if (stage.savedTasks.incrementAndGet() > maxTasksPerStage && !stage.cleaning) {
+        stage.cleaning = true
+        kvstore.doAsync {
+          cleanupTasks(stage)
+        }
+      }
+    }
+	3. 设置事件指定执行器度量值,并更新
+	liveExecutors.get(event.taskInfo.executorId).foreach { exec =>
+      exec.activeTasks += 1
+      exec.totalTasks += 1
+      maybeUpdate(exec, now)
+    }
+	
+	def onTaskGettingResult(event: SparkListenerTaskGettingResult): Unit
+	功能: 获取任务结果事件
+	liveTasks.get(event.taskInfo.taskId).foreach { task =>
+      maybeUpdate(task, System.nanoTime())
+    }
+	
+	def onTaskEnd(event: SparkListenerTaskEnd): Unit
+	功能: 任务结束事件处理
+	1. 获取任务度量的更新增量
+	val metricsDelta = liveTasks.remove(event.taskInfo.taskId).map { task =>
+      task.info = event.taskInfo
+      val errorMessage = event.reason match {
+        case Success =>
+          None
+        case k: TaskKilled =>
+          Some(k.reason)
+        case e: ExceptionFailure => 
+          Some(e.toErrorString)
+        case e: TaskFailedReason =>
+          Some(e.toErrorString)
+        case other =>
+          logInfo(s"Unhandled task end reason: $other")
+          None
+      }
+      task.errorMessage = errorMessage
+      val delta = task.updateMetrics(event.taskMetrics)
+      update(task, now, last = true)
+      delta
+    }.orNull
+	2. 获取增量因子三元组
+	val (completedDelta, failedDelta, killedDelta) = event.reason match {
+      case Success =>
+        (1, 0, 0)
+      case _: TaskKilled =>
+        (0, 0, 1)
+      case _: TaskCommitDenied =>
+        (0, 0, 1)
+      case _ =>
+        (0, 1, 0)
+    }
+	3. 更新stage度量值
+	Option(liveStages.get((event.stageId, event.stageAttemptId))).foreach { stage =>
+      if (metricsDelta != null) {
+        stage.metrics = LiveEntityHelpers.addMetrics(stage.metrics, metricsDelta)
+      }
+      stage.activeTasks -= 1
+      stage.completedTasks += completedDelta
+      if (completedDelta > 0) {
+        stage.completedIndices.add(event.taskInfo.index)
+      }
+      stage.failedTasks += failedDelta
+      stage.killedTasks += killedDelta
+      if (killedDelta > 0) {
+        stage.killedSummary = killedTasksSummary(event.reason, stage.killedSummary)
+      }
+      stage.activeTasksPerExecutor(event.taskInfo.executorId) -= 1
+      val removeStage =
+        stage.activeTasks == 0 &&
+          (v1.StageStatus.COMPLETE.equals(stage.status) ||
+            v1.StageStatus.FAILED.equals(stage.status))
+      if (removeStage) {
+        update(stage, now, last = true)
+      } else {
+        maybeUpdate(stage, now)
+      }
+      val taskIndex = (event.stageId.toLong << Integer.SIZE) | event.taskInfo.index
+      stage.jobs.foreach { job =>
+        job.activeTasks -= 1
+        job.completedTasks += completedDelta
+        if (completedDelta > 0) {
+          job.completedIndices.add(taskIndex)
+        }
+        job.failedTasks += failedDelta
+        job.killedTasks += killedDelta
+        if (killedDelta > 0) {
+          job.killedSummary = killedTasksSummary(event.reason, job.killedSummary)
+        }
+        if (removeStage) {
+          update(job, now)
+        } else {
+          maybeUpdate(job, now)
+        }
+      }
+      val esummary = stage.executorSummary(event.taskInfo.executorId)
+      esummary.taskTime += event.taskInfo.duration
+      esummary.succeededTasks += completedDelta
+      esummary.failedTasks += failedDelta
+      esummary.killedTasks += killedDelta
+      if (metricsDelta != null) {
+        esummary.metrics = LiveEntityHelpers.addMetrics(esummary.metrics, metricsDelta)
+      }
+      val isLastTask = stage.activeTasksPerExecutor(event.taskInfo.executorId) == 0
+      if (isLastTask) {
+        update(esummary, now)
+      } else {
+        maybeUpdate(esummary, now)
+      }
+      if (!stage.cleaning && stage.savedTasks.get() > maxTasksPerStage) {
+        stage.cleaning = true
+        kvstore.doAsync {
+          cleanupTasks(stage)
+        }
+      }
+      if (removeStage) {
+        liveStages.remove((event.stageId, event.stageAttemptId))
+      }
+    }
+	4. 更新执行器度量值
+	liveExecutors.get(event.taskInfo.executorId).foreach { exec =>
+      exec.activeTasks -= 1
+      exec.completedTasks += completedDelta
+      exec.failedTasks += failedDelta
+      exec.totalDuration += event.taskInfo.duration
+      if (event.reason != Resubmitted) {
+        if (event.taskMetrics != null) {
+          val readMetrics = event.taskMetrics.shuffleReadMetrics
+          exec.totalGcTime += event.taskMetrics.jvmGCTime
+          exec.totalInputBytes += event.taskMetrics.inputMetrics.bytesRead
+          exec.totalShuffleRead += readMetrics.localBytesRead + readMetrics.remoteBytesRead
+          exec.totalShuffleWrite += event.taskMetrics.shuffleWriteMetrics.bytesWritten
+        }
+      }
+      if (exec.activeTasks == 0) {
+        update(exec, now)
+      } else {
+        maybeUpdate(exec, now)
+      }
+    }
+
+	def removeBlackListedStageFrom(exec: LiveExecutor, stageId: Int, now: Long): Unit
+	功能: 从指定执行器中移除编号为@stageId的黑名单信息
+	exec.blacklistedInStages -= stageId
+    liveUpdate(exec, now)
+
+	def onStageCompleted(event: SparkListenerStageCompleted): Unit
+	功能: stage完成处理
+	1. 获取事件指定的stage
+	val maybeStage =Option(liveStages.get((event.stageInfo.stageId, event.stageInfo.attemptNumber)))
+	2. stage属性设置为事件指定
+	maybeStage.foreach { stage =>
+      val now = System.nanoTime()
+      stage.info = event.stageInfo
+      stage.executorSummaries.values.foreach(update(_, now))
+      stage.status = event.stageInfo.failureReason match {
+        case Some(_) => v1.StageStatus.FAILED
+        case _ if event.stageInfo.submissionTime.isDefined => v1.StageStatus.COMPLETE
+        case _ => v1.StageStatus.SKIPPED
+      }
+        // 有stage信息设置job信息
+      stage.jobs.foreach { job =>
+        stage.status match {
+          case v1.StageStatus.COMPLETE =>
+            job.completedStages += event.stageInfo.stageId
+          case v1.StageStatus.SKIPPED =>
+            job.skippedStages += event.stageInfo.stageId
+            job.skippedTasks += event.stageInfo.numTasks
+          case _ =>
+            job.failedStages += 1
+        }
+        job.activeStages -= 1
+        liveUpdate(job, now)
+      }
+		// 设置调度池信息
+      pools.get(stage.schedulingPool).foreach { pool =>
+        pool.stageIds = pool.stageIds - event.stageInfo.stageId
+        update(pool, now)
+      }
+		// 获取并移除黑名单执行器stage
+      val executorIdsForStage = stage.blackListedExecutors
+      executorIdsForStage.foreach { executorId =>
+        liveExecutors.get(executorId).foreach { exec =>
+          removeBlackListedStageFrom(exec, event.stageInfo.stageId, now)
+        }
+      }
+	// 仅在没有激活任务的情况下移除stage
+      val removeStage = stage.activeTasks == 0
+      update(stage, now, last = removeStage)
+      if (removeStage) {// 移除stage
+        liveStages.remove((event.stageInfo.stageId, event.stageInfo.attemptNumber))
+      }
+      if (stage.status == v1.StageStatus.COMPLETE) { // 将完成的stage写出到KV存储器中
+        appSummary = new AppSummary(appSummary.numCompletedJobs, appSummary.numCompletedStages + 1)
+        kvstore.write(appSummary)
+      }
+    }
+
+	def onBlockManagerAdded(event: SparkListenerBlockManagerAdded): Unit
+	功能: 处理添加块管理器事件
+	1. 获取事件指定的执行器
+	val exec = getOrCreateExecutor(event.blockManagerId.executorId, event.time)
+	2. 设置执行器参数
+	exec.hostPort = event.blockManagerId.hostPort
+    event.maxOnHeapMem.foreach { _ =>
+      exec.totalOnHeap = event.maxOnHeapMem.get
+      exec.totalOffHeap = event.maxOffHeapMem.get
+    }
+    exec.isActive = true
+    exec.maxMemory = event.maxMem
+	3. 更新执行器
+	liveUpdate(exec, System.nanoTime()
+               
+    def onBlockManagerRemoved(event: SparkListenerBlockManagerRemoved): Unit
+    功能: 移除块管理器事件
+            
+    def onUnpersistRDD(event: SparkListenerUnpersistRDD): Unit
+    功能: 解除RDD的持久化
+    1. 从存活RDD列表中移除事件指定RDD
+    liveRDDs.remove(event.rddId).foreach { liveRDD =>
+      val storageLevel = liveRDD.info.storageLevel
+        // 使用RDD分区更新执行器块信息
+      liveRDD.getPartitions().foreach { case (_, part) =>
+        part.executors.foreach { executorId => // 更新执行器块信息
+          liveExecutors.get(executorId).foreach { exec =>
+            exec.rddBlocks = exec.rddBlocks - 1
+          }
+        }
+      }
+      val now = System.nanoTime()
+        // 使用RDD分布来更新内存使用和磁盘使用信息
+      liveRDD.getDistributions().foreach { case (executorId, rddDist) =>
+        liveExecutors.get(executorId).foreach { exec =>
+          if (exec.hasMemoryInfo) {
+            if (storageLevel.useOffHeap) {
+              exec.usedOffHeap = addDeltaToValue(exec.usedOffHeap, -rddDist.offHeapUsed)
+            } else {
+              exec.usedOnHeap = addDeltaToValue(exec.usedOnHeap, -rddDist.onHeapUsed)
+            }
+          }
+            // 增量式更新内存/磁盘使用量
+          exec.memoryUsed = addDeltaToValue(exec.memoryUsed, -rddDist.memoryUsed)
+          exec.diskUsed = addDeltaToValue(exec.diskUsed, -rddDist.diskUsed)
+          maybeUpdate(exec, now)
+        }
+      }
+    }      
+    2. 删除事件指定的RDD存储信息
+    kvstore.delete(classOf[RDDStorageInfoWrapper], event.rddId)         	
+    
+    def onExecutorMetricsUpdate(event: SparkListenerExecutorMetricsUpdate): Unit
+    功能: 处理执行器度量器更新事件
+    1. 更新累加器参数@accumUpdates 设置           
+    val now = System.nanoTime()
+    event.accumUpdates.foreach { case (taskId, sid, sAttempt, accumUpdates) =>
+      liveTasks.get(taskId).foreach { task =>
+        val metrics = TaskMetrics.fromAccumulatorInfos(accumUpdates)
+        val delta = task.updateMetrics(metrics)
+        maybeUpdate(task, now)
+
+        Option(liveStages.get((sid, sAttempt))).foreach { stage =>
+          stage.metrics = LiveEntityHelpers.addMetrics(stage.metrics, delta)
+          maybeUpdate(stage, now)
+
+          val esummary = stage.executorSummary(event.execId)
+          esummary.metrics = LiveEntityHelpers.addMetrics(esummary.metrics, delta)
+          maybeUpdate(esummary, now)
+        }
+      }
+    }
+    2. 更新执行器度量器列表@executorUpdates
+       检查当前存活UI是否有执行器等级的内存度量器的峰值
+    event.executorUpdates.foreach { case (_, peakUpdates) =>
+      liveExecutors.get(event.execId).foreach { exec =>
+        if (exec.peakExecutorMetrics.compareAndUpdatePeakValues(peakUpdates)) {
+          maybeUpdate(exec, now)
+        }
+      }
+    }
+   3. 刷新更新,执行器心跳是一个周期性发生的动作,刷新它们,目的是保证sparkUI的持续时间不会超过
+      @max(heartbeat interval, liveUpdateMinFlushPeriod)
+   if (now - lastFlushTimeNs > liveUpdateMinFlushPeriod) {
+      flush(maybeUpdate(_, now))
+      lastFlushTimeNs = System.nanoTime()}
+   
+   def onStageExecutorMetrics(executorMetrics: SparkListenerStageExecutorMetrics): Unit
+   功能: stage执行器度量器监听事件处理
+   liveExecutors.get(executorMetrics.execId).orElse(
+      deadExecutors.get(executorMetrics.execId)).foreach { exec =>
+        if (exec.peakExecutorMetrics.compareAndUpdatePeakValues(executorMetrics.executorMetrics)) {
+          update(exec, now)
+        }
+    }
+               
+   def onBlockUpdated(event: SparkListenerBlockUpdated): Unit
+   功能: 监听块更新时间
+   event.blockUpdatedInfo.blockId match {
+      case block: RDDBlockId => updateRDDBlock(event, block) // 使用RDD更新块策略
+      case stream: StreamBlockId => updateStreamBlock(event, stream) // 使用流式块更新策略
+      case broadcast: BroadcastBlockId => updateBroadcastBlock(event, broadcast) // 使用广播变量块策略
+      case _ =>
+    }
+               
+   def flush(entityFlushFunc: LiveEntity => Unit): Unit
+   功能: 遍历所有存活实体，并使用@entityFlushFunc(entity) 去刷新它们
+   输入参数: entityFlushFunc	实体刷新函数
+    liveStages.values.asScala.foreach { stage =>
+      entityFlushFunc(stage)
+      stage.executorSummaries.values.foreach(entityFlushFunc)
+    }
+    liveJobs.values.foreach(entityFlushFunc)
+    liveExecutors.values.foreach(entityFlushFunc)
+    liveTasks.values.foreach(entityFlushFunc)
+    liveRDDs.values.foreach(entityFlushFunc)
+    pools.values.foreach(entityFlushFunc)
+    
+    def activeStages(): Seq[v1.StageData]
+    功能: 在一个运行应用中获取激活状态的stage的捷径方法,用于控制台的进度条
+    val = liveStages.values.asScala
+      .filter(_.info.submissionTime.isDefined)
+      .map(_.toApi())
+      .toList
+      .sortBy(_.stageId)
+               
+   def addDeltaToValue(old: Long, delta: Long): Long = math.max(0, old + delta)
+   功能: 增量式增加delta，但是结果值不能为负数
+               
+   def updateRDDBlock(event: SparkListenerBlockUpdated, block: RDDBlockId): Unit
+   功能: 接受RDD更新事件，更新RDD块信息
+   1. 获取执行器度量信息
+   val now = System.nanoTime()
+   val executorId = event.blockUpdatedInfo.blockManagerId.executorId
+   val storageLevel = event.blockUpdatedInfo.storageLevel
+   val diskDelta = event.blockUpdatedInfo.diskSize * (if (storageLevel.useDisk) 1 else -1)
+   val memoryDelta = event.blockUpdatedInfo.memSize * (if (storageLevel.useMemory) 1 else -1)
+   2. 更新执行器内存和磁盘度量值
+   val maybeExec = liveExecutors.get(executorId)
+   var rddBlocksDelta = 0
+   maybeExec.foreach { exec =>
+      updateExecutorMemoryDiskInfo(exec, storageLevel, memoryDelta, diskDelta) }
+   3. 更新RDD信息中的块信息，保证对增量值的追踪，方便对执行器信息的更新
+   liveRDDs.get(block.rddId).foreach { rdd =>
+      // 获取分区和执行器信息
+      val partition = rdd.partition(block.name)
+      val executors = if (storageLevel.isValid) {
+        val current = partition.executors
+        if (current.contains(executorId)) {
+          current
+        } else {
+          rddBlocksDelta = 1
+          current :+ executorId
+        }
+      } else {
+        rddBlocksDelta = -1
+        partition.executors.filter(_ != executorId)
+      }
+      if (executors.nonEmpty) {
+        // 分区更新
+        partition.update(executors,
+          addDeltaToValue(partition.memoryUsed, memoryDelta),
+          addDeltaToValue(partition.diskUsed, diskDelta))
+      } else {
+        // 没有执行器包含该分区,应当避免更新操作
+        rdd.removePartition(block.name)
+      }
+      // 执行器采用增量更新,更新执行器信息
+      maybeExec.foreach { exec =>
+        if (exec.rddBlocks + rddBlocksDelta > 0) {
+          val dist = rdd.distribution(exec)
+          dist.memoryUsed = addDeltaToValue(dist.memoryUsed, memoryDelta)
+          dist.diskUsed = addDeltaToValue(dist.diskUsed, diskDelta)
+          if (exec.hasMemoryInfo) {
+            if (storageLevel.useOffHeap) {
+              dist.offHeapUsed = addDeltaToValue(dist.offHeapUsed, memoryDelta)
+            } else {
+              dist.onHeapUsed = addDeltaToValue(dist.onHeapUsed, memoryDelta)
+            }
+          }
+          dist.lastUpdate = null
+        } else {
+          rdd.removeDistribution(exec)
+        }
+        liveRDDs.values.foreach { otherRdd =>
+          if (otherRdd.info.id != block.rddId) {
+            otherRdd.distributionOpt(exec).foreach { dist =>
+              dist.lastUpdate = null
+              update(otherRdd, now)
+            }
+          }
+        }
+      }
+      // 计算rdd 内存和磁盘使用量
+      rdd.memoryUsed = addDeltaToValue(rdd.memoryUsed, memoryDelta)
+      rdd.diskUsed = addDeltaToValue(rdd.diskUsed, diskDelta)
+      // 更新rdd信息
+      update(rdd, now)
+    }
+    4. 更新执行器中的rdd数量计量信息,并更新
+    maybeExec.foreach { exec =>
+      exec.rddBlocks += rddBlocksDelta
+      maybeUpdate(exec, now)
+    }
+               
+    def getOrCreateExecutor(executorId: String, addTime: Long): LiveExecutor
+    功能: 创建执行器
+    val= liveExecutors.getOrElseUpdate(executorId, {
+      activeExecutorCount += 1
+      new LiveExecutor(executorId, addTime)
+    })
+               
+    def updateStreamBlock(event: SparkListenerBlockUpdated, stream: StreamBlockId): Unit
+    功能: 根据事件@event 更新流式数据块@StreamBlockId
+    1. 获取存储等级
+    val storageLevel = event.blockUpdatedInfo.storageLevel
+    2. 获取流式数据块并进行处理
+    if (storageLevel.isValid) { // 存储等级可以使用,获取数据并写入到KV存储器中
+      val data = new StreamBlockData(
+        stream.name,
+        event.blockUpdatedInfo.blockManagerId.executorId,
+        event.blockUpdatedInfo.blockManagerId.hostPort,
+        storageLevel.description,
+        storageLevel.useMemory,
+        storageLevel.useDisk,
+        storageLevel.deserialized,
+        event.blockUpdatedInfo.memSize,
+        event.blockUpdatedInfo.diskSize)
+      kvstore.write(data)
+    } else {// 当前存储等级不可以使用,删除KV库中指定类名的条目
+      kvstore.delete(classOf[StreamBlockData],
+        Array(stream.name, event.blockUpdatedInfo.blockManagerId.executorId))
+    }
+               
+    def updateBroadcastBlock(event: SparkListenerBlockUpdated,broadcast: BroadcastBlockId): Unit
+    功能: 更新指定的广播变量数据块@broadcast
+    1. 获取执行器信息
+     val executorId = event.blockUpdatedInfo.blockManagerId.executorId
+    2. 获取指定执行器，更新内存磁盘使用量
+    liveExecutors.get(executorId).foreach { exec =>
+      val now = System.nanoTime()
+      val storageLevel = event.blockUpdatedInfo.storageLevel
+      val diskDelta = event.blockUpdatedInfo.diskSize * (if (storageLevel.useDisk) 1 else -1)
+      val memoryDelta = event.blockUpdatedInfo.memSize * (if (storageLevel.useMemory) 1 else -1)
+      updateExecutorMemoryDiskInfo(exec, storageLevel, memoryDelta, diskDelta)
+      maybeUpdate(exec, now)
+    }
+               
+    def updateExecutorMemoryDiskInfo(exec: LiveExecutor,storageLevel: StorageLevel,
+      memoryDelta: Long,diskDelta: Long): Unit
+    功能: 增量式更新执行器的内存磁盘使用量信息
+    if (exec.hasMemoryInfo) {
+      if (storageLevel.useOffHeap) {
+        exec.usedOffHeap = addDeltaToValue(exec.usedOffHeap, memoryDelta)
+      } else {
+        exec.usedOnHeap = addDeltaToValue(exec.usedOnHeap, memoryDelta)
+      }
+    }
+    exec.memoryUsed = addDeltaToValue(exec.memoryUsed, memoryDelta)
+    exec.diskUsed = addDeltaToValue(exec.diskUsed, diskDelta)
+
+    def getOrCreateStage(info: StageInfo): LiveStage
+    功能: 获取/创建一个stage实例
+    val stage = liveStages.computeIfAbsent((info.stageId, info.attemptNumber),
+      (_: (Int, Int)) => new LiveStage())
+    stage.info = info
+    val = stage
+    
+    def killedTasksSummary(reason: TaskEndReason,oldSummary: Map[String, Int]): Map[String, Int]
+    功能: 获取kill掉的任务描述
+    val= reason match {
+      case k: TaskKilled =>
+        oldSummary.updated(k.reason, oldSummary.getOrElse(k.reason, 0) + 1)
+      case denied: TaskCommitDenied =>
+        val reason = denied.toErrorString
+        oldSummary.updated(reason, oldSummary.getOrElse(reason, 0) + 1)
+      case _ =>
+        oldSummary
+    }
+    
+    def update(entity: LiveEntity, now: Long, last: Boolean = false): Unit
+    功能: 更新实例到kv存储器中
+    输入参数: 
+        entity	实例
+        now	现在时刻
+        last 是否为最后一次更新
+    entity.write(kvstore, now, checkTriggers = last)
+               
+    def maybeUpdate(entity: LiveEntity, now: Long): Unit
+    功能: 选择性更新实例
+    if (live && liveUpdatePeriodNs >= 0 && now - entity.lastWriteTime > liveUpdatePeriodNs)
+        update(entity, now)
+               
+    def liveUpdate(entity: LiveEntity, now: Long): Unit
+    功能: 存活更新,存活的实例才能更新
+    if (live) {
+      update(entity, now)
+    }
+               
+    def cleanupExecutors(count: Long): Unit
+    功能: 清除执行器
+    1. 计算死亡的执行器数量
+    val threshold = conf.get(MAX_RETAINED_DEAD_EXECUTORS)
+    val dead = count - activeExecutorCount
+    2. 超出容量则计算需要清理的执行器数量,并执行清除(从KV存储器中)
+    if (dead > threshold) {
+      val countToDelete = calculateNumberToRemove(dead, threshold)
+      val toDelete = kvstore.view(classOf[ExecutorSummaryWrapper]).index("active")
+        .max(countToDelete).first(false).last(false).asScala.toSeq
+      toDelete.foreach { e => kvstore.delete(e.getClass(), e.info.id) }
+    }
+        
+    def cleanupJobs(count: Long): Unit
+    功能: 清除job
+    val countToDelete = calculateNumberToRemove(count, conf.get(MAX_RETAINED_JOBS))
+    if (countToDelete <= 0L) {
+      return
+    }
+    val view = kvstore.view(classOf[JobDataWrapper]).index("completionTime").first(0L)
+    val toDelete = KVUtils.viewToSeq(view, countToDelete.toInt) { j =>
+      j.info.status != JobExecutionStatus.RUNNING && j.info.status != JobExecutionStatus.UNKNOWN
+    }
+    toDelete.foreach { j => kvstore.delete(j.getClass(), j.info.jobId) }
+     
+    def cleanupCachedQuantiles(stageKey: Array[Int]): Unit
+    功能: 清除缓存分割点
+    val cachedQuantiles = kvstore.view(classOf[CachedQuantile])
+      .index("stage")
+      .first(stageKey)
+      .last(stageKey)
+      .asScala
+      .toList
+    cachedQuantiles.foreach { q =>
+      kvstore.delete(q.getClass(), q.id)
+    }
+               
+    def cleanupTasks(stage: LiveStage): Unit
+    功能: 清除任务
+    1. 计算需要清除的任务数量
+    val countToDelete = calculateNumberToRemove(stage.savedTasks.get(), maxTasksPerStage).toInt
+    2. 清除任务
+    if (countToDelete > 0) {
+      val stageKey = Array(stage.info.stageId, stage.info.attemptNumber)
+      val view = kvstore.view(classOf[TaskDataWrapper])// 获取stagekey的任务数据视图
+        .index(TaskIndexNames.COMPLETION_TIME)
+        .parent(stageKey)
+      val toDelete = KVUtils.viewToSeq(view, countToDelete) { t => 
+        !live || t.status != TaskState.RUNNING.toString()
+      }
+      toDelete.foreach { t => kvstore.delete(t.getClass(), t.taskId) }// 删除指定数量的条目
+      stage.savedTasks.addAndGet(-toDelete.size)
+      val remaining = countToDelete - toDelete.size
+      if (remaining > 0) { // 这种情况极度稀少一般情况下 remain <<=0 
+        val runningTasksToDelete = view.max(remaining).iterator().asScala.toList
+        runningTasksToDelete.foreach { t => kvstore.delete(t.getClass(), t.taskId) }
+        stage.savedTasks.addAndGet(-remaining)
+      }
+      if (live) { // 激活任务中需要清理分割点
+        cleanupCachedQuantiles(stageKey)
+      }
+    }
+               
+     def calculateNumberToRemove(dataSize: Long, retainedSize: Long): Long
+     功能: 计算需要移除数量
+     输入数据:
+     	dataSize	数据规模大小
+        retainedSize	剩余规模大小
+     val= if (dataSize > retainedSize) {
+      math.max(retainedSize / 10L, dataSize - retainedSize)
+    } else {
+      0L
+    }
+}
+```
+
 #### AppStatusSource
 
-```markdown
+```scala
 private [spark] class JobDuration(val value: AtomicLong) extends Gauge[Long] {
 	介绍: job持续时间
 	操作集:
@@ -1479,7 +2485,7 @@ private[spark] class AppStatusSource extends Source {
 }
 ```
 
-```markdown
+```scala
 private[spark] object AppStatusSource {
 	操作集:
 	def getCounter(prefix: String, name: String)(implicit metricRegistry: MetricRegistry): Counter
