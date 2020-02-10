@@ -59,55 +59,1451 @@
 
     #### BitSet
 
-    #### CompactBuffer
-
-    #### ExternalAppendOnlyMap
-
-    #### ExternalSorter
-
-    #### MedianHeap
-
-    #### OpenHashMap
-
-    #### OpenHashSet
-
-    #### PairsWriter
-
     ```scala
-/*
-    	对于kv对消费者的抽象,持久化分区的数据时首先被使用.尽管也是可以通过shuffle写插件或者盘块写出器
-	@DiskBlockObjectWriter 来持久化.
-    */
-private[spark] trait PairsWriter {
-    	操作集:
-  	def write(key: Any, value: Any): Unit
-        功能: 写出指定kv值
-}
+class BitSet(numBits: Int) extends Serializable {
+        介绍: 简单,定长位集合实现,这个实现很快因为不要安全/越界检查
+    	主要用于存放bit位(0/1)
+       	构造器参数:
+    numBits	字节数
+        属性:
+    #name @words = new Array[Long](bit2words(numBits))	字数列表(每个位)
+        #name @numWords = words.length	字长
+    操作集:
+        def capacity: Int = numWords * 64
+	    功能: 计算位集合的容量
+        
+    def clear(): Unit = Arrays.fill(words, 0)
+        功能: 清理位集合
+    
+        def setUntil(bitIndex: Int): Unit
+	    功能: 超过指定@bitIndex 位置的置位(在0-index位置填充-1)
+        val wordIndex = bitIndex >> 6 
+        Arrays.fill(words, 0, wordIndex, -1)
+        if(wordIndex < words.length) {
+          val mask = ~(-1L << (bitIndex & 0x3f))
+          words(wordIndex) |= mask
+        }
+        
+        def clearUntil(bitIndex: Int): Unit
+        功能: 清除超过指定@bitIndex 的所有位
+        val wordIndex = bitIndex >> 6 
+        Arrays.fill(words, 0, wordIndex, 0)
+        if(wordIndex < words.length) {
+          val mask = -1L << (bitIndex & 0x3f)
+          words(wordIndex) &= mask
+        }
+        
+        def &(other: BitSet): BitSet
+        功能: 与指定位集合@other 的按位与
+        1. 创建一个新的位集合用于记录结果
+        val newBS = new BitSet(math.max(capacity, other.capacity))
+        val smaller = math.min(numWords, other.numWords)
+        2. 新的位集合参数断言
+        assert(newBS.numWords >= numWords)
+        assert(newBS.numWords >= other.numWords)
+        3. 两个集合按位与
+        var ind = 0
+        while( ind < smaller ) {
+          newBS.words(ind) = words(ind) & other.words(ind)
+          ind += 1
+        }
+        val= newBS
+        
+        def |(other: BitSet): BitSet
+        功能: 计算两个集合的按位或
+        1. 创建一个新的位集合用于记录结果,并断言
+        val newBS = new BitSet(math.max(capacity, other.capacity))
+        assert(newBS.numWords >= numWords)
+        assert(newBS.numWords >= other.numWords)
+        val smaller = math.min(numWords, other.numWords)
+        2. 共同部分按位或
+        var ind = 0
+        while( ind < smaller ) {
+          newBS.words(ind) = words(ind) | other.words(ind)
+          ind += 1
+        }
+        3. 超出部分按位或
+        while( ind < numWords ) {
+          newBS.words(ind) = words(ind)
+          ind += 1
+        }
+        while( ind < other.numWords ) {
+          newBS.words(ind) = other.words(ind)
+          ind += 1
+        }
+        val= newBS
+        
+        def ^(other: BitSet): BitSet
+        功能: 按位异或
+        1. 创建一个新的位集合用于记录结果,并断言
+        val newBS = new BitSet(math.max(capacity, other.capacity))
+        val smaller = math.min(numWords, other.numWords) // 计算共同部分
+        2. 共同部分异或
+        var ind = 0
+        while (ind < smaller) {
+          newBS.words(ind) = words(ind) ^ other.words(ind)
+          ind += 1
+        }
+        3. 超出部分处理 --> 直接拷贝多余的部分
+        if (ind < numWords) {
+          Array.copy( words, ind, newBS.words, ind, numWords - ind )
+        }
+        if (ind < other.numWords) {
+          Array.copy( other.words, ind, newBS.words, ind, other.numWords - ind )
+        }
+        val= newBS
+        
+        def set(index: Int): Unit
+        功能: 设置指定位置@Index 的值为true
+        val bitmask = 1L << (index & 0x3f)
+        words(index >> 6) |= bitmask 
+        
+        def unset(index: Int): Unit 
+        功能: 解除指定位置@index的置位状态
+        val bitmask = 1L << (index & 0x3f)
+        words(index >> 6) &= ~bitmask 
+        
+        def iterator: Iterator[Int]
+        功能: 获取位集合的迭代器
+        val= new Iterator[Int] {
+            var ind = nextSetBit(0) // 下个位指针
+            override def hasNext: Boolean = ind >= 0
+            override def next(): Int = {
+              val tmp = ind
+              ind = nextSetBit(ind + 1)
+              tmp
+            }
+          }
+        
+        def cardinality(): Int
+        功能: 获取位集合中处于置位状态的元素个数
+        var sum = 0
+        var i = 0
+        while (i < numWords) {
+          sum += java.lang.Long.bitCount(words(i))
+          i += 1
+        }
+        val= sum
+        
+        def get(index: Int): Boolean
+        功能: 获取指定位置@index 的值
+        val bitmask = 1L << (index & 0x3f)
+        (words(index >> 6) & bitmask) != 0
+        
+        def bit2words(numBits: Int) = ((numBits - 1) >> 6) + 1
+        功能: 获取指定位数@numBits可容纳字数
+        
+        def nextSetBit(fromIndex: Int): Int
+        功能: 返回在@fromIndex之后第一个置位的位置,没有则返回-1
+        1. 获取子位置
+        var wordIndex = fromIndex >> 6
+        if (wordIndex >= numWords) {
+          return -1
+        }
+        2. 获取当前字中下一个置位位置
+        val subIndex = fromIndex & 0x3f
+        var word = words(wordIndex) >> subIndex
+        if (word != 0) {
+          return (wordIndex << 6) + subIndex + java.lang.Long.numberOfTrailingZeros(word)
+        }
+        3. 当前字没有找到,找后面的字中第一个置位元素
+        wordIndex += 1
+        while (wordIndex < numWords) {
+          word = words(wordIndex)
+          if (word != 0) {
+            return (wordIndex << 6) + java.lang.Long.numberOfTrailingZeros(word)
+          }
+          wordIndex += 1
+        }
+        4. 其余情况,都表示找不到
+        val= -1
+    }
     ```
-
+    
+    #### CompactBuffer
+    
+    ```markdown
+    介绍:
+    	紧凑缓冲区,类似于@ArrayBuffer,但是对于多个小的缓冲区,在内存上更加高效.
+    	ArrayBuffer总是分配内存去存储对象,默认情况下也有16条记录的空间,所有他需要大约80-100字节的开销.相反,紧凑缓冲区,保证了主对象超过两个元素,只有当超过这个数值时,才会分配数字内存空间存储元素.使得少量数据的groupBy这类操作更加高效.
+    ```
+    
+    ```scala
+    private[spark] class CompactBuffer[T: ClassTag] extends Seq[T] with Serializable {
+        属性:
+        #Name @element0: T = _
+        #name @element1: T = _
+        #name @curSize = 0	元素总数量
+        #name @otherElements: Array[T] = null	其他元素列表
+        操作集:
+        def apply(position: Int): T
+        功能: 获取指定位置@position的元素
+        if (position < 0 || position >= curSize) {
+          throw new IndexOutOfBoundsException
+        }
+        val= if (position == 0) {
+          element0
+        } else if (position == 1) {
+          element1
+        } else {
+          otherElements(position - 2)
+        }
+        
+        def update(position: Int, value: T): Unit
+        功能: 更新指定位置@postion元素值
+        if (position < 0 || position >= curSize) {
+          throw new IndexOutOfBoundsException
+        }
+        if (position == 0) {
+          element0 = value
+        } else if (position == 1) {
+          element1 = value
+        } else {
+          otherElements(position - 2) = value
+        }
+        
+        def += (value: T): CompactBuffer[T]
+        功能: 将指定元素@value 添加到紧凑缓冲区中
+        val newIndex = curSize // 获取写入指针
+        if (newIndex == 0) {
+          element0 = value
+          curSize = 1
+        } else if (newIndex == 1) {
+          element1 = value
+          curSize = 2
+        } else {
+          growToSize(curSize + 1)
+          otherElements(newIndex - 2) = value
+        }
+        val= this
+        
+        def length: Int = curSize
+        功能: 获取缓冲区大小
+        
+        def iterator: Iterator[T]
+        功能: 获取迭代器
+        val= new Iterator[T] {
+            private var pos = 0
+            override def hasNext: Boolean = pos < curSize
+            override def next(): T = {
+              if (!hasNext) {
+                throw new NoSuchElementException
+              }
+              pos += 1
+              apply(pos - 1)
+            }
+          }
+        
+        def growToSize(newSize: Int): Unit
+        功能: 扩容紧凑缓冲区,有必要的化扩充底层数组长度
+        val newArraySize = newSize - 2
+        val arrayMax = ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH
+        if (newSize < 0 || newArraySize > arrayMax) {
+          throw new UnsupportedOperationException(s"Can't grow buffer past $arrayMax elements")
+        }
+        val capacity = if (otherElements != null) otherElements.length else 0
+        if (newArraySize > capacity) {
+          var newArrayLen = 8L
+          while (newArraySize > newArrayLen) {
+            newArrayLen *= 2
+          }
+          if (newArrayLen > arrayMax) {
+            newArrayLen = arrayMax
+          }
+          val newArray = new Array[T](newArrayLen.toInt)
+          if (otherElements != null) {
+            System.arraycopy(otherElements, 0, newArray, 0, otherElements.length)
+          }
+          otherElements = newArray
+        }
+        curSize = newSize
+        
+        def ++= (values: TraversableOnce[T]): CompactBuffer[T]
+        功能: 合并一列数据到当前紧凑缓冲区
+        values match {
+            // 合并紧凑缓冲区时可以在cogroup和groupByKey时对其进行优化合并操作
+          case compactBuf: CompactBuffer[T] =>
+            val oldSize = curSize
+            // 获取并入缓冲区的大小和数据元素
+            val itsSize = compactBuf.curSize
+            val itsElements = compactBuf.otherElements
+            growToSize(curSize + itsSize) // 缓冲区扩容
+            if (itsSize == 1) { // 仅仅并入了一个元素则直接在源Buffer之后追加一个
+              this(oldSize) = compactBuf.element0
+            } else if (itsSize == 2) {//仅仅并入了两个个元素则直接在源Buffer之后追加两个
+              this(oldSize) = compactBuf.element0
+              this(oldSize + 1) = compactBuf.element1
+            } else if (itsSize > 2) {// 超过两个则需要将从原来数组拷贝到本数组的指定位置
+              this(oldSize) = compactBuf.element0
+              this(oldSize + 1) = compactBuf.element1
+              System.arraycopy(itsElements, 0, otherElements, oldSize, itsSize - 2)
+            }
+    
+          case _ =>
+            values.foreach(e => this += e) // 不是紧凑缓冲区直接添加即可
+        }
+    }
+    ```
+    
+    ```scala
+    private[spark] object CompactBuffer {
+        操作集:
+        def apply[T: ClassTag](): CompactBuffer[T] = new CompactBuffer[T]
+        功能: 获取紧凑缓冲区实例
+        
+        def apply[T: ClassTag](value: T): CompactBuffer[T] 
+        功能: 获取添加有知道value的紧凑缓冲区
+        val buf = new CompactBuffer[T]
+        buf += value
+    }
+    ```
+    
+    
+    
+    #### ExternalAppendOnlyMap
+    
+    #### ExternalSorter
+    
+    #### MedianHeap
+    
+    ```markdown
+    介绍:
+    	中值堆设计用户快速定位一组数据的中位数(可能有重复元素).插入一个新值需要时间复杂度为O(log n),查找中位数的时间复杂度为O(1).
+    基本方法就是维护两个堆,一个小顶堆和一个大顶堆.当一个元素插入时,小顶堆和大顶堆需要重新调整,以至于它们的大小差距不会超过1.因此每次当执行@findMedian 调用时如果检测到两个堆大小相同.如果确实如此,获取两个堆的堆顶的平均数.否则返回较多元素的堆顶.
+    ```
+    
+    ```scala
+    private[spark] class MedianHeap(implicit val ord: Ordering[Double]) {
+        构造器属性:
+        ord	排序完毕的序列
+        属性:
+    #name @smallerHalf = PriorityQueue.empty[Double](ord)	小堆
+        #name @largerHalf = PriorityQueue.empty[Double](ord.reverse)	大堆
+    	操作集:
+        def isEmpty(): Boolean 
+    功能: 判断堆是否为空
+        
+    def size(): Int
+        功能: 获取堆大小
+    val= smallerHalf.size + largerHalf.size
+        
+    def insert(x: Double): Unit
+        功能: 插入元素x
+    1. 插入元素
+        if (isEmpty) { // 堆为空,将元素强制插入到大堆中
+      largerHalf.enqueue(x)
+        } else {
+      // 大于中间值,插入大堆,否则插入小堆
+          if (x > median) {
+            largerHalf.enqueue(x)
+          } else {
+            smallerHalf.enqueue(x)
+          }
+        }
+        2. 调整平衡
+        rebalance()
+        
+        def rebalance(): Unit
+        功能: 大小堆平衡策略(平衡因子决定值大于1)
+        if (largerHalf.size - smallerHalf.size > 1) { // 大堆数据多,大堆拿出堆顶元素放到小堆
+          smallerHalf.enqueue(largerHalf.dequeue())
+        }
+        if (smallerHalf.size - largerHalf.size > 1) {// 小堆数据多,拿出一个数据放到大堆
+          largerHalf.enqueue(smallerHalf.dequeue)
+        }
+        
+        def median: Double
+        功能: 获取平均值
+        if (isEmpty) {
+          throw new NoSuchElementException("MedianHeap is empty.")
+        }
+        val= if (largerHalf.size == smallerHalf.size) {
+          (largerHalf.head + smallerHalf.head) / 2.0
+        } else if (largerHalf.size > smallerHalf.size) {
+          largerHalf.head
+        } else {
+          smallerHalf.head
+        }
+    }
+    ```
+    
+    #### OpenHashMap
+    
+    ```markdown
+    介绍:
+    	含有key值的hashmap快速实现,这个hashmap支持插入和更新但是不支持移除元素.这个比普通的hashmap
+    	(java.util.HashMap) 要快上5倍. 但是占用的空间还有少.
+    	覆盖率@OpenHashSet 的实现
+    	注意: 如果需要使用数字类型的value值的时候,类的使用者需要小心的分辨0/0.0/0L和空值的区别
+    	主要实现手段: 压缩了空值的存储,使得存储空间变小,查找的范围变小,使得查询速度提升
+    ```
+    
+    ```scala
+    private[spark] class OpenHashMap[K : ClassTag, @specialized(Long, Int, Double) V: ClassTag](
+        initialCapacity: Int) extends Iterable[(K, V)] with Serializable{
+        构造器参数:
+        	initialCapacity	初始容量
+        构造函数:
+        def this() = this(64)
+        功能: 构造一个初始容量为64的hashmap
+        属性:
+        #name @_keySet = new OpenHashSet[K](initialCapacity) key集合
+        #name @_values: Array[V] = _ value值列表(用于普通1对象) 
+        #name @_values = new Array[V](_keySet.capacity)	用于序列化类型T的value
+        #name @_oldValues: Array[V] = null transient	旧值列表
+        #name @haveNullValue = false	是否有空值标志
+        #name @nullValue: V = null.asInstanceOf[V]	空值
+        #name @grow = (newCapacity: Int) => { 
+        	_oldValues = _values
+            _values = new Array[V](newCapacity)
+        }
+        	增长策略
+        #name @move = (oldPos: Int, newPos: Int) => {
+            _values(newPos) = _oldValues(oldPos)
+          }
+        	hash槽移动策略
+        操作集:
+        def size: Int
+        功能:获取hashmap的条目数量(所有空key只当做一个条目处理)
+        val= if (haveNullValue) _keySet.size + 1 else _keySet.size
+        
+        def contains(k: K): Boolean
+        功能: 测试是否包含指定key值
+        val= if (k == null) {
+          haveNullValue
+        } else {
+          _keySet.getPos(k) != OpenHashSet.INVALID_POS
+        }
+        
+        def apply(k: K): V
+        功能: 获取指定key值的value
+        val= if (k == null) {
+          nullValue
+        } else {
+          val pos = _keySet.getPos(k) // 获取key所属的位置
+          if (pos < 0) {
+            null.asInstanceOf[V]
+          } else {
+            _values(pos) // 获取pos位置的值即value值,容量与keyset一致,节省了空间
+          }
+        }
+        
+        def update(k: K, v: V): Unit
+        功能: 更新指定key的value为指定val
+        if (k == null) {
+          haveNullValue = true
+          nullValue = v
+        } else {
+          val pos = _keySet.addWithoutResize(k) & OpenHashSet.POSITION_MASK
+          _values(pos) = v
+          _keySet.rehashIfNeeded(k, grow, move)
+          _oldValues = null
+        }
+        
+        def changeValue(k: K, defaultValue: => V, mergeValue: (V) => V): V
+        功能: 如果key在hashmap中不存在,设置其值为默认,否则,设置值为合并函数的值,并返回新更新的值
+        输入参数:
+            k	key值
+            defaultValue	默认值
+            mergeValue	合并函数
+        if (k == null) {
+          if (haveNullValue) { // 不存在该key,但是有空值value,则合并空值value作为更新后的值
+            nullValue = mergeValue(nullValue)
+          } else { // 不存在该key,也没有空值可以使用,则设置为默认值@defaultValue
+            haveNullValue = true
+            nullValue = defaultValue
+          }
+          nullValue
+        } else { // 存在key的处理方案
+          val pos = _keySet.addWithoutResize(k)
+          if ((pos & OpenHashSet.NONEXISTENCE_MASK) != 0) { // pso不存在的处理方案
+            val newValue = defaultValue
+            _values(pos & OpenHashSet.POSITION_MASK) = newValue // 重新设置一个新的value等于默认值
+            _keySet.rehashIfNeeded(k, grow, move) //根据指定的增长策略重新hash
+            newValue
+          } else { // pos存在直接设置指定位置的值为新值即可
+            _values(pos) = mergeValue(_values(pos))
+            _values(pos)
+          }
+        }
+        
+        def hasNext: Boolean = nextPair != null
+        功能: 是否具有下一个条目
+        
+        def next(): (K, V)
+        功能: 获取下一个条目
+        val pair = nextPair
+        nextPair = computeNextPair()
+        val= pair
+        
+        def iterator: Iterator[(K, V)]
+        功能: 获取一个迭代器
+        val= new Iterator[(K, V)] {
+        var pos = -1 // 初始化指针位置
+        var nextPair: (K, V) = computeNextPair() // 获取第一个条目
+        def computeNextPair(): (K, V) = { // 获取下一个条目值
+          if (pos == -1) {    // 处理第一个条目
+            if (haveNullValue) { // 处理第一个条目的空值情况
+              pos += 1
+              return (null.asInstanceOf[K], nullValue)
+            }
+            pos += 1
+          }
+          pos = _keySet.nextPos(pos) 
+          if (pos >= 0) { // 获取后面的条目(不存在空,只有第一个条目可能出现空值)
+            val ret = (_keySet.getValue(pos), _values(pos))
+            pos += 1
+            ret
+          } else {
+            null
+          }
+        }  
+    } 
+    ```
+    
+    #### OpenHashSet
+    
+    ```markdown
+    介绍:
+    	简单来说,快速hashset优化了非空仅插入的情况,这种情况下key是不会被移除的.
+    	底层实现使用了scala编译器的特殊化处理,产生了优化了4个类型的存储空间(Long,Int,Double,Float).速度要快于java标准的hashSet,而需要更小的内存开销.这个可以服务于更高等级的数据结构,比如说优化后的hashMap.
+    	与传统的hashset相比,这个类提供了各式各样的回调接口.比如说分配函数@allocateFunc,@moveFunc.和一些检索key在底层存储数组中位置的接口.
+    	这里使用平方探测法,保证有足够的空间给每个key
+    ```
+    
+    ```scala
+    @Private
+    class OpenHashSet[@specialized(Long, Int, Double, Float) T: ClassTag](
+        initialCapacity: Int,
+        loadFactor: Double) extends Serializable{
+        构造器参数:
+        initialCapacity	初始化容量
+        loadFactor	加载因子
+        参数合法性断言:
+        require(initialCapacity <= OpenHashSet.MAX_CAPACITY,
+        s"Can't make capacity bigger than ${OpenHashSet.MAX_CAPACITY} elements")
+        require(initialCapacity >= 0, "Invalid initial capacity")
+        require(loadFactor < 1.0, "Load factor must be less than 1.0")
+        require(loadFactor > 0.0, "Load factor must be greater than 0.0")
+        自有构造器:
+        def this(initialCapacity: Int) = this(initialCapacity, 0.7)
+        功能: 初始化一个加载因子为 0.7 的快速hashSet
+        
+       	def this() = this(64)
+        功能: 初始化一个初始容量为64的快速HashSet
+        属性:
+        #name @_capacity=nextPowerOf2(initialCapacity)	容量值(容量翻倍--> 增长策略)
+        #name @_mask = _capacity - 1 掩码
+        #name @_size = 0	hashset的规模大小
+        #name @_growThreshold = (loadFactor * _capacity).toInt	增长容量
+        #name @_bitset = new BitSet(_capacity)	定长集合
+        #name @_data: Array[T] = _		为对象设置的底层存储数组
+        #name @_data = new Array[T](_capacity)	为指定类型T设置的底层存储数组
+        #name @hasher #Type @Hasher[T]	hash处理器
+        val= {
+            val mt = classTag[T] // 获取类名称,根据指定的类获取hash处理器
+            if (mt == ClassTag.Long) {
+              (new LongHasher).asInstanceOf[Hasher[T]]
+            } else if (mt == ClassTag.Int) {
+              (new IntHasher).asInstanceOf[Hasher[T]]
+            } else if (mt == ClassTag.Double) {
+              (new DoubleHasher).asInstanceOf[Hasher[T]]
+            } else if (mt == ClassTag.Float) {
+              (new FloatHasher).asInstanceOf[Hasher[T]]
+            } else {
+              new Hasher[T]
+            }
+          }
+        
+        操作集:
+        def size: Int = _size
+        功能: 获取集合规模大小
+        
+        def capacity: Int = _capacity
+        功能: 获取集合容量
+        
+        def getBitSet: BitSet = _bitset
+        功能: 获取定长集合
+        
+        def contains(k: T): Boolean = getPos(k) != INVALID_POS
+        功能: 确定集合是否包含指定的key
+        
+        def add(k: T): Unit
+        功能: 添加集合元素,如果添加之后超出容量,则需要进行rehash
+        1. 添加元素k
+        addWithoutResize(k)
+        2. 进行可能的rehash
+        rehashIfNeeded(k, grow, move)
+        
+        def union(other: OpenHashSet[T]): OpenHashSet[T]
+        功能: 合并指定hashSet到本类
+        val iterator = other.iterator
+        while (iterator.hasNext) {
+          add(iterator.next())
+        }
+        val= this
+        
+        def addWithoutResize(k: T): Int
+        功能: 在不考虑重新修改set的规模情况下,添加元素
+        1. 计算新元素的hashcode
+        var pos = hashcode(hasher.hash(k)) & _mask
+        2. 使用平方探测法循环探测找到hash槽的位置
+        var delta = 1
+        while (true) {
+          if (!_bitset.get(pos)) {
+            // 定长集合中不包含该元素,新增该元素
+            _data(pos) = k
+            _bitset.set(pos)
+            _size += 1
+            return pos | NONEXISTENCE_MASK
+          } else if (_data(pos) == k) {
+            // 找到指定位置,且已存在有值,直接返回(重复值)
+            return pos
+          } else {
+            // 平方探测,确定下一个hash槽位置
+            pos = (pos + delta) & _mask
+            delta += 1
+          }
+        }
+        
+        def rehashIfNeeded(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit): Unit
+        功能: 过载状态下对集合进行重新散列
+        输入参数:
+        	k	函数中未使用的参数,但是可以强迫scala编译器去特殊处理这个方法
+        	allocateFunc	回调函数,用于分配一个新的更大的底层存储数组
+        	moveFunc	移动函数(将旧数组中指定位置的数据移动到新数组中)
+        if (_size > _growThreshold) {
+          rehash(k, allocateFunc, moveFunc)
+        }
+        
+        def getPos(k: T): Int
+        功能: 获取指定key在底层数组中的位置,INVALID_POS表示找不到
+        1. 计算指定key的hashCode,并计算位置
+        var pos = hashcode(hasher.hash(k)) & _mask
+        2. 使用平方探测法求出具体位置
+        var delta = 1
+        while (true) {
+          if (!_bitset.get(pos)) {
+            return INVALID_POS
+          } else if (k == _data(pos)) {
+            return pos
+          } else {
+            pos = (pos + delta) & _mask
+            delta += 1
+          }
+        }
+        
+        def getValue(pos: Int): T = _data(pos)
+    	功能: 获取指定位置的value值
+        
+        def iterator: Iterator[T]
+        功能: 获取迭代器
+        val= new Iterator[T] {
+            var pos = nextPos(0)
+            override def hasNext: Boolean = pos != INVALID_POS
+            override def next(): T = {
+              val tmp = getValue(pos)
+              pos = nextPos(pos + 1)
+              tmp
+            }
+          }
+        
+        def getValueSafe(pos: Int): T
+        功能: 获取指定位置的值
+        0. 位置断言(避免获取时出错)
+        assert(_bitset.get(pos))
+        1. 获取value值
+        val= _data(pos)
+        
+        def nextPos(fromPos: Int): Int=_bitset.nextSetBit(fromPos)
+        功能: 获取迭代器中下一个值的位置,始于包含给定的的位置
+        
+        def hashcode(h: Int): Int = Hashing.murmur3_32().hashInt(h).asInt()
+        功能: 计算hashcode 采样MURMUR3_32算法
+        
+        def nextPowerOf2(n: Int): Int
+        功能: 计算2*n
+        val= if (n == 0) {
+          1
+        } else {
+          val highBit = Integer.highestOneBit(n)
+          if (highBit == n) n else highBit << 1
+        }
+        
+        def rehash(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit): Unit
+        功能: rehash,表扩容,并对所有数据进行重新散列,
+        输入参数: 
+        	k	函数没有使用,但是可以提示scala编译器对其进行特殊化处理
+        	allocateFunc	分配内存函数
+        	moveFunc	移动元素函数
+        1. 计算新容量
+        val newCapacity = _capacity * 2
+        require(newCapacity > 0 && newCapacity <= OpenHashSet.MAX_CAPACITY,
+          s"Can't contain more than ${(loadFactor * OpenHashSet.MAX_CAPACITY).toInt} elements")
+        2. 分配新容量的内存空间
+        allocateFunc(newCapacity)
+        3. 获取新的定长集合,底层数组,以及掩码值
+        val newBitset = new BitSet(newCapacity)
+        val newData = new Array[T](newCapacity)
+        val newMask = newCapacity - 1
+        4. 将旧数据迁移到新的底层数组中
+        var oldPos = 0
+        while (oldPos < capacity) {
+          if (_bitset.get(oldPos)) {
+            val key = _data(oldPos)
+            var newPos = hashcode(hasher.hash(key)) & newMask
+            var i = 1
+            var keepGoing = true
+            // No need to check for equality here when we insert so this has one less if branch than
+            // the similar code path in addWithoutResize.
+            while (keepGoing) {
+              if (!newBitset.get(newPos)) {
+                // Inserting the key at newPos
+                newData(newPos) = key
+                newBitset.set(newPos)
+                moveFunc(oldPos, newPos)
+                keepGoing = false
+              } else {
+                val delta = i
+                newPos = (newPos + delta) & newMask
+                i += 1
+              }
+            }
+          }
+          oldPos += 1
+        }
+        5. 设置新的底层数组指向,以及相关参数更新
+        _bitset = newBitset
+        _data = newData
+        _capacity = newCapacity
+        _mask = newMask
+        _growThreshold = (loadFactor * newCapacity).toInt
+    } 
+    ```
+    
+    ```scala
+    private[spark] object OpenHashSet {
+        属性:
+        #name @MAX_CAPACITY = 1 << 30	最大容量
+        #name @INVALID_POS = -1	无效位置
+        #name @NONEXISTENCE_MASK = 1 << 31	不存在的掩码值
+        #name @POSITION_MASK = (1 << 31) - 1	位置掩码值
+        #name @grow = grow1 _ 增长值
+        #name @move = move1 _ 移动值
+        样例类:
+        class LongHasher extends Hasher[Long] {
+            override def hash(o: Long): Int = (o ^ (o >>> 32)).toInt
+          }
+        介绍: long型hash处理器
+        
+        class IntHasher extends Hasher[Int] {
+            override def hash(o: Int): Int = o
+          }
+        介绍: int型hash处理器
+        
+        class DoubleHasher extends Hasher[Double] {
+            override def hash(o: Double): Int = {
+              val bits = java.lang.Double.doubleToLongBits(o)
+              (bits ^ (bits >>> 32)).toInt
+            }
+          }
+        介绍: double型hash处理器
+        
+        class FloatHasher extends Hasher[Float] {
+            override def hash(o: Float): Int = java.lang.Float.floatToIntBits(o)
+          }
+        功能: float型hash处理器
+        
+        def grow1(newSize: Int): Unit={}
+        功能: 增长策略
+        
+        def move1(oldPos: Int, newPos: Int): Unit = { }
+        功能: 移动方案
+        
+        sealed class Hasher[@specialized(Long, Int, Double, Float) T] extends Serializable {
+            def hash(o: T): Int = o.hashCode()
+          }
+        功能: 通用hash处理器
+    }
+    ```
+    
+    #### PairsWriter
+    
+    ```scala
+    /*
+    	对于kv对消费者的抽象,持久化分区的数据时首先被使用.尽管也是可以通过shuffle写插件或者盘块写出器
+    @DiskBlockObjectWriter 来持久化.
+    */
+    private[spark] trait PairsWriter {
+    	操作集:
+      	def write(key: Any, value: Any): Unit
+        功能: 写出指定kv值
+    }
+    ```
+    
     #### PartitionedAppendOnlyMap
-
+    
+    ```scala
+    private[spark] class PartitionedAppendOnlyMap[K, V]
+    extends SizeTrackingAppendOnlyMap[(Int, K), V] with WritablePartitionedPairCollection[K, V]{
+        介绍: 按照形式(分区编号,key)包装一个map
+        操作集:
+        def partitionedDestructiveSortedIterator(keyComparator: Option[Comparator[K]])
+        	: Iterator[((Int, K), V)]
+        功能: 获取一个分区可破坏的迭代器
+        1. 获取分区比较器
+        val comparator = keyComparator.map(partitionKeyComparator).getOrElse(partitionComparator)
+        2. 获取迭代器
+        val= destructiveSortedIterator(comparator)
+        
+        def insert(partition: Int, key: K, value: V): Unit
+        功能: 向分区中插入kv值	
+        update((partition, key), value)
+    }
+    ```
+    
     #### PartitionedPairBuffer
-
+    
+    ```scala
+    private[spark] class PartitionedPairBuffer[K, V](initialCapacity: Int = 64)
+    extends WritablePartitionedPairCollection[K, V] with SizeTracker{
+        介绍: kv对类型只添加类型的缓冲区,每个都有相对应的分区号.保证可以追踪到完成的字节量
+        	这个缓冲区可以支持1073741819个元素
+        属性:
+        #name @capacity = initialCapacity	缓冲区容量大小
+        #name @curSize = 0	当前完成的字节量大小
+        #name @data = new Array[AnyRef](2 * initialCapacity)	数据列表
+        	使用两倍容量用于容纳kv信息,可以使用@KVArraySortDataFormat高效排序
+        操作集:
+        def insert(partition: Int, key: K, value: V): Unit
+        功能: 插入kv值到指定分区@partition 中
+        1. 处理可能的容量扩充
+        if (curSize == capacity) {
+          growArray()
+        }
+        2. 设置kv到缓冲区中,并更新完成字节量大小
+        data(2 * curSize) = (partition, key.asInstanceOf[AnyRef])
+        data(2 * curSize + 1) = value.asInstanceOf[AnyRef]
+        curSize += 1
+        3. 更新回调
+        afterUpdate()
+        
+        def growArray(): Unit
+        功能: 缓冲区扩充
+        1. 检验可能出现的缓冲区大小超出限制
+        if (capacity >= MAXIMUM_CAPACITY) {
+          throw new IllegalStateException(s"Can't insert more than ${MAXIMUM_CAPACITY} elements")
+        }
+        2. 计算缓冲区的新容量
+        val newCapacity =
+          if (capacity * 2 > MAXIMUM_CAPACITY) { // 溢出取最大值
+            MAXIMUM_CAPACITY
+          } else { // 容量翻倍
+            capacity * 2
+          }
+        3. 更新缓冲区数组,并将之前数据复制过去
+        val newArray = new Array[AnyRef](2 * newCapacity)
+        System.arraycopy(data, 0, newArray, 0, 2 * capacity)
+        4. 重置数据和容量,并重置采样收集器
+        data = newArray
+        capacity = newCapacity
+        resetSamples()
+        
+        def partitionedDestructiveSortedIterator(keyComparator: Option[Comparator[K]])
+        : Iterator[((Int, K), V)]
+        功能: 获取可毁坏的分区排序迭代器
+        1. 获取指定分区的分区排序器
+        val comparator = keyComparator.map(partitionKeyComparator).getOrElse(partitionComparator)
+        2. 新建一个排序器,并对其进行排序,获取迭代器
+        new Sorter(new KVArraySortDataFormat[(Int, K), AnyRef]).sort(data, 0, curSize, comparator)
+        val= iterator
+        
+        def iterator(): Iterator[((Int, K), V)] = new Iterator[((Int, K), V)]
+        功能: 获取迭代器
+        val= new Iterator[((Int, K), V)] {
+            var pos = 0
+    
+            override def hasNext: Boolean = pos < curSize
+    
+            override def next(): ((Int, K), V) = {
+              if (!hasNext) {
+                throw new NoSuchElementException
+              }
+              val pair = (data(2 * pos).asInstanceOf[(Int, K)], data(2 * pos + 1).asInstanceOf[V])
+              pos += 1
+              pair
+            }
+          }
+    }
+    ```
+    
+    ```scala
+    private object PartitionedPairBuffer {
+        属性:
+        #name @MAXIMUM_CAPACITY: Int = ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH / 2
+        	缓冲区最大容量
+    }
+    ```
+    
     #### PrimitiveKeyOpenHashMap
-
+    
+    ```markdown
+    介绍:
+    	实现了非空值的原始的快速hashmap,这个hashmap支持插入和更新,但是不支持删除,这个map的速度要比普通hashmap要快,且占用更少的空间.主要是将空值的存储范围缩小了.
+    	底层使用了@OpenHashSet 实现
+    ```
+    
+    ```scala
+    private[spark]
+    class PrimitiveKeyOpenHashMap[@specialized(Long, Int) K: ClassTag,
+                                  @specialized(Long, Int, Double) V: ClassTag](
+        initialCapacity: Int) extends Iterable[(K, V)] with Serializable{
+        参数断言:
+        require(classTag[K] == classTag[Long] || classTag[K] == classTag[Int])
+        功能: key必须是long或者int型
+        默认构造器:
+        def this() = this(64)
+        功能: 默认创建64位容量的map
+        属性:
+        #name @_keySet: OpenHashSet[K] = _	name集合
+        #name @_values: Array[V] = _	value集合
+        #name @_keySet = new OpenHashSet[K](initialCapacity)	指定大小的key集合(用于指定类型T)
+        #name @_values = new Array[V](_keySet.capacity)	value集合(用于指定类型value)
+        #name @_oldValues: Array[V] = null	旧有的value列表
+        #name @grow = (newCapacity: Int) => {
+            _oldValues = _values
+            _values = new Array[V](newCapacity)
+          }
+        	增长策略
+        #name @move = (oldPos: Int, newPos: Int) => {
+            _values(newPos) = _oldValues(oldPos)
+          }
+        	将旧位置的value移动到新的位置,用于处理rehash
+        操作集:
+        def size: Int = _keySet.size
+        功能: 获取map的规模
+        
+        def contains(k: K): Boolean
+        功能: 确认map是否包含指定key
+        val=  _keySet.getPos(k) != OpenHashSet.INVALID_POS
+        
+        def apply(k: K): V
+        功能: 获取指定key的value
+        val pos = _keySet.getPos(k)
+        val= _values(pos)
+        
+        def getOrElse(k: K, elseValue: V): V
+        功能: 获取指定key的value,不存在则返回@elseValue
+        val pos = _keySet.getPos(k)
+        val= if (pos >= 0) _values(pos) else elseValue
+        
+        def update(k: K, v: V): Unit
+        功能: 更新指定的kv
+        val pos = _keySet.addWithoutResize(k) & OpenHashSet.POSITION_MASK // 获取指定位置pos
+        _values(pos) = v // 更新这个位置的key
+        _keySet.rehashIfNeeded(k, grow, move) //进行可能的rehash
+        _oldValues = null// 重置旧值
+        
+        def changeValue(k: K, defaultValue: => V, mergeValue: (V) => V): V
+        功能: 如果key存在于hashmap中设置气质为默认值@defaultValue,否则设置为@mergeValue
+        1. 获取指定key在value列表中的位置@pos
+        val pos = _keySet.addWithoutResize(k)
+        2. 判断key是否存在于列表中,存在则合并旧值@mergeValue并返回,否则使用默认值@defaultValue
+        val= if ((pos & OpenHashSet.NONEXISTENCE_MASK) != 0) { // 判断是否存在有这个key
+          val newValue = defaultValue
+          _values(pos & OpenHashSet.POSITION_MASK) = newValue
+          _keySet.rehashIfNeeded(k, grow, move)
+          newValue // 获取value为@defaultValue
+        } else {
+          _values(pos) = mergeValue(_values(pos))
+          _values(pos)// 合并旧值,并返回
+        }
+        
+        def iterator: Iterator[(K, V)] 
+        功能: 获取迭代器
+        val= new Iterator[(K, V)] {
+            var pos = 0
+            var nextPair: (K, V) = computeNextPair()
+            def computeNextPair(): (K, V) = {
+              pos = _keySet.nextPos(pos)
+              if (pos >= 0) {
+                val ret = (_keySet.getValue(pos), _values(pos))
+                pos += 1
+                ret
+              } else {
+                null
+              }
+            }
+            def hasNext: Boolean = nextPair != null
+            def next(): (K, V) = {
+              val pair = nextPair
+              nextPair = computeNextPair()
+              pair
+            }
+          }
+    } 
+    ```
+    
     #### PrimitiveVector
-
+    
+    ```scala
+    private[spark]
+    class PrimitiveVector[@specialized(Long, Int, Double) V: ClassTag](initialSize: Int = 64) {
+        介绍: 专为原语类型优化的,只能添加的,线程不安全的向量表
+        属性:
+        #name @_numElements = 0	元素数量(向量表末尾指针)
+        #name @_array: Array[V] = _	向量表
+        输出化操作:
+        _array = new Array[V](initialSize)
+        功能: 初始化向量表
+        
+        操作集:
+        def apply(index: Int): V
+        功能: 获取向量表指定位置@index的元素
+        0. 范围断言
+        require(index < _numElements)
+        1. 获取元素
+        val= _array(index)
+        
+        def +=(value: V): Unit
+        功能: 添加元素到向量表中
+        0. 处理可能的扩容情况
+        if (_numElements == _array.length) {
+          resize(_array.length * 2)
+        }
+        1. 添加到向量表中,并更新向量表元素数量信息
+        _array(_numElements) = value
+        _numElements += 1
+        
+        def capacity: Int = _array.length
+        功能: 获取向量表长度
+        
+        def length: Int = _numElements
+        功能: 向量表元素个数
+        
+        def size: Int = _numElements
+        功能: 向量表元素个数
+        
+        def iterator: Iterator[V]
+        功能: 获取迭代器
+        val= new Iterator[V] {
+            var index = 0
+            override def hasNext: Boolean = index < _numElements
+            override def next(): V = {
+              if (!hasNext) {
+                throw new NoSuchElementException
+              }
+              val value = _array(index)
+              index += 1
+              value
+            }
+          }
+        
+        def array: Array[V] = _array
+        功能: 获取底层向量表
+        
+        def trim(): PrimitiveVector[V] = resize(size)
+        功能: 截断向量表,使得容量等于向量表元素数量
+        
+        def resize(newLength: Int): PrimitiveVector[V]
+        功能: 改变向量表的大小,异常之后的元素
+        1. 获取一份向量表副本
+        _array = copyArrayWithLength(newLength)
+        2. 修改元素数量参数为新设置的长度
+        if (newLength < _numElements) {
+          _numElements = newLength
+        }
+        val= this
+        
+        def toArray: Array[V]
+        功能: 转化为数组
+        val= copyArrayWithLength(size)
+        
+        def copyArrayWithLength(length: Int): Array[V]
+        功能: 将向量表拷贝到一份@length 长度的列表,多出的部分截断
+        val copy = new Array[V](length)
+        _array.copyToArray(copy)
+        val= copy
+    }
+    ```
+    
     #### SizeTracker
-
+    
+    ```markdown
+    介绍:
+    	集合类通用接口,追踪已经写完的字节数。
+    	由于使用长度估量器@SizeEstimator 在某种程度上是开销较大的(几个ms),所有采样时使用@SizeEstimator带上低指数幂去分摊补偿时间.
+    ```
+    
+    ```scala
+    private[spark] trait SizeTracker {
+        属性:
+        #name @SAMPLE_GROWTH_RATE = 1.1	采样增长率
+        	控制采样的指数,如果设置为2,则采用序列为 1,2,4,8...
+        #name @samples = new mutable.Queue[Sample]	采样队列
+        	自从上次重置采样队列之后,仅仅保有最后两个,用于使用外推插值法
+        #name @bytesPerUpdate: Double = _	每次更新的最后两个采样值平均数
+        	每次更新最后两个采样值的平均数
+        #name @numUpdates: Long = _ 上次重置采样后插入/更新到map的记录数量
+        #name @nextSampleNum: Long = _	下一个采样值
+        初始化操作:
+        resetSamples()
+        功能: 重置采样队列
+        
+        操作集:
+        def resetSamples(): Unit
+        功能: 重置采样队列
+        numUpdates = 1
+        nextSampleNum = 1
+        samples.clear()
+        takeSample()
+        
+        def afterUpdate(): Unit
+        功能: 每次更新之后的回调函数
+        numUpdates += 1 // 更新数量+1
+        if (nextSampleNum == numUpdates) { // 进行可能的采样工作
+          takeSample()
+        }
+        
+        def takeSample(): Unit
+        功能: 获取当前集合类规模大小的采样值
+        1. 将采样信息入列
+        samples.enqueue(Sample(SizeEstimator.estimate(this), numUpdates))
+        2. 进行适当的出列操作,使得使用最后两个进行外推插值法
+        if (samples.size > 2) {
+          samples.dequeue()
+        }
+        3. 进行外推插值法,先求出字节增长率(单词更新字节增长量)
+        val bytesDelta = samples.toList.reverse match {
+          case latest :: previous :: tail =>
+            (latest.size - previous.size).toDouble / (latest.numUpdates - previous.numUpdates)
+          case _ => 0
+        }
+        bytesPerUpdate = math.max(0, bytesDelta)
+        4. 计算下个采样值
+        nextSampleNum = math.ceil(numUpdates * SAMPLE_GROWTH_RATE).toLong
+        
+        def estimateSize(): Long
+        功能: 估量当前集合的大小,时间复杂度O(1)
+        0. 采样断言
+        assert(samples.nonEmpty)
+        1. 估计外推插值法变化率
+        val extrapolatedDelta = bytesPerUpdate * (numUpdates - samples.last.numUpdates)
+        2. 计算当前估量值
+        val= (samples.last.size + extrapolatedDelta).toLong
+    }
+    ```
+    
+    ```scala
+    private object SizeTracker {
+      case class Sample(size: Long, numUpdates: Long)
+    }
+    ```
+    
     #### SizeTrackingAppendOnlyMap
+    
+    ```scala
+    private[spark] class SizeTrackingAppendOnlyMap[K, V]
+    extends AppendOnlyMap[K, V] with SizeTracker{
+        介绍: 只添加类型的map,可以使用统计方法追踪到预估字节量大小
+        操作集:
+        def update(key: K, value: V): Unit 
+        功能: 更新kv对
+        super.update(key, value) // 更新kv
+        super.afterUpdate() // 进行回调,进行可能的采样工作
+        
+        def changeValue(key: K, updateFunc: (Boolean, V) => V): V
+        功能: 更新key值的条目,默认值为函数@updateFunc 的输出值
+        val newValue = super.changeValue(key, updateFunc)
+        super.afterUpdate()
+        val= newValue
+        
+        def growTable(): Unit
+        功能: 对表进行扩容,并重置采样队列
+        super.growTable()
+        resetSamples()
+    }
+    ```
     
     #### SizeTrackingVector
     
+    ```scala
+    private[spark] class SizeTrackingVector[T: ClassTag] extends PrimitiveVector[T]{
+        介绍: 一个只能添加的缓冲区,使用统计方法保证对字节量大小的估算
+        操作集:
+        def +=(value: T): Unit
+        功能: 添加指定值@value 到向量表中
+        super.+=(value)
+        super.afterUpdate()
+        
+        def resize(newLength: Int): PrimitiveVector[T]
+        功能: 重设向量表长度为@newLength
+        super.resize(newLength)
+        resetSamples() // 由于向量表长度变化会影响外推插值法的计算值,重置采样队列
+    	val= this
+    }
+    ```
+    
     #### SortDataFormat
+    
+    ```scala
+    private[spark] abstract class SortDataFormat[K, Buffer] {
+        介绍: 对输入缓冲数据的强制排序抽象,这个接口需要决定指定元素索引的排序key值,和交换元素,以及移动缓冲区数据的方法.
+        示例类型: 一个数字组成的数组,每个元素又是key,可以看@KVArraySortDataFormat 获得更精确的格式信息.
+        注意: 声明和实例化多个子类会组织JIT内联到以及重写的方法.因此减少了shuffle次数.
+        构造器参数:
+        	k	me每个元素的sort key值
+        	Buffer	指定格式的内部数据结构
+        操作集:
+        def newKey(): K = null.asInstanceOf[K]
+        功能: 创建一个新的可变的可以重用的key,如果你需要重写@getKey(Buffer, Int, K) 的话需要实现它
+        
+        def getKey(data: Buffer, pos: Int): K
+        功能: 获取在指定位置的元素
+        
+        def getKey(data: Buffer, pos: Int, reuse: K): K
+        功能: 返回指定索引位置的key值,如果可能的话重用输入的key.默认实现忽略了重用的情况调用的是@getKey(Buffer, Int),如果你想要的重写这个方法,你必须要实现@newKey()
+        val= getKey(data, pos)
+        
+        def swap(data: Buffer, pos0: Int, pos1: Int): Unit
+        功能: 交换两个元素
+        
+        def copyElement(src: Buffer, srcPos: Int, dst: Buffer, dstPos: Int): Unit
+        功能: 从源地址拷贝元素到目标地址
+        
+        def copyRange(src: Buffer, srcPos: Int, dst: Buffer, dstPos: Int, length: Int): Unit
+        功能: 范围拷贝,拷贝(srcPos到dst位置)
+        
+        def allocate(length: Int): Buffer
+        功能: 分配容纳有@length 个元素的缓冲区,所有数据都被视作不可用知道有数据拷贝进来
+    }
+    ```
+    
+    ```scala
+    private[spark]
+    class KVArraySortDataFormat[K, T <: AnyRef : ClassTag] extends SortDataFormat[K, Array[T]] {
+        介绍: 支持kv键值对的排序数组
+        构造器参数:
+        	K 排序key值
+        	T 排序的数组
+        操作集:
+        def getKey(data: Array[T], pos: Int): K = data(2 * pos).asInstanceOf[K]
+        功能: 获取key
+        由于数组设计为2倍的长度大小,2*x为key,而2*x+1 为value
+        
+        def swap(data: Array[T], pos0: Int, pos1: Int): Unit
+        功能: 交换位置pos0和pos1处的键值对信息
+        val tmpKey = data(2 * pos0)
+        val tmpVal = data(2 * pos0 + 1)
+        data(2 * pos0) = data(2 * pos1)
+        data(2 * pos0 + 1) = data(2 * pos1 + 1)
+        data(2 * pos1) = tmpKey
+        data(2 * pos1 + 1) = tmpVal
+        
+        def copyElement(src: Array[T], srcPos: Int, dst: Array[T], dstPos: Int): Unit
+        功能: 将srcPos处的键值对信息拷贝到dst中
+        dst(2 * dstPos) = src(2 * srcPos)
+        dst(2 * dstPos + 1) = src(2 * srcPos + 1)
+        
+        def copyRange(src: Array[T], srcPos: Int,
+          dst: Array[T], dstPos: Int, length: Int): Unit
+        功能: 范围拷贝srcPos开始的@length个键值对
+        System.arraycopy(src, 2 * srcPos, dst, 2 * dstPos, 2 * length)
+        
+        def allocate(length: Int): Array[T] 
+        功能: 分配指定数目@length的内存空间
+        val= new Array[T](2 * length)
+    }
+    ```
     
     #### Sorter
     
+    ```scala
+    private[spark] class Sorter[K, Buffer](private val s: SortDataFormat[K, Buffer]) {
+        介绍: java Timsort的简单包装java实现时私有的,假设不可以外部调用,这个就仅仅对于spark可以使用.
+        构造器参数:
+        	s	排序形式
+        属性:
+        #name @timSort = new TimSort(s)	timsort实例
+        操作集:
+        def sort(a: Buffer, lo: Int, hi: Int, c: Comparator[_ >: K]): Unit 
+        功能: [lo,hi)范围之内使用TimSort
+        val= timSort.sort(a, lo, hi, c)
+    }
+    ```
+    
     #### Spillable
+    
+    ```scala
+    private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
+    extends MemoryConsumer(taskMemoryManager) with Logging {
+        介绍: 当超过内存容量时,内存集合类溢写到磁盘上的内容
+        属性:
+        #name @initialMemoryThreshold #Type @Long	初始化内存容量
+        val= SparkEnv.get.conf.get(SHUFFLE_SPILL_INITIAL_MEM_THRESHOLD)
+        #name @numElementsForceSpillThreshold #Type @Int	强行溢写容量
+        val= SparkEnv.get.conf.get(SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD)
+        #name @myMemoryThreshold = initialMemoryThreshold volatile	自有内存容量
+        #name @_elementsRead = 0	上次溢写以来读取元素数量
+        #name @_memoryBytesSpilled = 0L volatile	内存溢写总字节量
+        #name @_spillCount = 0	溢写计数器
+        操作集:
+        def spill(collection: C): Unit
+        功能: 将当前内存集合类溢写到磁盘上,并释放溢写部分的内存
+        输入参数: collection	需要溢写到磁盘上的集合
+        
+        def forceSpill(): Boolean
+        功能: 获取是否需要强行溢写
+        强行溢写内存集合到磁盘上,并释放内存,当任务没有足够内存的时候,有任务内存管理器@TaskMemoryManager 调用这个方法,强行的将内存集合溢写到磁盘上,并释放足够的内存给任务.
+        
+        def elementsRead: Int = _elementsRead
+        功能: 读取自上次溢写以来,输入读取的元素数量
+        
+        def addElementsRead(): Unit = { _elementsRead += 1 }
+        功能: 子类在每次记录被读取时调用,用于检查溢写频率
+        
+        def memoryBytesSpilled: Long = _memoryBytesSpilled
+        功能: 获取内存溢写字节量
+        
+        def releaseMemory(): Unit
+        功能: 释放内存
+        freeMemory(myMemoryThreshold - initialMemoryThreshold)
+        myMemoryThreshold = initialMemoryThreshold
+        
+        @inline def logSpillage(size: Long): Unit
+        功能: 日志溢写,将标准日志信息写出
+        val threadId = Thread.currentThread().getId
+        logInfo("Thread %d spilling in-memory map of %s to disk (%d time%s so far)"
+          .format(threadId, org.apache.spark.util.Utils.bytesToString(size),
+            _spillCount, if (_spillCount > 1) "s" else ""))
+        
+        def spill(size: Long, trigger: MemoryConsumer): Long 
+        功能: 指定内存消费者@trigger 释放指定大小@size的内存,返回实际释放内存数量
+        val= if (trigger != this && taskMemoryManager.getTungstenMemoryMode == MemoryMode.ON_HEAP) {
+            // 释放在堆模式下的内存
+          val isSpilled = forceSpill() // 确认是否需要强制溢写(任务内存是否足够)
+          if (!isSpilled) {
+            0L
+          } else { // 释放内存
+            val freeMemory = myMemoryThreshold - initialMemoryThreshold // 计算需要释放的内存量
+            _memoryBytesSpilled += freeMemory // 更新度量值
+            releaseMemory() // 释放内存
+            val= freeMemory
+          }
+        } else {
+          0L
+        }
+        
+        def maybeSpill(collection: C, currentMemory: Long): Boolean
+        功能: 确定指定集合@collection 是否需要被是否
+        	返回true表示已经被溢写到磁盘上,false则表示没有溢写到磁盘上
+        1. 向shuffle内存池中申请内存(为当前内存的2倍-自有内存)
+        var shouldSpill = false
+        if (elementsRead % 32 == 0 && currentMemory >= myMemoryThreshold) {
+            // 处理自有内存不足的情况
+            val amountToRequest = 2 * currentMemory - myMemoryThreshold // 计算需要申请的内存数量
+            val granted = acquireMemory(amountToRequest)	// 申请指定的内存量
+            myMemoryThreshold += granted	// 更新自有内存@myMemoryThreshold
+        	shouldSpill = currentMemory >= myMemoryThreshold // 确定是否是要溢写
+        }
+        2. 对需要溢写的情况进行溢写
+        // 溢写条件: 1. 自有内存不足 2. 强行溢写容量不足以不足以读取足够的元素
+         shouldSpill = shouldSpill || _elementsRead > numElementsForceSpillThreshold
+        if (shouldSpill) {
+            // 执行写,并打印出日志,重置相关参数
+          _spillCount += 1
+          logSpillage(currentMemory)
+          spill(collection)
+          _elementsRead = 0
+          _memoryBytesSpilled += currentMemory
+          releaseMemory()
+        }
+    }
+    ```
     
     #### Utils
     
+    ```scala
+    private[spark] object Utils {
+        介绍: 集合类的实用功能
+        操作集:
+        def takeOrdered[T](input: Iterator[T], num: Int)(implicit ord: Ordering[T]): Iterator[T]
+        功能: 获取top K的功能,参数k由@num指定 
+        1. 获取排序结果
+        val ordering = new GuavaOrdering[T] {
+          override def compare(l: T, r: T): Int = ord.compare(l, r)
+        }
+        2. 获取topK
+        val= ordering.leastOf(input.asJava, num).iterator.asScala
+    }
+    ```
+    
     #### WritablePartitionedPairCollection
+    
+    ```scala
+      private[spark] trait WritablePartitionedPairCollection[K, V] {
+          介绍: 可写分区键值对集合
+          	这是一个通用接口,用于对键值对的字节大小定位,具有如下功能
+          	1. 每个键值对都有相关分区
+          	2. 支持高效的内存排序的迭代器
+          	3. 支持可写分区迭代器,可以直接以字节形式写出
+          操作集:
+          def insert(partition: Int, key: K, value: V): Unit
+          功能: 插入键值对到分区中
+          
+          def partitionedDestructiveSortedIterator(keyComparator: Option[Comparator[K]])
+        	: Iterator[((Int, K), V)]
+          功能: 通过对数据的分区ID排序,这个操作可能破坏底层集合类
+          
+          def destructiveSortedWritablePartitionedIterator(keyComparator: Option[Comparator[K]])
+          	: WritablePartitionedIterator
+          功能: 写出迭代器中的元素而不是直接返回迭代器,记录按照分区编号的顺序返回,这个可能破坏底层集合
+            val it = partitionedDestructiveSortedIterator(keyComparator)
+            new WritablePartitionedIterator {
+              private[this] var cur = if (it.hasNext) it.next() else null // 获取一条记录
+              def writeNext(writer: PairsWriter): Unit = { // 写出一条记录,并移动指针到下一个位置
+                writer.write(cur._1._2, cur._2)
+                cur = if (it.hasNext) it.next() else null
+              }
+              def hasNext(): Boolean = cur != null // 确认是否有下一个元素
+              def nextPartition(): Int = cur._1._1 // 获取下一个分区
+            }
+      }
+    ```
+    
+    ```scala
+    private[spark] object WritablePartitionedPairCollection {
+        操作集:
+        def partitionComparator[K]: Comparator[(Int, K)] = (a: (Int, K), b: (Int, K)) => a._1 - b._1
+        功能: 获取分区比较器(根据分区ID排序)
+        
+        def partitionKeyComparator[K](keyComparator: Comparator[K]): Comparator[(Int, K)]
+        功能: 获取分区比较器(同时按照分区ID和key排序)
+        val= (a: (Int, K), b: (Int, K)) => {
+          val partitionDiff = a._1 - b._1
+          if (partitionDiff != 0) {
+            partitionDiff // 第一关键字排序逻辑
+          } else {
+            keyComparator.compare(a._2, b._2) // 第二关键字排序逻辑
+          }
+        }
+    }
+    ```
+    
+    ```scala
+    private[spark] trait WritablePartitionedIterator {
+        介绍: 迭代器,用于将数据写出到磁盘写出器上@DiskBlockObjectWriter 每个元素都有与之相关的分区
+        操作集:
+        def writeNext(writer: PairsWriter): Unit
+        功能: 写出一条记录,并移动读写指针
+        
+        def hasNext(): Boolean
+        功能: 确认是否有下一条记录
+        
+        def nextPartition(): Int
+        功能: 获取下一个分区的分区编号
+    }
+    ```
 
 #### io
 
@@ -1344,11 +2740,11 @@ private[spark] class GapSamplingReplacement(val f: Double,
    ```scala
 private[spark] object SamplingUtils {
        
-}
-   ```
-
-   ```scala
-private[spark] object PoissonBounds {
+   }
+```
+   
+```scala
+   private[spark] object PoissonBounds {
        介绍: 泊松分布界限类
        操作集:
        def getLowerBound(s: Double): Double
@@ -1368,7 +2764,7 @@ private[spark] object PoissonBounds {
          6.0
        }
    }
-   ```
+```
    
    ```scala
    private[spark] object BinomialBounds {
@@ -1388,7 +2784,7 @@ private[spark] object PoissonBounds {
        math.min(1,math.max(minSamplingRate, 
           fraction + gamma + math.sqrt(gamma * gamma + 2 * gamma * fraction)))
    }
-   ```
+```
    
    ```scala
    private[spark] object SamplingUtils {
@@ -1440,13 +2836,11 @@ private[spark] object PoissonBounds {
          BinomialBounds.getUpperBound(1e-4, total, fraction)
        }
    }
-   ```
+```
    
+#### StratifiedSamplingUtils
    
-   
-   #### StratifiedSamplingUtils
-   
-   分层采样工具
+分层采样工具
    
    ```markdown
    介绍:
@@ -1457,7 +2851,7 @@ private[spark] object PoissonBounds {
    	其中s为需要的采样规模大小,因此通过维护一个空间复杂度为O(sqrt(s)) 的等待列表,通过添加等待列表的部分内容到达立即接受集合中,实现创建指定大小的采样器.
    	通过对等待列表的值进行排序且获取处于位置为(s-numAccepted)的值作为容量精确值(等待列表容量).
    	注意到,当计算容量和实际采样值的时候,使用的是RNG的同一个种子,所以计算的容量保证了会生成需要的采样大小.
-   ```
+```
    
    ```scala
    private[spark] object StratifiedSamplingUtils extends Logging {
@@ -1677,7 +3071,7 @@ private[spark] object PoissonBounds {
            }
          }
    }
-   ```
+```
    
    ```scala
    private class RandomDataGenerator {
@@ -1702,7 +3096,7 @@ private[spark] object PoissonBounds {
        功能: 获取统一性随机变量
        val= uniform.nextDouble()
    }
-   ```
+```
    
    ```scala
    private[random] class AcceptanceResult(var numItems: Long = 0L, var numAccepted: Long = 0L)
@@ -1724,9 +3118,9 @@ private[spark] object PoissonBounds {
              numItems += other.get.numItems
            }
    }
-   ```
+```
    
-   #### XORShiftRandom
+#### XORShiftRandom
    
    ```scala
    private[spark] class XORShiftRandom(init: Long) extends JavaRandom(init) {
@@ -1749,7 +3143,7 @@ private[spark] object PoissonBounds {
        功能: 设置种子信息
        seed = XORShiftRandom.hashSeed(s)
    }
-   ```
+```
    
    ```scala
    private[spark] object XORShiftRandom {
@@ -1762,12 +3156,26 @@ private[spark] object PoissonBounds {
        val highBits = MurmurHash3.bytesHash(bytes, lowBits)
        (highBits.toLong << 32) | (lowBits.toLong & 0xFFFFFFFFL)
    }
-   ```
+```
    
-   #### 基础拓展
+#### 基础拓展
    
-   1.  伯努利分布 :  [伯努利分布](https://zh.wikipedia.org/wiki/伯努利分布)
-   2.  泊松分布: http://en.wikipedia.org/wiki/Poisson_distribution
-   3.  XorShift随机采样 https://en.wikipedia.org/wiki/Xorshift
-   4.   采样理论 http://jmlr.org/proceedings/papers/v28/meng13a.html
-   5.   缓冲区设计不当的内存泄漏 http://www.evanjones.ca/java-bytebuffer-leak.html
+   1. 伯努利分布 :  [伯努利分布](https://zh.wikipedia.org/wiki/伯努利分布)
+   
+   2. 泊松分布: http://en.wikipedia.org/wiki/Poisson_distribution
+   
+   3. XorShift随机采样 https://en.wikipedia.org/wiki/Xorshift
+   
+   4. 采样理论 http://jmlr.org/proceedings/papers/v28/meng13a.html
+   
+   5. 缓冲区设计不当的内存泄漏 http://www.evanjones.ca/java-bytebuffer-leak.html
+   
+   6. 外推插值法
+   
+   7.  平方探测法 http://en.wikipedia.org/wiki/Quadratic_probing
+   
+   8.  哈希函数
+   
+      32位 murmur3 算法 http://smhasher.googlecode.com/svn/trunk/MurmurHash3.cpp
+   
+   9.   位集合 https://www.runoob.com/java/java-bitset-class.html
