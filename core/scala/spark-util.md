@@ -57,26 +57,283 @@
 
     #### AppendOnlyMap
 
-    #### BitSet
-
+    ```markdown
+介绍:
+    	简单的快速hash表,在只添加模式下进行了优化,key不会被移除,但是value可以被改变
+	实现采样了平方探测法,保证了可以所有key的位置
+    	这个map可以支持高达375809638(0.7*2^29)个元素的存储
+    ```
+    
     ```scala
-class BitSet(numBits: Int) extends Serializable {
+    @DeveloperApi
+    class AppendOnlyMap[K, V](initialCapacity: Int = 64) extends Iterable[(K, V)] with Serializable{
+        构造器参数:
+        initialCapacity	初始容量64
+        参数断言:
+	    require(initialCapacity <= MAXIMUM_CAPACITY,
+        s"Can't make capacity bigger than ${MAXIMUM_CAPACITY} elements")
+        require(initialCapacity >= 1, "Invalid initial capacity")
+        属性:
+        #name @LOAD_FACTOR = 0.7	加载因子
+        #name @capacity = nextPowerOf2(initialCapacity)	容量大小
+	    #name @mask = capacity - 1	掩码
+        #name @curSize = 0	当前规模大小
+        #name @growThreshold = (LOAD_FACTOR * capacity).toInt	增长容量(超过这个值就会引发扩容)
+        #name @data = new Array[AnyRef](2 * capacity)	底层存储数组(按照key/value存储)
+        #name @haveNullValue = false	是否含有空值
+        #name @nullValue: V = null.asInstanceOf[V]	空值
+        #name @destroyed = false	迭代器是否损坏(为true则底层存储数组不会再被使用)
+        #name @destructionMessage = "Map state is invalid from destructive sorting!"	损坏信息
+       	操作集:
+        def apply(key: K): V 
+        功能: 获取指定key的value值
+        操作条件: 底层数据结构没有损坏
+        assert(!destroyed, destructionMessage)
+        0. 空值处理
+        val k = key.asInstanceOf[AnyRef]
+        if (k.eq(null)) {
+          return nullValue
+        }
+        1. 非空值处理
+        var pos = rehash(k.hashCode) & mask // 获取位置
+        var i = 1
+        while (true) { // 平方探测法获取实际位置
+          val curKey = data(2 * pos)
+          if (k.eq(curKey) || k.equals(curKey)) {
+            return data(2 * pos + 1).asInstanceOf[V]
+          } else if (curKey.eq(null)) {
+            return null.asInstanceOf[V]
+          } else {
+            val delta = i
+            pos = (pos + delta) & mask
+            i += 1
+          }
+        }
+        val= null.asInstanceOf[V] // 探测不到的值
+        
+        def update(key: K, value: V): Unit
+        功能: 更新key的值为value
+        操作条件: 底层存储可以使用
+        assert(!destroyed, destructionMessage)
+        0. 空值处理
+        if (k.eq(null)) {
+          if (!haveNullValue) {
+            incrementSize()
+          }
+          nullValue = value
+          haveNullValue = true
+          return
+        }
+        1. 设置非空key(使用平方探测法定位)
+        var pos = rehash(key.hashCode) & mask
+        var i = 1
+        while (true) {
+          val curKey = data(2 * pos)
+          if (curKey.eq(null)) {
+            data(2 * pos) = k
+            data(2 * pos + 1) = value.asInstanceOf[AnyRef]
+            incrementSize()  // Since we added a new key
+            return
+          } else if (k.eq(curKey) || k.equals(curKey)) {
+            data(2 * pos + 1) = value.asInstanceOf[AnyRef]
+            return
+          } else {
+            val delta = i
+            pos = (pos + delta) & mask
+            i += 1
+          }
+        }
+        
+        def size: Int = curSize
+        功能: 获取规模大小
+        
+        def incrementSize(): Unit
+        功能: hash表规模+1,如果可能的话进行rehash
+        curSize += 1
+        if (curSize > growThreshold) {
+          growTable()
+        }
+        
+        def rehash(h: Int): Int = Hashing.murmur3_32().hashInt(h).asInt()
+        功能: rehash
+        
+        def iterator: Iterator[(K, V)]
+        功能: 获取迭代器
+        操作条件: 底层存储系统可用
+        assert(!destroyed, destructionMessage)
+        1. 获取迭代器
+        val= new Iterator[(K, V)] {
+          var pos = -1 // 位置指针
+          def nextValue(): (K, V) = {
+            if (pos == -1) {    //首值处理(可能是控制)
+              if (haveNullValue) {
+                return (null.asInstanceOf[K], nullValue)
+              }
+              pos += 1
+            }
+            while (pos < capacity) {  // 非首个元素的kv处理
+              if (!data(2 * pos).eq(null)) {
+                return (data(2 * pos).asInstanceOf[K], data(2 * pos + 1).asInstanceOf[V])
+              }
+              pos += 1
+            }
+            null // 过界处理
+          }
+          override def hasNext: Boolean = nextValue() != null // 确认是否有下一个元素
+          override def next(): (K, V) = { // 获取下一个kv二元组
+            val value = nextValue()
+            if (value == null) {
+              throw new NoSuchElementException("End of iterator")
+            }
+            pos += 1
+            value
+          }
+        }
+        
+        def changeValue(key: K, updateFunc: (Boolean, V) => V): V
+        功能: 改变key对应的value值为更新函数@updateFunc	指定的value值
+        操作条件: 底层存储数组可以使用
+        assert(!destroyed, destructionMessage)
+        1. 空值更新处理
+        val k = key.asInstanceOf[AnyRef]
+        if (k.eq(null)) {
+          if (!haveNullValue) {// 原集合中没null,则需要新插入一个null,先扩容
+            incrementSize()
+          }
+          nullValue = updateFunc(haveNullValue, nullValue) // 获取更新的value值
+          haveNullValue = true // 修改空值记录标志位
+          return nullValue
+        }
+        2. 计算k的位置
+        var pos = rehash(k.hashCode) & mask
+        3. 使用平方探测法更新指定kv二元组
+        while (true) {
+          val curKey = data(2 * pos)
+          if (curKey.eq(null)) {
+            val newValue = updateFunc(false, null.asInstanceOf[V])
+            data(2 * pos) = k
+            data(2 * pos + 1) = newValue.asInstanceOf[AnyRef]
+            incrementSize()
+            return newValue
+          } else if (k.eq(curKey) || k.equals(curKey)) {
+            val newValue = updateFunc(true, data(2 * pos + 1).asInstanceOf[V])
+            data(2 * pos + 1) = newValue.asInstanceOf[AnyRef]
+            return newValue
+          } else {
+            val delta = i
+            pos = (pos + delta) & mask
+            i += 1
+          }
+        }
+        null.asInstanceOf[V] // 这个地方一般情况下到达不了
+        
+        def atGrowThreshold: Boolean = curSize == growThreshold
+        功能: 确定是否再插入一个值就会导致表扩容
+        
+        def nextPowerOf2(n: Int): Int
+        功能： 获取当前@n的2倍
+        val highBit = Integer.highestOneBit(n)
+        val= if (highBit == n) n else highBit << 1
+        
+        def growTable(): Unit
+        功能: hash表扩容2倍,并进行rehash
+        1. 扩容并设置扩容后的参数
+        val newCapacity = capacity * 2
+        require(newCapacity <= MAXIMUM_CAPACITY, s"Can't contain more than ${growThreshold} elements")
+        val newData = new Array[AnyRef](2 * newCapacity)
+        val newMask = newCapacity - 1
+        2. 将旧的存储数组中的数据迁移到新的存储数组中(使用平方探测法确定新数组的位置)
+        var oldPos = 0
+        while (oldPos < capacity) {
+          if (!data(2 * oldPos).eq(null)) {
+            val key = data(2 * oldPos)
+            val value = data(2 * oldPos + 1)
+            var newPos = rehash(key.hashCode) & newMask
+            var i = 1
+            var keepGoing = true
+            while (keepGoing) {
+              val curKey = newData(2 * newPos)
+              if (curKey.eq(null)) {
+                newData(2 * newPos) = key
+                newData(2 * newPos + 1) = value
+                keepGoing = false
+              } else {
+                val delta = i
+                newPos = (newPos + delta) & newMask
+                i += 1
+              }
+            }
+          }
+          oldPos += 1
+        }
+        3. 更新map中的属性
+        data = newData
+        capacity = newCapacity
+        mask = newMask
+        growThreshold = (LOAD_FACTOR * newCapacity).toInt
+        
+        def destructiveSortedIterator(keyComparator: Comparator[K]): Iterator[(K, V)] 
+        功能: 返回排序过后的迭代器,这里提供了一种不使用额外内存的排序方式,代价就是损坏map的正确性
+        1. 设置一个新的索引范围,用于容纳非空值
+        var keyIndex, newIndex = 0
+        while (keyIndex < capacity) {
+          if (data(2 * keyIndex) != null) {
+            data(2 * newIndex) = data(2 * keyIndex)
+            data(2 * newIndex + 1) = data(2 * keyIndex + 1)
+            newIndex += 1
+          }
+          keyIndex += 1
+        }
+    	2. 参数合法性断言
+        assert(curSize == newIndex + (if (haveNullValue) 1 else 0))
+        3. 对新的非空数据进行排序 // 这里内部的timsort会改变底层存储数组的顺序,故而map的正确性得不到保障
+        new Sorter(new KVArraySortDataFormat[K, AnyRef]).sort(data, 0, newIndex, keyComparator)
+        4. 获取迭代器
+        val= new Iterator[(K, V)] {
+          var i = 0
+          var nullValueReady = haveNullValue
+          def hasNext: Boolean = (i < newIndex || nullValueReady)
+          def next(): (K, V) = {
+            if (nullValueReady) {
+              nullValueReady = false
+              (null.asInstanceOf[K], nullValue)
+            } else {
+              val item = (data(2 * i).asInstanceOf[K], data(2 * i + 1).asInstanceOf[V])
+              i += 1
+              item
+            }
+          }
+        }
+    }
+    ```
+    
+    ```scala
+    private object AppendOnlyMap {
+        属性:
+        #name @MAXIMUM_CAPACITY = (1 << 29)	最大容量
+    }
+    ```
+    
+    #### BitSet
+    
+    ```scala
+    class BitSet(numBits: Int) extends Serializable {
         介绍: 简单,定长位集合实现,这个实现很快因为不要安全/越界检查
     	主要用于存放bit位(0/1)
        	构造器参数:
-    numBits	字节数
+        numBits	字节数
         属性:
-    #name @words = new Array[Long](bit2words(numBits))	字数列表(每个位)
+    	#name @words = new Array[Long](bit2words(numBits))	字数列表(每个位)
         #name @numWords = words.length	字长
     操作集:
         def capacity: Int = numWords * 64
-	    功能: 计算位集合的容量
+        功能: 计算位集合的容量
         
-    def clear(): Unit = Arrays.fill(words, 0)
+    	def clear(): Unit = Arrays.fill(words, 0)
         功能: 清理位集合
     
         def setUntil(bitIndex: Int): Unit
-	    功能: 超过指定@bitIndex 位置的置位(在0-index位置填充-1)
+        功能: 超过指定@bitIndex 位置的置位(在0-index位置填充-1)
         val wordIndex = bitIndex >> 6 
         Arrays.fill(words, 0, wordIndex, -1)
         if(wordIndex < words.length) {
@@ -358,18 +615,1177 @@ class BitSet(numBits: Int) extends Serializable {
     }
     ```
     
-    
-    
     #### ExternalAppendOnlyMap
     
+    ```markdown
+    介绍:
+    	外部只添加类型map,溢写排序完成的内容到磁盘上,这种情况会在没有足够的空间去扩容时发生.
+    	这个map会越过这两类数据
+    	1. 合并到combiner中的数据,这类数据必然会排序和溢写到磁盘上.
+    	2. combiner读取磁盘数据并相互合并
+    	溢写容量的设置遵照下述方式:
+    	如果溢出容量过大,内存中的map数据会占用超过可用内存的内存量,就会导致OOM,然而如果溢写容量设置的过小,溢写频率上述,会增加不必要的磁盘溢写工作.这种情况比较不使用溢写的@AppendOnlyMap 性能退化了.
+    ```
+    
+    ```scala
+    @DeveloperApi
+    class ExternalAppendOnlyMap[K, V, C](
+        createCombiner: V => C,
+        mergeValue: (C, V) => C,
+        mergeCombiners: (C, C) => C,
+        serializer: Serializer = SparkEnv.get.serializer,
+        blockManager: BlockManager = SparkEnv.get.blockManager,
+        context: TaskContext = TaskContext.get(),
+        serializerManager: SerializerManager = SparkEnv.get.serializerManager)
+    extends Spillable[SizeTracker](context.taskMemoryManager())
+    with Serializable
+    with Logging
+    with Iterable[(K, C)]{
+        构造器参数:
+        createCombiner	combiner创建函数
+        mergeValue	合并函数
+        mergeCombiners	combiner合并函数
+        serializer	序列化器
+        blockManager	块管理器
+        context	任务上下文管理器
+        serializerManager	序列化管理器
+        属性:
+        #name @currentMap = new SizeTrackingAppendOnlyMap[K, C]	字节量大小追踪hashmap
+        #name @spilledMaps = new ArrayBuffer[DiskMapIterator]	溢写迭代器列表
+        #name @sparkConf = SparkEnv.get.conf	应用程序配置集
+        #name @diskBlockManager = blockManager.diskBlockManager	磁盘块管理器
+        #name @serializerBatchSize = sparkConf.get(config.SHUFFLE_SPILL_BATCH_SIZE)
+        	序列化批量大小
+        #name @_diskBytesSpilled = 0L	磁盘溢写量
+        #name @fileBufferSize = sparkConf.get(config.SHUFFLE_FILE_BUFFER_SIZE).toInt * 1024
+        	文件缓冲大小(单位字节)
+        #name @writeMetrics: ShuffleWriteMetrics = new ShuffleWriteMetrics() 写度量器
+        #name @_peakMemoryUsedBytes: Long = 0L	峰值内存使用量
+        #name @keyComparator = new HashComparator[K]	key比较器
+        #name @ser = serializer.newInstance()	序列化实例
+        #name @readingIterator: SpillableIterator = null	读取迭代器
+        构造器及初始化操作:
+        if (context == null) {
+            throw new IllegalStateException(
+              "Spillable collections should not be instantiated outside of tasks")
+          }
+        功能: 任务内才可以溢写
+        
+        def this(
+          createCombiner: V => C,
+          mergeValue: (C, V) => C,
+          mergeCombiners: (C, C) => C,
+          serializer: Serializer,
+          blockManager: BlockManager) {
+        this(createCombiner, mergeValue, mergeCombiners, serializer, blockManager, TaskContext.get())
+      }
+        功能: 向后兼容二进制的构造器
+        操作集:
+        def diskBytesSpilled: Long = _diskBytesSpilled
+        功能: 获取磁盘字节溢写量
+        
+        def peakMemoryUsedBytes: Long = _peakMemoryUsedBytes
+        功能: 获取峰值内存使用量
+        
+        def numSpills: Int = spilledMaps.size
+        功能: 获取磁盘溢写量
+        
+        def insert(key: K, value: V): Unit
+        功能: 插入一个键值对到map中
+        insertAll(Iterator((key, value)))
+        
+        def insertAll(entries: Iterator[Product2[K, V]]): Unit
+        功能: 插入指定迭代器到map中
+        操作条件: 当前map存在
+        if (currentMap == null) {
+          throw new IllegalStateException(
+            "Cannot insert new elements into a map after calling iterator")
+        }
+        1. 使用更新函数,确定是否key是需要更新(value的合并),还是需要新建
+        var curEntry: Product2[K, V] = null
+        val update: (Boolean, C) => C = (hadVal, oldVal) => {
+          if (hadVal) mergeValue(oldVal, curEntry._2) else createCombiner(curEntry._2)
+        }
+        2. 判断是否需要对当前map进行溢写,并更新度量参数:峰值内存使用量@_peakMemoryUsedBytes
+        while (entries.hasNext) {
+          curEntry = entries.next()
+          val estimatedSize = currentMap.estimateSize()
+          if (estimatedSize > _peakMemoryUsedBytes) { // 更新度量值: 峰值内存使用量
+            _peakMemoryUsedBytes = estimatedSize
+          }
+          if (maybeSpill(currentMap, estimatedSize)) { // 确定是否需要溢写,如果发生溢写则重新执行当前map
+            currentMap = new SizeTrackingAppendOnlyMap[K, C]
+          }
+          currentMap.changeValue(curEntry._1, update) // 更新内存map中当前key的value,使用更新函数@update
+          addElementsRead() // 计量读取元素数量(自从上次溢写以来)
+        }
+        
+        def insertAll(entries: Iterable[Product2[K, V]]): Unit
+        功能: 插入给定的迭代器到map中
+        	当底层map需要扩容时,检查当前shuffle内存池中是否有足够的内存分配,如果有则分配内存并对map进行扩容,	否则需要溢写内存map到磁盘上.
+       	insertAll(entries.iterator)
+        
+        def spill(collection: SizeTracker): Unit 
+        功能: 对内存map存在的内容进行排序,溢写到磁盘上,命名为临时文件
+        val inMemoryIterator = currentMap.destructiveSortedIterator(keyComparator)
+        val diskMapIterator = spillMemoryIteratorToDisk(inMemoryIterator)
+        spilledMaps += diskMapIterator
+        
+        def forceSpill(): Boolean 
+        功能: 强制溢写当前内存map到磁盘,并释放内存空间.调用时机为任务内存不足时,任务内存管理器调用.释放成功返		回true
+        val= if (readingIterator != null) {
+              // 溢写并释放内存(溢写读取迭代器中的内容)
+              val isSpilled = readingIterator.spill()
+              if (isSpilled) {
+                currentMap = null
+              }
+              isSpilled
+            } else if (currentMap.size > 0) { // 溢写当前map中的内容
+              spill(currentMap)
+              currentMap = new SizeTrackingAppendOnlyMap[K, C]
+              true
+            } else {
+              false
+            }
+        
+        def flush(): Unit 
+    	功能: 刷新磁盘写出器的内容到磁盘上,并且更新相关变量
+        val segment = writer.commitAndGet() // 提交并获取文件段
+        batchSizes += segment.length // 更新溢写列表
+        _diskBytesSpilled += segment.length // 更新磁盘溢写字节量
+        objectsWritten = 0 // 重置写出对象数量
+        
+        def spillMemoryIteratorToDisk(inMemoryIterator: Iterator[(K, C)])
+          : DiskMapIterator
+        功能: 溢写内存迭代器的内容到磁盘上
+        输入参数: inMemoryIterator	内存迭代器
+        1. 创建临时块,并根据这个临时块创建写出器实例
+        val (blockId, file) = diskBlockManager.createTempLocalBlock()
+        val writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, writeMetrics)
+        var objectsWritten = 0 // 初始化写出量
+        2. 创建溢写字节数量列表
+        val batchSizes = new ArrayBuffer[Long]
+        3. 溢写迭代器内容
+        while (inMemoryIterator.hasNext) {
+            // 获取迭代器的内容并进行溢写
+            val kv = inMemoryIterator.next()
+            writer.write(kv._1, kv._2)
+            objectsWritten += 1
+            if (objectsWritten == serializerBatchSize) {
+              flush() // 批量延时溢写,降低IO频度
+            }
+          }
+         // 溢写最后的参与数据 
+          if (objectsWritten > 0) {
+            flush()
+            writer.close()
+          } else {
+            writer.revertPartialWritesAndClose()
+          }
+          success = true
+        } finally {
+          if (!success) {  // 溢写失败处理方案
+            // 获取写出失败的文件,并将其从文件系统删除
+            writer.revertPartialWritesAndClose()
+            if (file.exists()) {
+              if (!file.delete()) {
+                logWarning(s"Error deleting ${file}")
+              }
+            }
+          }
+        }
+    	val= new DiskMapIterator(file, blockId, batchSizes)
+    
+    	def destructiveIterator(inMemoryIterator: Iterator[(K, C)]): Iterator[(K, C)]
+    	功能: 获取损坏的迭代(底层存储数组的数据发送改变),当内存不足时会溢写到磁盘上
+    	readingIterator = new SpillableIterator(inMemoryIterator)
+        readingIterator.toCompletionIterator
+    
+    	def freeCurrentMap(): Unit
+    	功能: 释放当前map的内存空间
+    	if (currentMap != null) {
+          currentMap = null // So that the memory can be garbage-collected
+          releaseMemory()
+        }
+    
+    	def iterator: Iterator[(K, C)]
+    	功能: 获取一个底层已经损坏的迭代器(这个迭代器合并了内存map和溢写map)
+    	操作条件: 当前map存在
+    	if (currentMap == null) {
+          throw new IllegalStateException(
+            "ExternalAppendOnlyMap.iterator is destructive and should only be called once.")
+        }
+    	1. 获取迭代器
+    	val= if (spilledMaps.isEmpty) {
+          destructiveIterator(currentMap.iterator)
+        } else {
+          new ExternalIterator()
+        }
+    }
+    ```
+    
+    #subclass @ExternalIterator
+    
+    ```scala
+    private class ExternalIterator extends Iterator[(K, C)] {
+        介绍: 合并并排序内存map和溢写map的合集的迭代器
+        属性:
+        #name @mergeHeap = new mutable.PriorityQueue[StreamBuffer]	合并堆(非空缓冲队列)
+        #name @inputStreams = (Seq(sortedMap) ++ spilledMaps).map(it => it.buffered)	输入流列表
+        	输入流来自于内存map和磁盘上的溢写map,内存map使用内存排序完毕,外存(溢写)map之前已经排序完毕
+        #name @sortedMap = destructiveIterator(
+          currentMap.destructiveSortedIterator(keyComparator))
+        	排序完成的map
+        初始化操作:
+        inputStreams.foreach { it =>
+          val kcPairs = new ArrayBuffer[(K, C)]
+          readNextHashCode(it, kcPairs) 
+          if (kcPairs.length > 0) {
+            mergeHeap.enqueue(new StreamBuffer(it, kcPairs))
+          }
+        }
+        功能: 将输入流列表中的kv值合并堆队列
+        
+        操作集:
+        def readNextHashCode(it: BufferedIterator[(K, C)], buf: ArrayBuffer[(K, C)]): Unit
+        功能: 使用来自于指定迭代器的同一个hash值的kv对来填充缓冲区@buf.保证了读取一个hashcode的流数据时不会忘记将它们合并,假定给定迭代器是排序好的.一次执行只能合并一个hash值的缓冲区.
+        if (it.hasNext) {
+            var kc = it.next()
+            buf += kc
+            val minHash = hashKey(kc)
+            while (it.hasNext && it.head._1.hashCode() == minHash) { // 与之前的hash值相等,则合并到buff
+              kc = it.next()
+              buf += kc
+            }
+          }
+        
+        def mergeIfKeyExists(key: K, baseCombiner: C, buffer: StreamBuffer): C 
+        功能: 如果给定buffer包含指定key的值,合并value到基本合并器中,并将相应的kv对从buffer中移除.
+        var i = 0
+          while (i < buffer.pairs.length) {
+            val pair = buffer.pairs(i)
+            if (pair._1 == key) { // 缓冲区找到与key匹配的条目,合并到combiner中
+              // 这里是假定了一个缓冲区内只有一个值与key匹配(因为溢写前key是唯一的),所以直接返回是没有问题的
+              removeFromBuffer(buffer.pairs, i)
+              return mergeCombiners(baseCombiner, pair._2)
+            }
+            i += 1
+          }
+        val= baseCombiner
+        
+        def removeFromBuffer[T](buffer: ArrayBuffer[T], index: Int): T 
+        功能: 将指定元素从缓冲区中移除
+        val elem = buffer(index)
+        buffer(index) = buffer(buffer.size - 1) // 维度-1
+        buffer.trimEnd(1)// 截取buffer
+        val= elem // 返回移除的元素
+        
+        def hasNext: Boolean = mergeHeap.nonEmpty
+        功能: 确定迭代器中是否含有下一个元素
+        
+        def next(): (K, C) 
+        功能: 获取下一个kv键值对
+        0. 合并队列检查
+        if (mergeHeap.isEmpty) {
+            throw new NoSuchElementException
+        }
+        1. 获取队列中最小的key进行处理
+        val minBuffer = mergeHeap.dequeue()
+        val minPairs = minBuffer.pairs
+        val minHash = minBuffer.minKeyHash
+        val minPair = removeFromBuffer(minPairs, 0)
+        val minKey = minPair._1
+        var minCombiner = minPair._2
+        2. 合法性断言
+        assert(hashKey(minPair) == minHash)
+        3. 将hash值最小的缓冲区合并到缓冲区列表中
+        val mergedBuffers = ArrayBuffer[StreamBuffer](minBuffer)
+          while (mergeHeap.nonEmpty && mergeHeap.head.minKeyHash == minHash) {
+            val newBuffer = mergeHeap.dequeue()
+            minCombiner = mergeIfKeyExists(minKey, minCombiner, newBuffer)
+            mergedBuffers += newBuffer
+          }
+        4. 将缓冲区列表的缓冲区送回合并堆中
+        mergedBuffers.foreach { buffer =>
+            if (buffer.isEmpty) {
+              readNextHashCode(buffer.iterator, buffer.pairs)
+            }
+            if (!buffer.isEmpty) {
+              mergeHeap.enqueue(buffer)
+            }
+          }
+        5. 返回当前最小的key和combiner
+        val= (minKey, minCombiner)
+        
+        private class StreamBuffer(
+            val iterator: BufferedIterator[(K, C)],
+            val pairs: ArrayBuffer[(K, C)])
+        extends Comparable[StreamBuffer] {
+            介绍: 来自一个map迭代器(内存迭代器和磁盘迭代器)的流式缓冲区,按照hash值排序.每个缓冲区维护了所有键值对(使用的是当前流中最小hash值的key).如果hash碰撞时会产生多个value.主要到由于存在有溢写,对于一个key仅仅溢写一个value.每个key至多有一个元素.
+            流式缓冲区需要实现比较逻辑,主要是方便与排序和优先队列的使用.
+            构造器参数:
+                iterator	缓冲迭代器
+                pairs	kv缓冲列表
+            操作集:
+            def isEmpty: Boolean = pairs.length == 0
+            功能: 检查缓冲区列表是否为空
+            
+            def minKeyHash: Int 
+            功能: 获取hash最小值
+            assert(pairs.length > 0)
+            hashKey(pairs.head)
+            
+            def compareTo(other: StreamBuffer): Int
+            功能: 实现降序排列,在大顶堆的情况下获取最小值(hash值)
+            val= if (other.minKeyHash < minKeyHash) -1 
+            else if (other.minKeyHash == minKeyHash) 0 else 1
+        }
+    }
+    ```
+    
+    ```scala
+    private class DiskMapIterator(file: File, blockId: BlockId, batchSizes: ArrayBuffer[Long])
+    extends Iterator[(K, C)]{
+        介绍: 磁盘map返回排序完成的迭代器
+        构造器属性:
+        	file	文件
+        	blockId	块编号
+        	batchSize	批量处理大小列表
+        属性:
+        #name @batchOffsets = batchSizes.scanLeft(0L)(_ + _)	批量偏移量
+        	大小为batchSize.length + 1
+        #name @batchIndex = 0	批量获取指针
+        #name @fileStream: FileInputStream = null	文件流
+        #name @deserializeStream: DeserializationStream = null	反序列化流
+        #name @nextItem: (K, C) = null	下一个键值对
+        #name @objectsRead = 0	读取对象数量
+        初始化操作:
+        assert(file.length() == batchOffsets.last,
+          "File length is not equal to the last batch offset:\n" +
+          s"    file length = ${file.length}\n" +
+          s"    last batch offset = ${batchOffsets.last}\n" +
+          s"    all batch offsets = ${batchOffsets.mkString(",")}"
+        )
+        功能: 文件大小校验
+        
+         context.addTaskCompletionListener[Unit](context => cleanup())
+        功能: 添加任务结束作为任务完成的监听事件
+        
+        操作集:
+        def readNextItem(): (K, C)
+        功能: 反序列化读取下一个KV对,如果当前批次的被拉取了,则构建下一个批次的输入流,并读取.如果没有键值对,则返回null.
+        try {
+            val k = deserializeStream.readKey().asInstanceOf[K]
+            val c = deserializeStream.readValue().asInstanceOf[C]
+            val item = (k, c) //获取键值对信息
+            objectsRead += 1
+            if (objectsRead == serializerBatchSize) { // 换取下一个批次
+              objectsRead = 0
+              deserializeStream = nextBatchStream()
+            }
+            item
+          } catch {
+            case e: EOFException =>
+              cleanup()
+              null
+          }
+        
+        def hasNext: Boolean
+        功能: 确认是否含有下一个键值对数据
+        if (nextItem == null) {
+            if (deserializeStream == null) {
+              // 处理反序列化没有开始的情况
+              deserializeStream = nextBatchStream()
+              if (deserializeStream == null) { // 表示之后已经没有数据了
+                return false
+              }
+            }
+            nextItem = readNextItem()
+          }
+          val= nextItem != null
+        
+        def next(): (K, C)
+        功能: 获取下一个kv对
+        0. 末尾元素校验
+        if (!hasNext) {
+            throw new NoSuchElementException
+        }
+        1. 获取下一个元素,并修改下一个元素指针为空
+        val item = nextItem
+        nextItem = null
+        val= item
+        
+        def cleanup(): Unit 
+        功能: 清空
+        1. 移动批处理位置指针,防止读取到其他批次数据
+        batchIndex = batchOffsets.length 
+        2. 关闭反序列化流和文件输入流
+        if (deserializeStream != null) {
+            deserializeStream.close()
+            deserializeStream = null
+          }
+          if (fileStream != null) {
+            fileStream.close()
+            fileStream = null
+          }
+        3. 删除文件
+        if (file.exists()) {
+            if (!file.delete()) {
+              logWarning(s"Error deleting ${file}")
+            }
+          }
+    }
+    ```
+    
+    ```scala
+    private class SpillableIterator(var upstream: Iterator[(K, C)])
+    extends Iterator[(K, C)] {
+        结束: 溢写迭代器
+        属性:
+        #name @SPILL_LOCK = new Object()	溢写控制锁
+        #name @cur: (K, C) = readNext()	溢写指针
+        #name @hasSpilled: Boolean = false	是否产生溢写标志
+        操作集:
+        def destroy(): Unit
+        功能: 销毁迭代器
+        1. 是否map内存空间
+        freeCurrentMap()
+        2. 置空上游迭代器@upstream
+        upstream = Iterator.empty
+        
+        def toCompletionIterator: CompletionIterator[(K, C), SpillableIterator]
+        功能: 转化为完成迭代器@CompletionIterator
+        val= CompletionIterator[(K, C), SpillableIterator](this, this.destroy)
+        
+        def readNext(): (K, C)
+        功能: 读取下一个键值(上游迭代器的下一个kv对)对信息
+        val=  SPILL_LOCK.synchronized {
+          if (upstream.hasNext) {
+            upstream.next()
+          } else {
+            null
+          }
+        }
+        
+        def hasNext(): Boolean = cur != null
+        功能: 确认是否存在有下一个元素
+        
+        def next(): (K, C)
+        功能: 获取下一个kv对
+        val r = cur  // 读取数据
+        cur = readNext() // 移动指针
+        val= r
+        
+    }
+    ```
+    
+    ```scala
+    private[spark] object ExternalAppendOnlyMap {
+        操作集:
+        def hash[T](obj: T): Int= if (obj == null) 0 else obj.hashCode()
+        功能: 获取指定对象@obj 的hash值
+        
+        内部类:
+        private class HashComparator[K] extends Comparator[K] {
+            介绍: 基于hash值的key排序
+            操作集:
+            def compare(key1: K, key2: K): Int
+            功能: 比较两个key的大小
+            val hash1 = hash(key1)
+            val hash2 = hash(key2)
+            val= if (hash1 < hash2) -1 else if (hash1 == hash2) 0 else 1
+        }
+    }
+    ```
+    
     #### ExternalSorter
+    
+    ```markdown
+    介绍:
+    	外部排序器.排序并且进行有可能的kv键值对合并,产生kv键值对的合并形式.使用分区器@Partitioner 首次将key分组送入分区中.之后在分区内部按照key进行排序,排序规则有用户指定.使用一个分区的不同字节范围可以输出单个分区文件.适合与shuffle获取数据.
+    	如果合并失效了,类型C必须要等于V(可以在最后进行类型转换)
+    	注意: 尽管外部排序器是一个公平的排序器,一些配置连接向基于排序的shuffle.我们可能需要重新访问外部访问器,如果它在其他没有shuffle的上下文中.
+    构造器参数:
+    	aggregator	聚合器(结合合并函数用户合并数据)
+    	partitioner	分区器,如果给定了,会按照分区编号--> key值关键字次序进行排序
+    	ordering	排序方式,可以选择全局排序或者是部分排序
+    	serializer	溢写时需要使用的序列化器
+    	
+    	注意: 如果给定了排序方式,我们总是使用它进行排序,所以仅仅你想要输出的key顺序排序才需要给定它.举个例子,在一个不存在有map侧join的map任务来说,可能你会传递None作为排序方式,去避免不必要的排序.另一方面,如果你需要进行合并,有排序的方式要远远比不排序要高效.
+    	用户可以通过以下几种方式进行与本类的交互:
+    	1. 实例化一个外部排序器@ExternalSorter
+    	2. 一组记录调用@insertAll()
+    	3. 请求一个迭代器@iterator()去遍历排序/聚合后的记录或者是调用@writePartitionedFile() 去创建一个包含排序/聚合结果的输出的文件.(可以用在spark shuffle的排序)
+    	在高级方式下,这个类由如下几种内部工作方式:
+    	1. 反复的填充内存数据的缓冲区.如果需要对数据进行合并则选择@PartitionedAppendOnlyMap 的数据结构,否则采用@PartitionedPairBuffer 的数据结构.在缓冲区内部,使用分区ID进行排序也有可能使用key作为第二关键字进行排序.为了避免使用同一个key多次调用分区.在存储分区ID时需要伴随着记录.
+    	2. 当每个缓冲区到达内存限制的时候,将其溢写到文件中.文件按照分区编号进行排序,也有可能key作为第二关键字进行排序(如果需要进行聚合操作).对于每个文件来说,我们追踪了每个分区在内存中有多少个对象,所以对于任意一个元素来说,不需要写出器分区ID.
+    	3. 当用户请求一个迭代器或者文件输出的时候,溢写文件被合并,还有一些残留的内存数据,使用相同的排序策略(除非排序和聚合都不能使用).如果我们需要按照key进行聚合,我们既可以使用全局排序,也可以读取相同的hash值的记录,对其作比较之后进行数据的合并.
+    	4. 用户在最后调用stop(),去删除所有中间文件.
+    ```
+    
+    ```scala
+    private[spark] class ExternalSorter[K, V, C](
+        context: TaskContext,
+        aggregator: Option[Aggregator[K, V, C]] = None,
+        partitioner: Option[Partitioner] = None,
+        ordering: Option[Ordering[K]] = None,
+        serializer: Serializer = SparkEnv.get.serializer)
+    extends Spillable[WritablePartitionedPairCollection[K, C]](context.taskMemoryManager())
+    with Logging{
+        属性:
+        #name @conf = SparkEnv.get.conf	spark配置
+        #name @numPartitions = partitioner.map(_.numPartitions).getOrElse(1)	分区数量
+        #name @shouldPartition = numPartitions > 1	是否需要分区
+        #name @blockManager = SparkEnv.get.blockManager	块管理器
+        #name @diskBlockManager = blockManager.diskBlockManager	盘块管理器
+        #name @serializerManager = SparkEnv.get.serializerManager	序列化管理器
+        #name @serInstance = serializer.newInstance()	序列化实例
+        #name @fileBufferSize = conf.get(config.SHUFFLE_FILE_BUFFER_SIZE).toInt * 1024 文件缓冲大小
+        #name @serializerBatchSize = conf.get(config.SHUFFLE_SPILL_BATCH_SIZE) 序列化批次长度
+        #name @map = new PartitionedAppendOnlyMap[K, C]	聚合使用的内存数据结构
+        #name @buffer = new PartitionedPairBuffer[K, C]	不使用聚合的内存数据结构
+        #name @_diskBytesSpilled = 0L	磁盘溢写字节量
+        #name @_peakMemoryUsedBytes: Long = 0L	峰值内存使用量
+        #name @isShuffleSort: Boolean = true	volatile	shuffle是否排序
+        #name @forceSpillFiles = new ArrayBuffer[SpilledFile]	强行溢写列表
+        #name @readingIterator: SpillableIterator = null	volatile	读取迭代器
+        #name @keyComparator #Type @Comparator[K]	key排序器
+        	val= ordering.getOrElse((a: K, b: K) => {
+            val h1 = if (a == null) 0 else a.hashCode()
+            val h2 = if (b == null) 0 else b.hashCode()
+            if (h1 < h2) -1 else if (h1 == h2) 0 else 1
+          })
+        按照key的hashcode进行排序
+        #name @spills = new ArrayBuffer[SpilledFile]	溢写文件列表
+        操作集:
+        def getPartition(key: K): Int = if (shouldPartition) partitioner.get.getPartition(key) else 0
+        功能: 获取当前key所属于的分区编号
+        
+        def diskBytesSpilled: Long = _diskBytesSpilled
+        功能: 获取磁盘溢写字节量
+        
+        def peakMemoryUsedBytes: Long = _peakMemoryUsedBytes
+        功能: 获取峰值内存使用量
+        
+        def comparator: Option[Comparator[K]]
+        功能: 获取比较器
+        val= if (ordering.isDefined || aggregator.isDefined) Some(keyComparator) else None
+        
+        def numSpills: Int = spills.size
+        功能: 获取溢写量
+        
+        def insertAll(records: Iterator[Product2[K, V]]): Unit
+        功能: 插入迭代器内部的记录
+        1. 确定是否需要合并
+        val shouldCombine = aggregator.isDefined
+        2. 合并情况的处理
+        val mergeValue = aggregator.get.mergeValue
+        val createCombiner = aggregator.get.createCombiner
+        var kv: Product2[K, V] = null
+        val update = (hadValue: Boolean, oldValue: C) => { // 设置更新函数,有则更新,无则创建
+            if (hadValue) mergeValue(oldValue, kv._2) else createCombiner(kv._2)
+        }
+        while (records.hasNext) {
+            addElementsRead() // 读取元素数量+1
+            kv = records.next() // 获取迭代器中的下一个kv对
+            map.changeValue((getPartition(kv._1), kv._1), update) // 改变key值为合并后的值
+            maybeSpillCollection(usingMap = true) // 如果内存不够使用则溢写
+        }
+        3. 不使用合并的处理情况
+        while (records.hasNext) {
+            addElementsRead()
+            val kv = records.next()
+            buffer.insert(getPartition(kv._1), kv._1, kv._2.asInstanceOf[C]) // 直接将数据插入缓冲区
+            maybeSpillCollection(usingMap = false) // 如果内存不够则溢写
+          }
+        
+        def maybeSpillCollection(usingMap: Boolean): Unit
+        功能: 如果内存不够使用则对内部数据结构进行溢写
+        输入参数: useMap 为true则释放map内存,为false则释放缓冲区内存
+        1. 释放内存
+        var estimatedSize = 0L
+        if (usingMap) {
+          estimatedSize = map.estimateSize()
+          if (maybeSpill(map, estimatedSize)) { // 进行可能的溢写和内存重新设置
+            map = new PartitionedAppendOnlyMap[K, C]
+          }
+        } else {
+          estimatedSize = buffer.estimateSize()
+          if (maybeSpill(buffer, estimatedSize)) { // 进行可能的溢写和内存重新设置
+            buffer = new PartitionedPairBuffer[K, C]
+          }
+        }
+        2. 重置可能的度量值@_peakMemoryUsedBytes
+        if (estimatedSize > _peakMemoryUsedBytes) {
+          _peakMemoryUsedBytes = estimatedSize
+        }
+        
+        def spill(collection: WritablePartitionedPairCollection[K, C]): Unit
+        功能: 溢写指定集合@collection
+        1. 获取内存迭代器
+        val inMemoryIterator = collection.destructiveSortedWritablePartitionedIterator(comparator)
+        2. 将迭代器中内容溢写到磁盘上
+        val spillFile = spillMemoryIteratorToDisk(inMemoryIterator)
+        3. 将新写出的溢写文件注册到溢写文件列表中
+        spills += spillFile
+        
+        def forceSpill(): Boolean
+        功能: 强行溢写当前内存集合到磁盘上,以释放内存.任务没有足够的执行内存时才会由任务内存管理器执行
+        if (isShuffleSort) {
+          val= false // 采取shuffle排序,不溢写
+        } else {
+          assert(readingIterator != null)
+          val isSpilled = readingIterator.spill() // 不采用shuffle排序,对内存数据结构都进行溢写
+          if (isSpilled) {
+            map = null
+            buffer = null
+          }
+          val= isSpilled
+        }
+        
+        def flush(): Unit 
+        功能: 刷写磁盘写出器的内容到磁盘中,并更新相关变量
+        val segment = writer.commitAndGet()
+        batchSizes += segment.length
+        _diskBytesSpilled += segment.length
+        objectsWritten = 0
+        
+        def spillMemoryIteratorToDisk(inMemoryIterator: WritablePartitionedIterator)
+          : SpilledFile
+        功能: 将内存迭代器溢写到磁盘上,并返回溢写文件实例
+        1. 创建临时shuffle数据块(由于shuffle期间可能被读取,所以压缩必须交由@spark.shuffle.compress控制)
+        	所以必须创建一个shuffle数据块
+        val (blockId, file) = diskBlockManager.createTempShuffleBlock()
+        2. 获取写出相关参数(每次刷写之后都会进行重置)
+        var objectsWritten: Long = 0
+        val spillMetrics: ShuffleWriteMetrics = new ShuffleWriteMetrics
+        val writer: DiskBlockObjectWriter =
+          blockManager.getDiskWriter(blockId, file, serInstance, fileBufferSize, spillMetrics)
+        3. 获取写到磁盘的批次长度列表
+        val batchSizes = new ArrayBuffer[Long]
+        4. 获取每个分区的元素数量
+        val elementsPerPartition = new Array[Long](numPartitions)
+        5. 写出写出器中的内容
+        var success = false
+        try {
+          while (inMemoryIterator.hasNext) {
+            val partitionId = inMemoryIterator.nextPartition()// 获取迭代器所属的分区号
+            require(partitionId >= 0 && partitionId < numPartitions,
+              s"partition Id: ${partitionId} should be in the range [0, ${numPartitions})")
+            inMemoryIterator.writeNext(writer) // 写出写出器的内容
+            elementsPerPartition(partitionId) += 1  // 更新度量值@elementsPerPartition
+            objectsWritten += 1 // 更新度量值@objectsWritten
+            if (objectsWritten == serializerBatchSize) { // 批量刷写迭代器中的数据
+              flush()
+            }
+          } 
+          if (objectsWritten > 0) { // 刷写剩余数据
+            flush()
+          } else {
+            writer.revertPartialWritesAndClose()
+          }
+          success = true
+        } finally {
+          if (success) {
+            writer.close()
+          } else {
+            writer.revertPartialWritesAndClose() // 失败处理
+            if (file.exists()) {
+              if (!file.delete()) {
+                logWarning(s"Error deleting ${file}")
+              }
+            }
+          }
+        }
+        
+        def iterator: Iterator[Product2[K, C]]
+        功能: 获取迭代器(包含有所有写出数据,使用聚合器继续聚合)
+        isShuffleSort = false
+        val= partitionedIterator.flatMap(pair => pair._2)
+        
+        def destructiveIterator(memoryIterator: Iterator[((Int, K), C)]): Iterator[((Int, K), C)] 
+        功能: 获取map的具有由破坏性的迭代器,内存不足时强行溢写到磁盘,返回磁盘上map的kv数据
+        输入参数: memoryIterator	内存迭代器
+        if (isShuffleSort) {
+          val= memoryIterator
+        } else {
+          readingIterator = new SpillableIterator(memoryIterator) // 使用shuffle则会向磁盘溢写
+          val= readingIterator
+        }
+        
+        def partitionedIterator: Iterator[(Int, Iterator[Product2[K, C]])]
+        功能: 获取分区迭代器(这个迭代器只能顺序读取),保证返回的每个分区都是按照分区号进行排序的
+        	现在,只一次合并所有溢写文件.但是可以修改成可以分成合并.
+        1. 确定是否使用聚合,并获取进行处理的内部数据结构
+        val usingMap = aggregator.isDefined
+        val collection: WritablePartitionedPairCollection[K, C] = if (usingMap) map else buffer
+        2. 一次性合并溢写文件
+        if (spills.isEmpty) {
+    	  // 特殊情况,不存在有溢写出去的数据,只需要对内存数据进行处理即可
+          if (ordering.isEmpty) { // 没有指定排序方式,按分区号排序即可	
+              groupByPartition(destructiveIterator(
+              collection.partitionedDestructiveSortedIterator(None)))
+          } else { // 指定了排序,则按照排序规则@keyComparator 进行排序
+            groupByPartition(destructiveIterator(
+              collection.partitionedDestructiveSortedIterator(Some(keyComparator))))
+          }
+        } else {
+          merge(spills, destructiveIterator(
+            collection.partitionedDestructiveSortedIterator(comparator)))
+        }
+        
+        def writePartitionedFile(blockId: BlockId,outputFile: File): Array[Long]
+        功能: 写出分区文件
+        1. 定位每个分区再输出文件中的位置
+        val lengths = new Array[Long](numPartitions) // 分区长度列表
+        2. 获取指定写出器
+        val writer = blockManager.getDiskWriter(blockId, outputFile, serInstance, fileBufferSize,
+          context.taskMetrics().shuffleWriteMetrics)
+        3. 只有内存数据的处理(spills.isEmpty)
+        val collection = if (aggregator.isDefined) map else buffer // 获取使用的数据结构
+        val it = collection.destructiveSortedWritablePartitionedIterator(comparator)// 获取迭代器
+        while (it.hasNext) { // 处理迭代器中每个分区的长度
+            val partitionId = it.nextPartition() // 获取分区编号
+            while (it.hasNext && it.nextPartition() == partitionId) { // 写出指定分区编号的内容
+                it.writeNext(writer) 
+            }
+            val segment = writer.commitAndGet() //获取写出的长度
+            lengths(partitionId) = segment.length // 设置长度列表该分区的长度
+        }
+        4. 存在溢写的处理情况
+        for ((id, elements) <- this.partitionedIterator) { // 获取分区迭代器,并对其进行长度获取和设置
+            if (elements.hasNext) {
+              for (elem <- elements) {
+                writer.write(elem._1, elem._2)
+              }
+              val segment = writer.commitAndGet()
+              lengths(id) = segment.length
+            }
+          }
+        5. 关闭写出器,更新度量系统的参数值
+        context.taskMetrics().incMemoryBytesSpilled(memoryBytesSpilled)
+        context.taskMetrics().incDiskBytesSpilled(diskBytesSpilled)
+        context.taskMetrics().incPeakExecutionMemory(peakMemoryUsedBytes)
+        val= lengths
+        
+        def writePartitionedMapOutput(shuffleId: Int,mapId: Long,
+          mapOutputWriter: ShuffleMapOutputWriter): Unit
+        功能: 写出所有添加到外部排序器@ExternalSorter 的数据,按照mapOutput的形式.使用@SortShuffleWriter调用
+        1. 获取分区编号
+        var nextPartitionId = 0
+        2. 处理只有内存数据的情况
+        val collection = if (aggregator.isDefined) map else buffer // 选取数据结构
+        val it = collection.destructiveSortedWritablePartitionedIterator(comparator) // 获取迭代器
+        while (it.hasNext()) {
+            // 获取分区ID,分区写出器,分区kv写出器
+            val partitionId = it.nextPartition() 
+            var partitionWriter: ShufflePartitionWriter = null
+            var partitionPairsWriter: ShufflePartitionPairsWriter = null
+            TryUtils.tryWithSafeFinally {
+                partitionWriter = mapOutputWriter.getPartitionWriter(partitionId)
+                // 获取shuffle数据块信息
+                val blockId = ShuffleBlockId(shuffleId, mapId, partitionId)
+                partitionPairsWriter = new ShufflePartitionPairsWriter(
+                    partitionWriter,
+                    serializerManager,
+                    serInstance,
+                    blockId,
+                    context.taskMetrics().shuffleWriteMetrics)
+                while (it.hasNext && it.nextPartition() == partitionId) { // 写出当前分区的内容
+                    it.writeNext(partitionPairsWriter)
+                }
+            } {
+                if (partitionPairsWriter != null) {
+                    partitionPairsWriter.close()
+                }
+            }
+            nextPartitionId = partitionId + 1 // 指针移动到下一个分区
+        }
+        3. 处理含有溢写文件的情况
+        for ((id, elements) <- this.partitionedIterator) { // 直接从分区迭代器中获取数据写出
+            // 获取shuffle块信息
+            val blockId = ShuffleBlockId(shuffleId, mapId, id)
+            var partitionWriter: ShufflePartitionWriter = null
+            var partitionPairsWriter: ShufflePartitionPairsWriter = null
+            TryUtils.tryWithSafeFinally {
+                // 指定分区写出器,和分区kv写出器
+                partitionWriter = mapOutputWriter.getPartitionWriter(id)
+                partitionPairsWriter = new ShufflePartitionPairsWriter(
+                    partitionWriter,
+                    serializerManager,
+                    serInstance,
+                    blockId,
+                    context.taskMetrics().shuffleWriteMetrics)
+                if (elements.hasNext) {
+                    for (elem <- elements) { // 直接写出分区写出器的kv信息
+                        partitionPairsWriter.write(elem._1, elem._2)
+                    }
+                }
+            } {
+                if (partitionPairsWriter != null) {
+                    partitionPairsWriter.close()
+                }
+            }
+            nextPartitionId = id + 1 // 移动到下一个分区
+        }
+      	4. 更新度量值
+        context.taskMetrics().incMemoryBytesSpilled(memoryBytesSpilled)
+        context.taskMetrics().incDiskBytesSpilled(diskBytesSpilled)
+        context.taskMetrics().incPeakExecutionMemory(peakMemoryUsedBytes)
+        
+        def stop(): Unit
+        功能: 停止外部排序器
+        1. 清理溢写文件列表
+        spills.foreach(s => s.file.delete())
+        spills.clear()
+        forceSpillFiles.foreach(s => s.file.delete())
+        forceSpillFiles.clear()
+        2. 重置内部数据结构,并释放内存
+        if (map != null || buffer != null || readingIterator != null) {
+          map = null 
+          buffer = null
+          readingIterator = null
+          releaseMemory()
+        }
+        
+        def groupByPartition(data: Iterator[((Int, K), C)])
+          : Iterator[(Int, Iterator[Product2[K, C]])] 
+        功能: 按照分区进行聚合,给定@data 假定是按照分区id进行排序的.将分区下所有kv对组成一个子迭代器
+        val buffered = data.buffered
+        // 创建所有分区的聚合迭代器
+        (0 until numPartitions).iterator.map(p => (p, new IteratorForPartition(p, buffered)))
+        
+        def merge(spills: Seq[SpilledFile], inMemory: Iterator[((Int, K), C)])
+          : Iterator[(Int, Iterator[Product2[K, C]])]
+        功能: 合并排序完毕文件,既可以写出新文件,也可以返回数据给用户
+        	返回的数据是所有已经写出的对象,按照分区分组.每个分区有其迭代器,需要顺序读取(不支持随机存取).
+        输入参数:
+        	spilled	已经排序好的溢写文件
+        	inMemory	内存数据迭代器
+        1. 获取溢写读取器列表和内存数据缓冲区
+        val readers = spills.map(new SpillReader(_))
+        val inMemBuffered = inMemory.buffered
+        2. 每个分区将内存数据域溢写数据进行归并操作
+        (0 until numPartitions).iterator.map { p =>
+            // 获取内存数据在本分区上的迭代器
+          val inMemIterator = new IteratorForPartition(p, inMemBuffered)
+            // 获取归并后的迭代器
+          val iterators = readers.map(_.readNextPartition()) ++ Seq(inMemIterator) 
+          if (aggregator.isDefined) { // 运行归并则进行聚合归并
+            (p, mergeWithAggregation(
+              iterators, aggregator.get.mergeCombiners, keyComparator, ordering.isDefined))
+          } else if (ordering.isDefined) {// 定义排序则排序
+            (p, mergeSort(iterators, ordering.get))
+          } else { //其余情况正常输出,按照k-->seq形式输出
+            (p, iterators.iterator.flatten)
+          }
+        }
+        
+        def mergeSort(iterators: Seq[Iterator[Product2[K, C]]], comparator: Comparator[K])
+          : Iterator[Product2[K, C]]
+        功能: 归并排序(使用指定的排序器@comparator 对key进行排序),返回一个排序完成的迭代器
+        1. 获取迭代器缓冲
+        val bufferedIters = iterators.filter(_.hasNext).map(_.buffered)
+        2. 设置小顶堆用于排序
+        heap = new mutable.PriorityQueue[Iter]()(
+          (x: Iter, y: Iter) => comparator.compare(y.head._1, x.head._1))
+        3. 数据入堆(进行堆排序)
+        heap.enqueue(bufferedIters: _*)
+        4. 返回迭代器
+        val= new Iterator[Product2[K, C]] {
+          override def hasNext: Boolean = heap.nonEmpty
+          override def next(): Product2[K, C] = {
+            if (!hasNext) {
+              throw new NoSuchElementException
+            }
+            val firstBuf = heap.dequeue()
+            val firstPair = firstBuf.next()
+            if (firstBuf.hasNext) {
+              heap.enqueue(firstBuf)
+            }
+            firstPair
+          }
+        }
+        
+        def mergeWithAggregation(
+          iterators: Seq[Iterator[Product2[K, C]]],
+          mergeCombiners: (C, C) => C,
+          comparator: Comparator[K],
+          totalOrder: Boolean)
+          : Iterator[Product2[K, C]]
+        功能: 合并并聚合
+        通过聚合key值进行合并,假定所有迭代器的key都是按照比较器@comparator 进行排序.如果比较器不是全局有序,我们依旧需要合并它们.通过所有key做相等测试.
+        1. 非全局排序(这种情况只有局部排序结果)
+         val it = new Iterator[Iterator[Product2[K, C]]] {
+            val sorted = mergeSort(iterators, comparator).buffered
+            val keys = new ArrayBuffer[K]
+            val combiners = new ArrayBuffer[C]
+            override def hasNext: Boolean = sorted.hasNext
+            override def next(): Iterator[Product2[K, C]] = {
+              if (!hasNext) {
+                throw new NoSuchElementException
+              }
+              keys.clear()
+              combiners.clear()
+              val firstPair = sorted.next()
+              keys += firstPair._1
+              combiners += firstPair._2
+              val key = firstPair._1
+              while (sorted.hasNext && comparator.compare(sorted.head._1, key) == 0) {
+                val pair = sorted.next()
+                var i = 0
+                var foundKey = false
+                while (i < keys.size && !foundKey) {
+                  if (keys(i) == pair._1) {
+                    combiners(i) = mergeCombiners(combiners(i), pair._2)
+                    foundKey = true
+                  }
+                  i += 1
+                }
+                if (!foundKey) {
+                  keys += pair._1
+                  combiners += pair._2
+                }
+              }
+              keys.iterator.zip(combiners.iterator)
+            }
+          }
+        val= it.flatten
+        2. 全局排序
+        val= new Iterator[Product2[K, C]] {
+            val sorted = mergeSort(iterators, comparator).buffered
+            override def hasNext: Boolean = sorted.hasNext
+            override def next(): Product2[K, C] = {
+              if (!hasNext) {
+                throw new NoSuchElementException
+              }
+              val elem = sorted.next()
+              val k = elem._1
+              var c = elem._2
+              while (sorted.hasNext && sorted.head._1 == k) {
+                val pair = sorted.next()
+                c = mergeCombiners(c, pair._2)
+              }
+              (k, c)
+            }
+          }
+        
+    }
+    ```
+    
+    ```scala
+    private[this] class IteratorForPartition(partitionId: Int, data: BufferedIterator[((Int, K), C)])
+    extends Iterator[Product2[K, C]]{
+        介绍: 这个迭代器只通过底层缓冲流读取指定分区号的数据,假定分区是下一个读取的数据.使用它可以简单的获取内存中下一个分区迭代器.
+        构造器参数:
+        partitionId	分区编号
+        data	缓冲迭代器
+        操作集:
+        def hasNext: Boolean = data.hasNext && data.head._1._1 == partitionId
+        功能: 确认存在下一条数据
+        
+        def next(): Product2[K, C]
+        功能: 获取下一个迭代器
+        if (!hasNext) {
+            throw new NoSuchElementException
+          }
+        val elem = data.next()
+        val= (elem._1._2, elem._2)
+    }
+    ```
+    
+    ```scala
+    private[this] class SpillableIterator(var upstream: Iterator[((Int, K), C)])
+    extends Iterator[((Int, K), C)]{
+        属性:
+        #name @SPILL_LOCK = new Object()	溢写控制锁
+        #name @nextUpstream: Iterator[((Int, K), C)] = null 下一个上游迭代器
+        #name @cur: ((Int, K), C) = readNext()	当前迭代器
+        #name @hasSpilled: Boolean = false	是否溢写标志
+        操作集:
+        def hasNext(): Boolean = cur != null
+        功能: 确认之后是否存在迭代器
+        
+        def next(): ((Int, K), C) 
+        功能: 获取当前迭代器,并移动迭代器指针
+        val r = cur
+        cur = readNext()
+        val= r
+        
+        def readNext(): ((Int, K), C)
+        功能: 读取上游迭代器内容
+        val= SPILL_LOCK.synchronized {
+          if (nextUpstream != null) {
+            upstream = nextUpstream
+            nextUpstream = null
+          }
+          if (upstream.hasNext) {
+            upstream.next()
+          } else {
+            null
+          }
+        }
+        
+        def spill(): Boolean
+        功能: 溢写上游迭代器
+        操作条件: 当前没有发送溢写
+        if (hasSpilled) {
+            false
+          } else {
+            val inMemoryIterator = new WritablePartitionedIterator {
+                // 迭代器指针
+              private[this] var cur = if (upstream.hasNext) upstream.next() else null
+    			// 写出一条kv数据,并移动迭代器指针
+              def writeNext(writer: PairsWriter): Unit = {
+                writer.write(cur._1._2, cur._2)
+                cur = if (upstream.hasNext) upstream.next() else null
+              }
+    			// 判断是否到达迭代器末尾
+              def hasNext(): Boolean = cur != null
+    			// 获取下一个分区
+              def nextPartition(): Int = cur._1._1
+            }
+            logInfo(s"Task ${TaskContext.get().taskAttemptId} force spilling in-memory map to disk " +
+              s"and it will release ${org.apache.spark.util.Utils.bytesToString(getUsed())} memory")
+            val spillFile = spillMemoryIteratorToDisk(inMemoryIterator) // 获取溢写文件
+            forceSpillFiles += spillFile // 将溢写文件添加到强行溢写列表中
+            val spillReader = new SpillReader(spillFile)
+            // 读取上游迭代器
+            nextUpstream = (0 until numPartitions).iterator.flatMap { p =>
+              val iterator = spillReader.readNextPartition()
+              iterator.map(cur => ((p, cur._1), cur._2))
+            }
+            hasSpilled = true // 设置溢写标志
+            true
+          }
+    }
+    ```
+    
+    ```scala
+    private[this] class SpillReader(spill: SpilledFile) {
+        介绍: 读取经过分区的溢写文件的内部类,所有分区按照顺序请求
+        属性:
+        #name @batchOffsets = spill.serializerBatchSizes.scanLeft(0L)(_ + _)	批量偏移值
+        #name @partitionId = 0	分区编号
+        #name @indexInPartition = 0L	分区内索引
+        #name @batchId = 0	批次编号
+        #name @indexInBatch = 0	批次内编号
+        #name @lastPartitionId = 0 最后一个分区编号
+        #name @fileStream: FileInputStream = null	文件输入流
+        #name @deserializeStream = nextBatchStream()	反序列化
+        #name @nextItem: (K, C) = null	下一个kv对
+        #name @finished = false	读取完成标志
+        #name @nextPartitionToRead = 0	下一个读取分区指针
+        操作集:
+        def cleanup(): Unit 
+        功能: 清除工作
+        batchId = batchOffsets.length  // 获取批次编号,防止读取其他批次数据
+        val ds = deserializeStream
+        // 重置输入流
+        deserializeStream = null 
+        fileStream = null
+        if (ds != null) { // 关闭序列化流
+            ds.close()
+        }
+        
+        def readNextPartition(): Iterator[Product2[K, C]]
+        功能: 获取下一个分区迭代器
+        val= new Iterator[Product2[K, C]] {
+          val myPartition = nextPartitionToRead
+          nextPartitionToRead += 1
+          override def hasNext: Boolean = {
+            if (nextItem == null) {
+              nextItem = readNextItem()
+              if (nextItem == null) {
+                return false
+              }
+            }
+            assert(lastPartitionId >= myPartition)
+            lastPartitionId == myPartition
+          }
+          override def next(): Product2[K, C] = {
+            if (!hasNext) {
+              throw new NoSuchElementException
+            }
+            val item = nextItem
+            nextItem = null
+            item
+          }
+        }
+        
+        def skipToNextPartition(): Unit
+        功能: 跳到下一个分区,如果到达分区的末尾则更新分区编号
+        while (partitionId < numPartitions &&
+              indexInPartition == spill.elementsPerPartition(partitionId)) { // 到达分区末尾
+            partitionId += 1 // 跳到下一个分区
+            indexInPartition = 0L
+        }
+        
+        def readNextItem(): (K, C)
+        功能: 读取下一个kv对
+        操作条件: 读取器运行中,且反序列化流可以使用
+        if (finished || deserializeStream == null) {
+            return null
+        }
+        1. 读取kv对
+        val k = deserializeStream.readKey().asInstanceOf[K]
+        val c = deserializeStream.readValue().asInstanceOf[C]
+        lastPartitionId = partitionId
+        2. 如果处理完这个批次的数据,则开始读取下一个批次数据
+        indexInBatch += 1
+        if (indexInBatch == serializerBatchSize) {// 读取下一个批次的数据
+            indexInBatch = 0
+            deserializeStream = nextBatchStream()
+        }
+        3. 更新分区指针
+        indexInPartition += 1
+        skipToNextPartition()
+        4. 处理可能发生的读取结束问题
+        if (partitionId == numPartitions) {
+            finished = true
+            if (deserializeStream != null) {
+              deserializeStream.close()
+            }
+          }
+        val= (k,c)
+        
+        def nextBatchStream(): DeserializationStream
+        功能: 获取下一个批次的反序列化流
+        if (batchId < batchOffsets.length - 1) {
+            if (deserializeStream != null) { // 关闭反序列化流
+              deserializeStream.close()
+              fileStream.close()
+              deserializeStream = null
+              fileStream = null
+            }
+            // 使用文件输入流读取当前批次数据
+            val start = batchOffsets(batchId)
+            fileStream = new FileInputStream(spill.file)
+            fileStream.getChannel.position(start)
+            // 移动批次指针
+            batchId += 1
+            // 获取下一个偏移量位置
+            val end = batchOffsets(batchId)
+            // 数据合法性断言
+            assert(end >= start, "start = " + start + ", end = " + end +
+              ", batchOffsets = " + batchOffsets.mkString("[", ", ", "]"))
+            // 获取反序列化流
+            val bufferedStream = new BufferedInputStream(ByteStreams.limit(fileStream, end - start))
+            val wrappedStream = serializerManager.wrapStream(spill.blockId, bufferedStream)
+            val= serInstance.deserializeStream(wrappedStream)
+          } else {// 所有批次读取结束,直接关闭读取
+            cleanup()
+            null
+          }
+    }
+    ```
     
     #### MedianHeap
     
     ```markdown
     介绍:
     	中值堆设计用户快速定位一组数据的中位数(可能有重复元素).插入一个新值需要时间复杂度为O(log n),查找中位数的时间复杂度为O(1).
-    基本方法就是维护两个堆,一个小顶堆和一个大顶堆.当一个元素插入时,小顶堆和大顶堆需要重新调整,以至于它们的大小差距不会超过1.因此每次当执行@findMedian 调用时如果检测到两个堆大小相同.如果确实如此,获取两个堆的堆顶的平均数.否则返回较多元素的堆顶.
+    	基本方法就是维护两个堆,一个小顶堆和一个大顶堆.当一个元素插入时,小顶堆和大顶堆需要重新调整,以至于它们的大小差距不会超过1.因此每次当执行@findMedian 调用时如果检测到两个堆大小相同.如果确实如此,获取两个堆的堆顶的平均数.否则返回较多元素的堆顶.
     ```
     
     ```scala
@@ -2741,9 +4157,10 @@ private[spark] class GapSamplingReplacement(val f: Double,
 private[spark] object SamplingUtils {
        
    }
+   ```
 ```
    
-```scala
+​```scala
    private[spark] object PoissonBounds {
        介绍: 泊松分布界限类
        操作集:
@@ -2765,7 +4182,7 @@ private[spark] object SamplingUtils {
        }
    }
 ```
-   
+
    ```scala
    private[spark] object BinomialBounds {
    	介绍: 伯努利界限类
@@ -2784,8 +4201,8 @@ private[spark] object SamplingUtils {
        math.min(1,math.max(minSamplingRate, 
           fraction + gamma + math.sqrt(gamma * gamma + 2 * gamma * fraction)))
    }
-```
-   
+   ```
+
    ```scala
    private[spark] object SamplingUtils {
        def reservoirSampleAndCount[T: ClassTag](input: Iterator[T],k: Int,
@@ -2836,12 +4253,12 @@ private[spark] object SamplingUtils {
          BinomialBounds.getUpperBound(1e-4, total, fraction)
        }
    }
-```
-   
+   ```
+
 #### StratifiedSamplingUtils
-   
+
 分层采样工具
-   
+
    ```markdown
    介绍:
    	在pair RDD函数中@PairRDDFunctions 用作辅助函数和数据结构
@@ -2851,8 +4268,8 @@ private[spark] object SamplingUtils {
    	其中s为需要的采样规模大小,因此通过维护一个空间复杂度为O(sqrt(s)) 的等待列表,通过添加等待列表的部分内容到达立即接受集合中,实现创建指定大小的采样器.
    	通过对等待列表的值进行排序且获取处于位置为(s-numAccepted)的值作为容量精确值(等待列表容量).
    	注意到,当计算容量和实际采样值的时候,使用的是RNG的同一个种子,所以计算的容量保证了会生成需要的采样大小.
-```
-   
+   ```
+
    ```scala
    private[spark] object StratifiedSamplingUtils extends Logging {
        介绍: 分层采用工具类
@@ -3071,8 +4488,8 @@ private[spark] object SamplingUtils {
            }
          }
    }
-```
-   
+   ```
+
    ```scala
    private class RandomDataGenerator {
        介绍: 随机数生成器,既可以生成统一型随机变量,也可以生成泊松随机变量
@@ -3096,8 +4513,8 @@ private[spark] object SamplingUtils {
        功能: 获取统一性随机变量
        val= uniform.nextDouble()
    }
-```
-   
+   ```
+
    ```scala
    private[random] class AcceptanceResult(var numItems: Long = 0L, var numAccepted: Long = 0L)
      extends Serializable{
@@ -3118,10 +4535,10 @@ private[spark] object SamplingUtils {
              numItems += other.get.numItems
            }
    }
-```
-   
+   ```
+
 #### XORShiftRandom
-   
+
    ```scala
    private[spark] class XORShiftRandom(init: Long) extends JavaRandom(init) {
        构造器属性:
@@ -3143,8 +4560,8 @@ private[spark] object SamplingUtils {
        功能: 设置种子信息
        seed = XORShiftRandom.hashSeed(s)
    }
-```
-   
+   ```
+
    ```scala
    private[spark] object XORShiftRandom {
        介绍: 运行RNG的基准
@@ -3156,10 +4573,10 @@ private[spark] object SamplingUtils {
        val highBits = MurmurHash3.bytesHash(bytes, lowBits)
        (highBits.toLong << 32) | (lowBits.toLong & 0xFFFFFFFFL)
    }
-```
-   
+   ```
+
 #### 基础拓展
-   
+
    1. 伯努利分布 :  [伯努利分布](https://zh.wikipedia.org/wiki/伯努利分布)
    
    2. 泊松分布: http://en.wikipedia.org/wiki/Poisson_distribution
