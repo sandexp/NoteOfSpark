@@ -486,6 +486,270 @@ class PartitionGroup(val prefLoc: Option[String] = None) {
 
 #### CoalescedRDD
 
+```scala
+private[spark] case class CoalescedRDDPartition(
+    index: Int,
+    @transient rdd: RDD[_],
+    parentsIndices: Array[Int],
+    @transient preferredLocation: Option[String] = None) extends Partition {
+  	介绍: 通过追踪父分区来捕捉合并RDD 
+    构造器参数:
+        index	合并的分区
+        rdd	属于的RDD
+        parentsIndices	被合并到这个分区的父分区列表
+        preferredLocation	最佳位置
+    属性:
+    #name @parents: Seq[Partition] = parentsIndices.map(rdd.partitions(_))	分区列表
+    操作集:
+    @throws(classOf[IOException])
+    private def writeObject(oos: ObjectOutputStream): Unit 
+    功能: 写出默认属性
+    
+    def localFraction: Double
+    功能: 计算包含最佳位置的父分区的部分
+    1. 计算父分区中包含最佳位置的分区数目
+    val loc = parents.count { p =>
+      val parentPreferredLocations = rdd.context.getPreferredLocs(rdd, p.index).map(_.host)
+      preferredLocation.exists(parentPreferredLocations.contains)
+    }
+    2. 计算占有比例
+    if (parents.isEmpty) 0.0 else loc.toDouble / parents.size.toDouble
+}
+```
+
+```scala
+private[spark] class CoalescedRDD[T: ClassTag](
+    @transient var prev: RDD[T],
+    maxPartitions: Int,
+    partitionCoalescer: Option[PartitionCoalescer] = None)
+extends RDD[T](prev.context, Nil) { 
+	介绍: 代表合并的RDD,可能比父RDD的分区少.这个类使用@PartitionCoalescer 分区合并器去找到好的父RDD分区,以便于新的分区大致于父分区一致.每个分区的最佳位置会于父分区的最佳位置重叠.
+    构造器:
+    	prev	需要合并的RDD
+    	maxPartitions	最大分区数(合并后,正整数)
+    	partitionCoalescer	分区合并器@PartitionCoalescer
+    参数断言:
+   	require(maxPartitions > 0 || maxPartitions == prev.partitions.length,
+    s"Number of partitions ($maxPartitions) must be positive.")
+    功能: 最大分区数断言
+    
+    if (partitionCoalescer.isDefined) {
+        require(partitionCoalescer.get.isInstanceOf[Serializable],
+          "The partition coalescer passed in must be serializable.")
+      }
+    功能: 分区合并器序列化断言
+    
+    操作集:
+    def getPartitions: Array[Partition] 
+    功能: 获取分区列表
+    1. 获取分区合并器
+    val pc = partitionCoalescer.getOrElse(new DefaultPartitionCoalescer())
+    2. 合并分区
+    pc.coalesce(maxPartitions, prev).zipWithIndex.map {
+      case (pg, i) =>
+        val ids = pg.partitions.map(_.index).toArray
+        CoalescedRDDPartition(i, prev, ids, pg.prefLoc)
+    }
+    
+    def compute(partition: Partition, context: TaskContext): Iterator[T] 
+    功能: 计算分区值
+    val= partition.asInstanceOf[CoalescedRDDPartition].parents.iterator.flatMap { parentPartition =>
+      firstParent[T].iterator(parentPartition, context)
+    }
+    
+    def clearDependencies(): Unit
+    功能: 清除依赖
+    super.clearDependencies()
+    prev = null
+    
+    def getDependencies: Seq[Dependency[_]]
+    功能: 获取依赖列表(窄依赖)
+    val= Seq(new NarrowDependency(prev) {
+      def getParents(id: Int): Seq[Int] =
+        partitions(id).asInstanceOf[CoalescedRDDPartition].parentsIndices
+    })
+    
+    def getPreferredLocations(partition: Partition): Seq[String]
+    功能: 获取指定分区最佳位置
+    val= partition.asInstanceOf[CoalescedRDDPartition].preferredLocation.toSeq
+}
+```
+
+```markdown
+介绍:
+	合并父RDD的分区,使得分区更少,每个分区都要计算一个或者多个父类RDD.这个操作对于父类RDD比较多的分区,需要过滤出小的RDD.避免产生大量小任务(因为产生了多个文件的目录).如果父类中没有包含本地化信息(最佳位置),合并操作非常简单,合并列表中相邻的分区即可.但是如果包含本地化信息,需要按照如下四个目标对其进行打包.
+	1. 平衡分组,使得与父RDD含有差不多大小的分区数量
+	2. 每个分区获取本地化信息(找到分区最佳位置)
+	3. 高效 对于n个分区使用时间复杂度为O(n)的算法(类似于NP-hard)
+	4. 平衡最佳位置(避免多个分区选择同一个位置)
+	此外假定父RDD含有的分区数量比合并后的多.
+	算法指定了每个分区的最佳位置.如果合并后的分区数量大于最佳位置数量,需要获取最佳位置副本.使用收集器估量来决定(时间复杂度2n log n).负载均衡使用平方随机化的处理方式.也是尝试获取本地化信息.这个操作允许使用松弛技术,(平衡松弛,1.0是全部本地化,0是在两个箱子之间全部平衡).从平衡的角度来看,两个箱子处于松弛操作中,算法会通过本地化信息指定分区.
+```
+
+```scala
+private class DefaultPartitionCoalescer(val balanceSlack: Double = 0.10)
+extends PartitionCoalescer {
+   	构造器属性:
+    	balanceSlack	平衡松弛度
+    属性:
+    #name @rnd = new scala.util.Random(7919)	随机值
+    #name @groupArr = ArrayBuffer[PartitionGroup]()	合并分区组列表
+    #name @groupHash = mutable.Map[String, ArrayBuffer[PartitionGroup]]() 组hash(检查机器是否存在组里)
+    #name @initialHash = mutable.Set[Partition]()	初始hash(首个最大分区数hash)
+    #name @noLocality = true	是否存在父RDD的最佳位置
+    操作集:
+    def currPrefLocs(part: Partition, prev: RDD[_]): Seq[String]
+    功能: 获取当前分区的最佳位置列表(来自于DAG图)
+    val= prev.context.getPreferredLocs(prev, part.index).map(tl => tl.host)
+    
+    def getLeastGroupHash(key: String): Option[PartitionGroup]
+    功能: 获取列表中名称为@key 最少元素的分区组
+    val= groupHash.get(key).filter(_.nonEmpty).map(_.min)
+    
+    def addPartToPGroup(part: Partition, pgroup: PartitionGroup): Boolean
+    功能: 添加分区到分区组,添加成功(之前没有这个分区)返回false
+    if (!initialHash.contains(part)) {
+      pgroup.partitions += part         
+      initialHash += part
+      true
+    } else { false }
+    
+    def getPartitions: Array[PartitionGroup] = groupArr.filter( pg => pg.numPartitions > 0).toArray
+    功能: 获取分区列表
+    
+    def setupGroups(targetLen: Int, partitionLocs: PartitionLocations): Unit
+    功能: 初始化指定长度的分区组,如果开启使用最佳位置,每个组都会分配一个最佳位置,使用收集器去估量需要多少个最佳位置.必须要循环执行,直到找到大多数最佳位置,时间复杂度O(2n log n)
+    0. 处理空值情况,直接创建一个没有最佳位置的分区组即可
+    if (partitionLocs.partsWithLocs.isEmpty) {
+      (1 to targetLen).foreach(_ => groupArr += new PartitionGroup())
+      return
+    }
+    1. 计算需要进行的迭代次数,以至于可以找到大多数分区组
+    noLocality = false
+    val expectedCoupons2 = 2 * (math.log(targetLen)*targetLen + targetLen + 0.5).toInt
+    var numCreated = 0
+    var tries = 0
+    2. 循环直到targetLen unique/distinct个最佳位置创建完成或者遍历完所有分区,或者找到所有的最佳位置
+    // 确定需要查找的分区数量
+    val numPartsToLookAt = math.min(expectedCoupons2, partitionLocs.partsWithLocs.length)
+    while (numCreated < targetLen && tries < numPartsToLookAt) { 
+        // 遍历直到创建所有分区的最佳位置,或者找遍所有最佳位置
+      val (nxt_replica, nxt_part) = partitionLocs.partsWithLocs(tries) // 获取分区位置对
+      tries += 1
+      if (!groupHash.contains(nxt_replica)) { // 创建分区组
+        val pgroup = new PartitionGroup(Some(nxt_replica))
+        groupArr += pgroup
+        addPartToPGroup(nxt_part, pgroup)
+        groupHash.put(nxt_replica, ArrayBuffer(pgroup)) // list in case we have multiple
+        numCreated += 1
+      }
+    }
+    3. 没有创建足够的分区组,需要复制(随机取值复制)
+    while (numCreated < targetLen) {
+      val (nxt_replica, nxt_part) = partitionLocs.partsWithLocs(
+        rnd.nextInt(partitionLocs.partsWithLocs.length))
+      val pgroup = new PartitionGroup(Some(nxt_replica))
+      groupArr += pgroup
+      groupHash.getOrElseUpdate(nxt_replica, ArrayBuffer()) += pgroup
+      addPartToPGroup(nxt_part, pgroup)
+      numCreated += 1
+    }
+    
+    def pickBin(
+      p: Partition,
+      prev: RDD[_],
+      balanceSlack: Double,
+      partitionLocs: PartitionLocations): PartitionGroup
+    功能: 获取父RDD的分区,决定放到哪个分区组,考虑的本地化的情况,使用平方选取去进行负载均衡.使用平衡松弛度变量,进行平衡.
+    输入: 
+    	p	分区	
+    	prev	父RDD
+    	balanceSlack	平衡松弛度
+    	partitionLocs	最佳位置
+    1. 获取松弛度
+    val slack = (balanceSlack * prev.partitions.length).toInt
+    2. 拿取最少元素的分区组
+    val pref = currPrefLocs(p, prev).flatMap(getLeastGroupHash)
+    val prefPart = if (pref.isEmpty) None else Some(pref.min)
+    3. 随机出两个值,并去取两个数的最小分区组
+    val minPowerOfTwo = {
+      if (groupArr(r1).numPartitions < groupArr(r2).numPartitions) {
+        groupArr(r1)
+      }
+      else {
+        groupArr(r2)
+      }
+    }
+    4. 处理特殊情况
+    if (prefPart.isEmpty) {
+      return minPowerOfTwo
+    }
+    5. 根据是否本地化获取需要存储的分区组
+    val prefPartActual = prefPart.get
+    if (minPowerOfTwo.numPartitions + slack <= prefPartActual.numPartitions) {
+      minPowerOfTwo  // prefer balance over locality
+    } else {
+      prefPartActual // prefer locality over balance
+    }
+    
+    def throwBalls(
+      maxPartitions: Int,
+      prev: RDD[_],
+      balanceSlack: Double, partitionLocs: PartitionLocations): Unit
+    功能: 将父RDD的分区存放到分区组中
+    1. 处理非本地化,JUMP2 ,否则JUMP 3
+    2. 处理非本地化的放入操作,不需要进行随机化
+    if (maxPartitions > groupArr.size) { // 父RDD分区足够多,直接存放的分区组中
+        for ((p, i) <- prev.partitions.zipWithIndex) {
+          groupArr(i).partitions += p
+        }
+      } else { // 父RDD分区数量小,对于每个分区组,添加指定范围内部分区
+        for (i <- 0 until maxPartitions) {
+          val rangeStart = ((i.toLong * prev.partitions.length) / maxPartitions).toInt
+          val rangeEnd = (((i.toLong + 1) * prev.partitions.length) / maxPartitions).toInt
+          (rangeStart until rangeEnd).foreach{ j => groupArr(i).partitions += prev.partitions(j) }
+        }
+      }
+    3. 本地化处理 ,如果每个分区组没有指定分区,首先就需要填充带有最佳位置的分区
+    val partIter = partitionLocs.partsWithLocs.iterator
+      groupArr.filter(pg => pg.numPartitions == 0).foreach { pg =>
+        while (partIter.hasNext && pg.numPartitions == 0) {
+          var (_, nxt_part) = partIter.next()
+          if (!initialHash.contains(nxt_part)) {
+            pg.partitions += nxt_part
+            initialHash += nxt_part
+          }
+        }
+      }
+    4. 如果在分区组里找不到含有最佳位置信息的分区信息,则填充不含有最佳信息的分区
+    val partNoLocIter = partitionLocs.partsWithoutLocs.iterator
+      groupArr.filter(pg => pg.numPartitions == 0).foreach { pg =>
+        while (partNoLocIter.hasNext && pg.numPartitions == 0) {
+          val nxt_part = partNoLocIter.next()
+          if (!initialHash.contains(nxt_part)) {
+            pg.partitions += nxt_part
+            initialHash += nxt_part
+          }
+        }
+      }
+    5. 获取父RDD其他分区的分区组
+    for (p <- prev.partitions if (!initialHash.contains(p))) { // throw every partition into group
+        pickBin(p, prev, balanceSlack, partitionLocs).partitions += p
+      }
+    
+    def coalesce(maxPartitions: Int, prev: RDD[_]): Array[PartitionGroup]
+    功能: 聚合函数
+    1. 获取最佳位置信息
+    val partitionLocs = new PartitionLocations(prev)
+    2. 创建分区组(箱子)
+    setupGroups(math.min(prev.partitions.length, maxPartitions), partitionLocs)
+    3. 将分区指定到分区组中(扔球)
+    throwBalls(maxPartitions, prev, balanceSlack, partitionLocs)
+    4. 获取分区信息
+    val= getPartitions
+}
+```
+
 #### CoGroupedRDD
 
 ```scala
@@ -890,9 +1154,7 @@ private[spark] class JdbcPartition(idx: Int, val lower: Long, val upper: Long) e
 	getConnection	获取连接函数,RDD需要注意对链接的拆除
 	sql	sql执行内容
     注意: 查询必须包含两个占位符例如:
-    ```sql
     	select title, author from books where ? <= id and id <= ?
-    ```
 	lowerBound	第一个占位符的下限值
 	upperBound	第二个占位符的上限值
 	numPartitions	分区数量
@@ -943,10 +1205,10 @@ extends RDD[T](sc, Nil) with Logging {
       } catch {
         case e: Exception => logWarning("Exception closing connection", e)
       }
-
-	def getNext(): T 
-	功能: 获取记录值,并移动迭代器指针
-	if (rs.next()) {
+    
+    def getNext(): T 
+    功能: 获取记录值,并移动迭代器指针
+    if (rs.next()) {
         mapRow(rs)
       } else {
         finished = true
@@ -982,7 +1244,7 @@ object JdbcRDD {
     def resultSetToObjectArray(rs: ResultSet): Array[Object]
     功能: 将结果集转化为对象数组
     val= Array.tabulate[Object](rs.getMetaData.getColumnCount)(i => rs.getObject(i + 1))
-    
+
     def create[T](
       sc: JavaSparkContext,
       connectionFactory: ConnectionFactory,
@@ -1150,6 +1412,82 @@ extends RDD[U](prev) {
 ```
 
 #### NewHadoopRDD
+
+```scala
+@DeveloperApi
+class NewHadoopRDD[K, V](
+    sc : SparkContext,
+    inputFormatClass: Class[_ <: InputFormat[K, V]],
+    keyClass: Class[K],
+    valueClass: Class[V],
+    @transient private val _conf: Configuration)
+extends RDD[(K, V)](sc, Nil) with Logging {
+    介绍: 这个RDD提供了核心的基本功能,用于读取存储在hadoop中的数据(HDFS,HBase,S3),使用的是MR的API.
+    不建议对这个类进行实例化,请使用@org.apache.spark.SparkContext.newAPIHadoopRDD() 构建
+    #name @sc.broadcast(new SerializableConfiguration(_conf))	hadoop配置广播变量
+    #name @jobTrackerId: String	任务追踪ID
+    val= {
+        val formatter = new SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
+        formatter.format(new Date())
+      }
+    #name @jobId = new JobID(jobTrackerId, id)	jobID
+    #name @shouldCloneJobConf	是否需要拷贝JobConf
+    #name @ignoreCorruptFiles=sparkContext.conf.get(IGNORE_CORRUPT_FILES)	是否回来不可使用的文件
+    #name @ignoreMissingFiles = sparkContext.conf.get(IGNORE_MISSING_FILES)	是否忽略遗失文件
+    #name @ignoreEmptySplits = sparkContext.conf.get(HADOOP_RDD_IGNORE_EMPTY_SPLITS) 是否忽略空文件
+    操作集:
+    def getConf: Configuration
+    功能: 获取配置文件
+    
+    def compute(theSplit: Partition, context: TaskContext): InterruptibleIterator[(K, V)]
+    功能: 计算分区数据
+    
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    
+    def getPreferredLocations(hsplit: Partition): Seq[String]
+    功能: 获取最优位置
+    
+    def mapPartitionsWithInputSplit[U: ClassTag](
+      f: (InputSplit, Iterator[(K, V)]) => Iterator[U],
+      preservesPartitioning: Boolean = false): RDD[U]
+    功能: 映射分区
+    val= new NewHadoopMapPartitionsWithSplitRDD(this, f, preservesPartitioning)
+    
+    def persist(storageLevel: StorageLevel): this.type
+    功能: 持久化
+    if (storageLevel.deserialized) {
+      logWarning("Caching NewHadoopRDDs as deserialized objects usually leads to undesired" +
+        " behavior because Hadoop's RecordReader reuses the same Writable object for all records." +
+        " Use a map transformation to make copies of the records.")
+    }
+    val= super.persist(storageLevel)
+}
+```
+
+```scala
+private[spark] object NewHadoopRDD {
+    属性：
+    #name @CONFIGURATION_INSTANTIATION_LOCK = new Object() 配置实例化锁
+    内部类:
+    private[spark] class NewHadoopMapPartitionsWithSplitRDD[U: ClassTag, T: ClassTag](
+      prev: RDD[T],
+      f: (InputSplit, Iterator[T]) => Iterator[U],
+      preservesPartitioning: Boolean = false)
+    extends RDD[U](prev) {
+        介绍： 类似@MapPartitionsRDD 只不过转换函数输入的是@InputSplit
+       	操作集:
+        def getPartitions: Array[Partition] = firstParent[T].partitions
+        功能: 获取分区列表
+        
+        def compute(split: Partition, context: TaskContext): Iterator[U]
+        功能: 计算分区数据
+        val partition = split.asInstanceOf[NewHadoopPartition]
+        val inputSplit = partition.serializableHadoopSplit.value
+        val= f(inputSplit, firstParent[T].iterator(split, context))
+    }
+}
+```
 
 #### OrderedRDDFunctions
 
@@ -1542,6 +1880,183 @@ extends RDD[U](prev) {
 
 #### PipedRDD
 
+```scala
+private[spark] class PipedRDD[T: ClassTag](
+    prev: RDD[T],
+    command: Seq[String],
+    envVars: Map[String, String],
+    printPipeContext: (String => Unit) => Unit,
+    printRDDElement: (T, String => Unit) => Unit,
+    separateWorkingDir: Boolean,
+    bufferSize: Int,
+    encoding: String)
+extends RDD[String](prev) {
+    介绍: 这个RDD管道传输父RDD的分区通过外部指令@command 并返回一个串的集合作为输出.
+    操作集:
+    def getPartitions: Array[Partition] = firstParent[T].partitions
+    功能: 获取分区列表
+    
+    def cleanup(): Unit
+    功能: 清理任务的工作目录(使用完的)
+    if (workInTaskDirectory) {
+        scala.util.control.Exception.ignoring(classOf[IOException]) {
+            Utils.deleteRecursively(new File(taskDirectory))
+        }
+        logDebug(s"Removed task working directory $taskDirectory")
+    }
+    
+    def propagateChildException(): Unit
+    功能: 传递子RDD异常
+    1. 获取子类异常
+    val t = childThreadException.get()
+    2. 销毁进程并情况工作目录
+    if (t != null) {
+        val commandRan = command.mkString(" ")
+        logError(s"Caught exception while running pipe() operator. Command ran: $commandRan. " +
+                 s"Exception: ${t.getMessage}")
+        proc.destroy()
+        cleanup()
+        throw t
+    }
+    
+    def next(): String 
+    功能: 获取当前数据字符串
+    if (!hasNext()) {
+        throw new NoSuchElementException()
+    }
+    val= lines.next()
+    
+    def hasNext(): Boolean 
+    功能: 确认是否包含下一个元素
+    val result = if (lines.hasNext) {
+        true
+    } else {
+        val exitStatus = proc.waitFor()
+        cleanup()
+        if (exitStatus != 0) {
+            throw new IllegalStateException(s"Subprocess exited with status $exitStatus. " +
+                                            s"Command ran: " + command.mkString(" "))
+        }
+        false
+    }
+    propagateChildException()
+    val= result
+    
+    def compute(split: Partition, context: TaskContext): Iterator[String]
+    功能: 计算指定分区数据
+    1. 获取指令@command 进程以及对应的参数
+    val pb = new ProcessBuilder(command.asJava) // 获取进程
+    val currentEnvVars = pb.environment() // 获取进程环境变量
+    envVars.foreach { case (variable, value) => currentEnvVars.put(variable, value) }// 置入设置的环境变量
+    if (split.isInstanceOf[HadoopPartition]) { // 如果是hadoop环境变量,则载入
+      val hadoopSplit = split.asInstanceOf[HadoopPartition]
+      currentEnvVars.putAll(hadoopSplit.getPipeEnvVars().asJava)
+    }
+    2. 任务目录处理相关
+    val taskDirectory = "tasks" + File.separator + java.util.UUID.randomUUID.toString // 任务目录
+    var workInTaskDirectory = false // 是否工作于任务目录中
+    3. 进行可能的工作目录分割
+    val currentDir = new File(".")
+    val taskDirFile = new File(taskDirectory) // 创建任务目录
+    taskDirFile.mkdirs()
+    try {
+        val tasksDirFilter = new NotEqualsFileNameFilter("tasks") // 设置任务目录过滤器
+        // 需要将信息添加到jar,文件或者目录中,yarn上通过hadoop分别缓存找不到对应可以被sparkContext识别的内容.我们也不想添加到目录或者文件中,所以在这里创建文件
+        for (file <- currentDir.list(tasksDirFilter)) {
+          val fileWithDir = new File(currentDir, file)
+          Utils.symlink(new File(fileWithDir.getAbsolutePath()),
+            new File(taskDirectory + File.separator + fileWithDir.getName()))
+        }
+        pb.directory(taskDirFile)
+        workInTaskDirectory = true
+      } catch {
+        case e: Exception => logError("Unable to setup task working directory: " + e.getMessage +
+          " (" + taskDirectory + ")", e)
+      }
+    4. 启动进程
+    val proc = pb.start()
+    val childThreadException = new AtomicReference[Throwable](null)
+    5. 启动一个线程用于打印经常错误日志
+    val stderrReaderThread = new Thread(s"${PipedRDD.STDERR_READER_THREAD_PREFIX} $command") {
+      override def run(): Unit = {
+        val err = proc.getErrorStream
+        try {
+          for (line <- Source.fromInputStream(err)(encoding).getLines) {
+            System.err.println(line)
+          }
+        } catch {
+          case t: Throwable => childThreadException.set(t)
+        } finally {
+          err.close()
+        }
+      }
+    }
+    stderrReaderThread.start()
+    6. 设置线程用于反馈父迭代器的输入
+    val stdinWriterThread = new Thread(s"${PipedRDD.STDIN_WRITER_THREAD_PREFIX} $command") {
+      override def run(): Unit = {
+        TaskContext.setTaskContext(context)
+        val out = new PrintWriter(new BufferedWriter(
+          new OutputStreamWriter(proc.getOutputStream, encoding), bufferSize))
+        try {
+          if (printPipeContext != null) {
+            printPipeContext(out.println)
+          }
+          for (elem <- firstParent[T].iterator(split, context)) {
+            if (printRDDElement != null) {
+              printRDDElement(elem, out.println)
+            } else {
+              out.println(elem)
+            }
+          }
+        } catch {
+          case t: Throwable => childThreadException.set(t)
+        } finally {
+          out.close()
+        }
+      }
+    }
+    stdinWriterThread.start()
+    7. 添加监听事件
+    context.addTaskCompletionListener[Unit] { _ =>
+      if (proc.isAlive) {
+        proc.destroy()
+      }
+      if (stdinWriterThread.isAlive) {
+        stdinWriterThread.interrupt()
+      }
+      if (stderrReaderThread.isAlive) {
+        stderrReaderThread.interrupt()
+      }
+    }
+    8. 返回迭代器
+    val lines = Source.fromInputStream(proc.getInputStream)(encoding).getLines // 获取命令信息
+    val= new Iterator[String] {
+        def next(): String
+        def hasNext(): Boolean 
+        def cleanup(): Unit
+        def propagateChildException(): Unit 
+    } 
+}
+```
+
+```scala
+private object PipedRDD {
+    属性:
+    #name @STDIN_WRITER_THREAD_PREFIX = "stdin writer for"	标准输入写出线程前缀
+    #name @STDERR_READER_THREAD_PREFIX = "stderr reader for"	标准错误读取线程前缀
+    操作集:
+    def tokenize(command: String): Seq[String]
+    功能: 分割指定字符串,使用标准字符串分词
+    val buf = new ArrayBuffer[String]
+    val tok = new StringTokenizer(command)
+    while(tok.hasMoreElements) {
+      buf += tok.nextToken()
+    }
+    val= buf
+}
+```
+
 #### RDD
 
 #### RDDBarrier
@@ -1637,24 +2152,974 @@ private[spark] object RDDCheckpointData
 介绍: 用于全局同步检查点操作的锁
 ```
 
+#### RDDOperationRDD
+
+```scala
+private[spark] class ReliableCheckpointRDD[T: ClassTag](
+    sc: SparkContext,
+    val checkpointPath: String,
+    _partitioner: Option[Partitioner] = None
+) extends CheckpointRDD[T](sc) {
+    介绍: 提前从检查点文件中读取RDD,写出到可靠存储上
+    构造器参数:
+    	sc	spark上下文
+    	checkpointPath	检查点路径
+    	_partitioner	分区器
+    属性:
+    #name @hadoopConf = sc.hadoopConfiguration	hadoop配置 transient
+    #name @cpath = new Path(checkpointPath) transient	检查点路径
+    #name @fs=cpath.getFileSystem(hadoopConf) transient	文件系统
+    #name @broadcastedConf=sc.broadcast(new SerializableConfiguration(hadoopConf)) hadoop广播变量配置
+    #name @getCheckpointFile: Option[String] = Some(checkpointPath)	检查点文件
+    #name @partitioner: Option[Partitioner]	分区器
+    val= _partitioner.orElse {
+      ReliableCheckpointRDD.readCheckpointedPartitionerFile(context, checkpointPath)
+    }
+    #name @cachedPreferredLocations #type @CacheBuilder transient lazy	缓存位置
+    val= CacheBuilder.newBuilder()
+    .expireAfterWrite(
+      SparkEnv.get.conf.get(CACHE_CHECKPOINT_PREFERRED_LOCS_EXPIRE_TIME).get,
+      TimeUnit.MINUTES)
+    .build(
+      new CacheLoader[Partition, Seq[String]]() {
+        override def load(split: Partition): Seq[String] = {
+          getPartitionBlockLocations(split)
+        }
+      })
+    
+    #name @cachedExpireTime 缓存时间
+    val= SparkEnv.get.conf.get(CACHE_CHECKPOINT_PREFERRED_LOCS_EXPIRE_TIME)
+    参数校验:
+    require(fs.exists(cpath), s"Checkpoint directory does not exist: $checkpointPath")
+    功能: 检查点目录检查
+    
+    操作集:
+    def getPartitions: Array[Partition] 
+    功能: 获取检查点目录中的分区文件,这个方法假定原始RDD的检查点文件全部被保存到可靠存储中
+    1. 获取检查点目录下的文件列表
+    val inputFiles = fs.listStatus(cpath)
+      .map(_.getPath)
+      .filter(_.getName.startsWith("part-"))
+      .sortBy(_.getName.stripPrefix("part-").toInt)
+    2. 检查输入文件的合法性,不合法则快速失败
+    inputFiles.zipWithIndex.foreach { case (path, i) =>
+      if (path.getName != ReliableCheckpointRDD.checkpointFileName(i)) {
+        throw new SparkException(s"Invalid checkpoint file: $path")
+      }
+    }
+    3. 返回分区列表
+    val= Array.tabulate(inputFiles.length)(i => new CheckpointRDDPartition(i))
+    
+    def getPartitionBlockLocations(split: Partition): Seq[String]
+    功能: 获取指定分区的数据块信息列表
+    1. 获取文件状态
+    val status = fs.getFileStatus(
+      new Path(checkpointPath, ReliableCheckpointRDD.checkpointFileName(split.index)))
+    2. 获取分区对应的位置
+    val locations = fs.getFileBlockLocations(status, 0, status.getLen)
+    val= locations.headOption.toList.flatMap(_.getHosts).filter(_ != "localhost")
+    
+    def getPreferredLocations(split: Partition): Seq[String]
+    功能: 获取指定分区的理想位置
+    val= if (cachedExpireTime.isDefined && cachedExpireTime.get > 0) {
+        // 对缓存获取有要求,则直接从缓存获取数据
+      cachedPreferredLocations.get(split)
+    } else {
+      getPartitionBlockLocations(split)
+    }
+    
+    def compute(split: Partition, context: TaskContext): Iterator[T]
+    功能: 计算分区内容
+    val file = new Path(checkpointPath, ReliableCheckpointRDD.checkpointFileName(split.index))
+    val= ReliableCheckpointRDD.readCheckpointFile(file, broadcastedConf, context_)
+}
+```
+
+```scala
+private[spark] object ReliableCheckpointRDD extends Logging {
+    操作集:
+    def checkpointFileName(partitionIndex: Int): String = "part-%05d".format(partitionIndex)
+    功能: 获取指定分区的检查点文件名称
+    
+    def checkpointPartitionerFileName(): String = "_partitioner"
+    功能: 获取分区器文件名称
+    
+    def writeRDDToCheckpointDirectory[T: ClassTag](
+      originalRDD: RDD[T],
+      checkpointDir: String,
+      blockSize: Int = -1): ReliableCheckpointRDD[T] 
+    功能: 写出RDD到检查点文件中,并返回一个可靠检查点RDD@ReliableCheckpointRDD 代替之前的RDD
+    1. 获取检查点文件目录
+    val checkpointStartTimeNs = System.nanoTime()
+    val sc = originalRDD.sparkContext
+    val checkpointDirPath = new Path(checkpointDir)
+    val fs = checkpointDirPath.getFileSystem(sc.hadoopConfiguration)
+    if (!fs.mkdirs(checkpointDirPath)) {
+      throw new SparkException(s"Failed to create checkpoint path $checkpointDirPath")
+    }
+	2. 将RDD写入检查点文件,并重载获取一个新的RDD
+    val broadcastedConf = sc.broadcast(
+      new SerializableConfiguration(sc.hadoopConfiguration))
+    sc.runJob(originalRDD, // 写出到检查点文件,这个操作开销比较大参考SPARK-8582
+      writePartitionToCheckpointFile[T](checkpointDirPath.toString, broadcastedConf) _)
+    if (originalRDD.partitioner.nonEmpty) {
+      writePartitionerToCheckpointDir(sc, originalRDD.partitioner.get, checkpointDirPath)
+    }
+    val checkpointDurationMs =
+      TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - checkpointStartTimeNs)	
+    val newRDD = new ReliableCheckpointRDD[T](
+      sc, checkpointDirPath.toString, originalRDD.partitioner)
+    if (newRDD.partitions.length != originalRDD.partitions.length) {
+      throw new SparkException(
+        "Checkpoint RDD has a different number of partitions from original RDD. Original " +
+          s"RDD [ID: ${originalRDD.id}, num of partitions: ${originalRDD.partitions.length}]; " +
+          s"Checkpoint RDD [ID: ${newRDD.id}, num of partitions: " +
+          s"${newRDD.partitions.length}].")
+    }
+    val= newRDD
+    
+    def writePartitionToCheckpointFile[T: ClassTag](
+      path: String,
+      broadcastedConf: Broadcast[SerializableConfiguration],
+      blockSize: Int = -1)(ctx: TaskContext, iterator: Iterator[T]): Unit 
+    功能: 写出RDD分区数据到检查点文件中
+    1. 获取写出文件元数据信息
+    val env = SparkEnv.get
+    val outputDir = new Path(path)
+    val fs = outputDir.getFileSystem(broadcastedConf.value.value)
+    val finalOutputName = ReliableCheckpointRDD.checkpointFileName(ctx.partitionId())
+    val finalOutputPath = new Path(outputDir, finalOutputName)
+    val tempOutputPath =
+      new Path(outputDir, s".$finalOutputName-attempt-${ctx.attemptNumber()}")
+    2. 设置缓冲区大小,获取文件输出流
+    val bufferSize = env.conf.get(BUFFER_SIZE)
+    val fileOutputStream = if (blockSize < 0) {
+      val fileStream = fs.create(tempOutputPath, false, bufferSize)
+      if (env.conf.get(CHECKPOINT_COMPRESS)) {
+        CompressionCodec.createCodec(env.conf).compressedOutputStream(fileStream)
+      } else {
+        fileStream
+      }
+    } else { // 这个主要是测试用的
+      fs.create(tempOutputPath, false, bufferSize,
+        fs.getDefaultReplication(fs.getWorkingDirectory), blockSize)
+    }
+    val serializer = env.serializer.newInstance()
+    val serializeStream = serializer.serializeStream(fileOutputStream)
+    Utils.tryWithSafeFinally {
+      serializeStream.writeAll(iterator)
+    } {
+      serializeStream.close()
+    }
+    3. 处理临时文件无法作为最终文件的情况
+    if (!fs.rename(tempOutputPath, finalOutputPath)) {
+      if (!fs.exists(finalOutputPath)) { // 因为最终文件无法设置的情况
+        logInfo(s"Deleting tempOutputPath $tempOutputPath")
+        fs.delete(tempOutputPath, false)
+        throw new IOException("Checkpoint failed: failed to save output of task: " +
+          s"${ctx.attemptNumber()} and final output path does not exist: $finalOutputPath")
+      } else { // 之前已经有一个这样的文件,暂时不能覆盖
+        logInfo(s"Final output path $finalOutputPath already exists; not overwriting it")
+        if (!fs.delete(tempOutputPath, false)) {
+          logWarning(s"Error deleting ${tempOutputPath}")
+        }
+      }
+    }
+    
+    def writePartitionerToCheckpointDir(
+    sc: SparkContext, partitioner: Partitioner, checkpointDirPath: Path): Unit
+    功能: 将分区器写出到检查点目录下,按照最大努力去写出.有异常出现就会标记和忽略
+    1. 获取分区文件路径和缓冲区大小
+    val partitionerFilePath = new Path(checkpointDirPath, checkpointPartitionerFileName)
+    val bufferSize = sc.conf.get(BUFFER_SIZE)
+    2. 获取文件系统输出流
+    val fs = partitionerFilePath.getFileSystem(sc.hadoopConfiguration)
+    val fileOutputStream = fs.create(partitionerFilePath, false, bufferSize)
+    val serializer = SparkEnv.get.serializer.newInstance()
+    val serializeStream = serializer.serializeStream(fileOutputStream)
+    3. 写出分区器内容
+    Utils.tryWithSafeFinally {
+        serializeStream.writeObject(partitioner)
+      } {
+        serializeStream.close()
+      }
+    
+    def readCheckpointedPartitionerFile(
+      sc: SparkContext,
+      checkpointDirPath: String): Option[Partitioner] 
+    功能: 读取检查点分区文件,按最大努力处置,中途异常忽略
+    val bufferSize = sc.conf.get(BUFFER_SIZE)
+      val partitionerFilePath = new Path(checkpointDirPath, checkpointPartitionerFileName)
+      val fs = partitionerFilePath.getFileSystem(sc.hadoopConfiguration)
+      val fileInputStream = fs.open(partitionerFilePath, bufferSize)
+      val serializer = SparkEnv.get.serializer.newInstance()
+      val partitioner = Utils.tryWithSafeFinally {
+        val deserializeStream = serializer.deserializeStream(fileInputStream)
+        Utils.tryWithSafeFinally {
+          deserializeStream.readObject[Partitioner]
+        } {
+          deserializeStream.close()
+        }
+      } {
+        fileInputStream.close()
+      }
+      val= Some(partitioner)
+    
+    def readCheckpointFile[T](
+      path: Path,
+      broadcastedConf: Broadcast[SerializableConfiguration],
+      context: TaskContext): Iterator[T]
+    功能: 读取指定检查点文件
+    1. 获取输入流相关信息
+    val env = SparkEnv.get
+    val fs = path.getFileSystem(broadcastedConf.value.value)
+    val bufferSize = env.conf.get(BUFFER_SIZE)
+    val fileInputStream = {
+      val fileStream = fs.open(path, bufferSize)
+      if (env.conf.get(CHECKPOINT_COMPRESS)) {
+        CompressionCodec.createCodec(env.conf).compressedInputStream(fileStream)
+      } else {
+        fileStream
+      }
+    }
+    val serializer = env.serializer.newInstance()
+    val deserializeStream = serializer.deserializeStream(fileInputStream)
+    2. 读取检查点文件内容
+    context.addTaskCompletionListener[Unit](context => deserializeStream.close())// 设置监听事件
+    val= deserializeStream.asIterator.asInstanceOf[Iterator[T]]// 获取读取内容
+}
+```
+
+#### ReliableCheckpointData
+
+```scala
+private[spark] class ReliableRDDCheckpointData[T: ClassTag](@transient private val rdd: RDD[T])
+extends RDDCheckpointData[T](rdd) with Logging {
+    介绍: 检查点写到可靠存储的数据实现,允许驱动器失败重启,并携带之前的计算状态
+    属性:
+    #name @cpDir: String	与RDD相关的目录(假定是一个非本地的可靠存储位置)
+    val= ReliableRDDCheckpointData.checkpointPath(rdd.context, rdd.id)
+      .map(_.toString)
+      .getOrElse { throw new SparkException("Checkpoint dir must be specified.") }
+    
+    操作集:
+    def getCheckpointDir: Option[String]
+    功能: 获取检查点目录
+    val= if (isCheckpointed) Some(cpDir.toString) else None
+    
+    def doCheckpoint(): CheckpointRDD[T]
+    功能: 实体化RDD,并将数据写出到可靠DFS中,当这个RDD首次完成时立即调用,写到磁盘上
+    1. 写出到可靠DFS
+    val newRDD = ReliableCheckpointRDD.writeRDDToCheckpointDirectory(rdd, cpDir)
+    2. 如果引用失效,清除检查点引用
+    if (rdd.conf.get(CLEANER_REFERENCE_TRACKING_CLEAN_CHECKPOINTS)) {
+      rdd.context.cleaner.foreach { cleaner =>
+        cleaner.registerRDDCheckpointDataForCleanup(newRDD, rdd.id)
+      }
+    }
+    val= newRDD
+}
+```
+
+```scala
+private[spark] object ReliableRDDCheckpointData extends Logging {
+    操作集:
+    def checkpointPath(sc: SparkContext, rddId: Int): Option[Path]
+    功能: 返回检查点文件路径位置
+    val= sc.checkpointDir.map { dir => new Path(dir, s"rdd-$rddId") }
+    
+    def cleanCheckpoint(sc: SparkContext, rddId: Int): Unit
+    功能: 清理指定RDD的检查点(从文件系统移除)
+    checkpointPath(sc, rddId).foreach { path =>
+      path.getFileSystem(sc.hadoopConfiguration).delete(path, true)
+    }
+}
+```
+
 #### RDDOperationScope
 
-#### ReliableCheckpointRDD
+```markdown
+介绍:
+	总体来说,命名代码块代表实例化RDD的操作.实例化在代码块中的RDD会存储一个指针,指向这个对象.示例包括但不会限制RDD的操作,比如说@textFile @reduceByKey和@treeAggregate 的操作
+	一个操作范围可以嵌套在替他操作范围内.比如说,sql查询可能分装其他公用RDD的操作范围.
+	与stage和job之间没有什么特点关系.可以在一个stage中允许,也可以在多个job中运行.
+```
 
-#### ReliableRDDCheckpointData
+```scala
+@JsonInclude(Include.NON_ABSENT)
+@JsonPropertyOrder(Array("id", "name", "parent"))
+private[spark] class RDDOperationScope(
+    val name: String,
+    val parent: Option[RDDOperationScope] = None,
+    val id: String = RDDOperationScope.nextScopeId().toString) {
+    构造器参数:
+    	name 操作作用域名称
+    	parent	父作用域
+    	id	唯一标识符
+    操作集:
+    @JsonIgnore
+    def getAllScopes: Seq[RDDOperationScope]
+    功能: 返回当前操作范围所属的操作作用域列表,包含本身结果按照作用域返回从外到内排序,最后一个是自己.
+    val= parent.map(_.getAllScopes).getOrElse(Seq.empty) ++ Seq(this)
+    
+    def hashCode(): Int = Objects.hashCode(id, name, parent)
+    功能: 获取hashcode值
+    
+    def toString: String = toJson
+    功能: 信息显示
+    
+    def equals(other: Any): Boolean
+    功能: 相等逻辑
+    val= other match {
+      case s: RDDOperationScope =>
+        id == s.id && name == s.name && parent == s.parent
+      case _ => false
+    }
+    
+    def toJson: String 
+    功能: 转化为json
+    val= RDDOperationScope.jsonMapper.writeValueAsString(this)
+}
+```
+
+```scala
+private[spark] object RDDOperationScope extends Logging {
+    介绍: 实用方法集合,用于构造RDD作用域的分层展示,一个RDD作用域追踪了RDD中一系列操作
+    属性:
+    #name @jsonMapper = new ObjectMapper().registerModule(DefaultScalaModule)	json映射
+    #name @scopeCounter = new AtomicInteger(0)	作用域计数值
+    操作集:
+    def fromJson(s: String): RDDOperationScope = jsonMapper.readValue(s, classOf[RDDOperationScope])
+    功能: 获取指定串@s 的RDD操作作用域@RDDOperationScope
+    
+    def nextScopeId(): Int = scopeCounter.getAndIncrement
+    功能: 获取唯一的作用范围全局唯一标识
+    
+    def withScope[T](sc: SparkContext,allowNesting: Boolean = false)(body: => T): T 
+    功能: 执行指定的函数体,以至于所有的RDD都在这个执行体中创建,这样就拥有相同的作用域.这个作业范围的名称是首个方法名称,用于定位和这个方法名称不同.
+    输入参数:
+    	sc	spark上下文
+    	allowNesting	是否允许包含关系
+    	body	执行体函数
+    1. 获取本体名称
+    val ourMethodName = "withScope"
+    2. 获取执行体名称
+    val callerMethodName = Thread.currentThread.getStackTrace()
+      .dropWhile(_.getMethodName != ourMethodName)
+      .find(_.getMethodName != ourMethodName)
+      .map(_.getMethodName)
+      .getOrElse {
+        logWarning("No valid method name for this RDD operation scope!")
+        "N/A"
+      }
+    3. 执行执行体
+    val= withScope[T](sc, callerMethodName, allowNesting, ignoreParent = false)(body)
+    
+    def withScope[T](sc: SparkContext,name: String,allowNesting: Boolean,
+                     ignoreParent: Boolean)(body: => T): T
+    功能: 执行执行体函数,如果允许操作范围的包含,那么执行体中的子调用会初始化子操作范围.否则调用无效.
+    此外,方法调用者可以忽略配置和高级调用者设置的操作范围,这种情况下会忽视父调用者的不允许嵌套的指令,且新的操作返回会没有父调用者.用于定位物理操作范围很有效(spark sql中).
+    输入参数:
+    	sc	spark上下文
+    	name	操作范围名称
+    	allowNesting	是否允许嵌套
+    	ignoreParent	是否忽略父调用者的影响
+    1. 获取旧操作范围,以便之后恢复
+    val scopeKey = SparkContext.RDD_SCOPE_KEY
+    val noOverrideKey = SparkContext.RDD_SCOPE_NO_OVERRIDE_KEY
+    val oldScopeJson = sc.getLocalProperty(scopeKey)
+    val oldScope = Option(oldScopeJson).map(RDDOperationScope.fromJson)
+    val oldNoOverride = sc.getLocalProperty(noOverrideKey)
+    2. 根据是否忽略父调用者,选择是否使用旧操作范围
+    try {
+      if (ignoreParent) {
+        sc.setLocalProperty(scopeKey, new RDDOperationScope(name).toJson)
+      } else if (sc.getLocalProperty(noOverrideKey) == null) {
+        sc.setLocalProperty(scopeKey, new RDDOperationScope(name, oldScope).toJson)
+      }
+      if (!allowNesting) {
+        sc.setLocalProperty(noOverrideKey, "true")
+      }
+      body
+    } finally {
+      sc.setLocalProperty(scopeKey, oldScopeJson)
+      sc.setLocalProperty(noOverrideKey, oldNoOverride)
+    }
+}
+```
 
 #### SequenceFileRDDFunctions
 
+```scala
+class SequenceFileRDDFunctions[K <% Writable: ClassTag, V <% Writable : ClassTag](
+    self: RDD[(K, V)],
+    _keyWritableClass: Class[_ <: Writable],
+    _valueWritableClass: Class[_ <: Writable])
+extends Logging with Serializable {
+    介绍: KV RDD额外的函数,用于创建Hadoop序列文件
+    操作集:
+    def saveAsSequenceFile(path: String,codec: Option[Class[_ <: CompressionCodec]] = None): Unit
+    功能: 保存为序列文件
+    将KV RDD转化为Hadoop 序列文件,如果KV可写,那么可以直接使用他们的类,否则需要将其映射为可写类型.
+    输入参数:
+    	path	文件路径(只要hadoop文件系统支持即可)
+    	codec	压缩方式
+    1. 确定kv是否可以转化为可写类型
+    val convertKey = self.keyClass != _keyWritableClass
+    val convertValue = self.valueClass != _valueWritableClass
+    2. 获取job配置
+    val format = classOf[SequenceFileOutputFormat[Writable, Writable]]
+    val jobConf = new JobConf(self.context.hadoopConfiguration)
+    3. 根据不同形式写出kv值
+    if (!convertKey && !convertValue) { // 都不可转换,直接写出
+      self.saveAsHadoopFile(path, _keyWritableClass, _valueWritableClass, format, jobConf, codec)
+    } else if (!convertKey && convertValue) { //只映射key到可写状态
+      self.map(x => (x._1, anyToWritable(x._2))).saveAsHadoopFile(
+        path, _keyWritableClass, _valueWritableClass, format, jobConf, codec)
+    } else if (convertKey && !convertValue) { // 只映射value到可写状态
+      self.map(x => (anyToWritable(x._1), x._2)).saveAsHadoopFile(
+        path, _keyWritableClass, _valueWritableClass, format, jobConf, codec)
+    } else if (convertKey && convertValue) { // kv同时映射
+      self.map(x => (anyToWritable(x._1), anyToWritable(x._2))).saveAsHadoopFile(
+        path, _keyWritableClass, _valueWritableClass, format, jobConf, codec)
+    }
+}
+```
+
 #### ShuffledRDD
+
+```scala
+@DeveloperApi
+class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
+    @transient var prev: RDD[_ <: Product2[K, V]],
+    part: Partitioner)
+extends RDD[(K, C)](prev.context, Nil) {
+    介绍: 一个shuffle(数据重组)的结果RDD
+    构造器参数:
+    	prev 父RDD
+    	part	用于分区的RDD
+    	K	key类型
+    	V	value类型
+    	C	combiner类型
+    属性:
+    #name @userSpecifiedSerializer: Option[Serializer] = None 	用户指定的序列化器	
+    #name @keyOrdering: Option[Ordering[K]] = None	Key排序规则
+    #name @aggregator: Option[Aggregator[K, V, C]] = None	聚合函数
+    #name @mapSideCombine: Boolean = false	是否开启map侧combine
+    #name @partitioner = Some(part)分区器
+    操作集
+    def setSerializer(serializer: Serializer): ShuffledRDD[K, V, C]
+    功能: 设置序列化器
+    this.userSpecifiedSerializer = Option(serializer)
+    this
+    
+    def setKeyOrdering(keyOrdering: Ordering[K]): ShuffledRDD[K, V, C] 
+    功能: 设置排序规则
+    this.keyOrdering = Option(keyOrdering)
+    this
+    
+    def setAggregator(aggregator: Aggregator[K, V, C]): ShuffledRDD[K, V, C] 
+    功能: 设置聚合函数
+    this.aggregator = Option(aggregator)
+    this
+    
+    def setMapSideCombine(mapSideCombine: Boolean): ShuffledRDD[K, V, C] 
+    功能: 设置map侧是否能够combine
+    this.mapSideCombine = mapSideCombine
+    this
+    
+    def getDependencies: Seq[Dependency[_]]
+    功能: 获取当前RDD的依赖列表
+    1. 获取序列化器
+    val serializer = userSpecifiedSerializer.getOrElse {
+      val serializerManager = SparkEnv.get.serializerManager
+      if (mapSideCombine) {
+        serializerManager.getSerializer(implicitly[ClassTag[K]], implicitly[ClassTag[C]])
+      } else {
+        serializerManager.getSerializer(implicitly[ClassTag[K]], implicitly[ClassTag[V]])
+      }
+    }
+    2. 获取shuffle依赖
+    val= List(new ShuffleDependency(prev, part, serializer, keyOrdering, aggregator, mapSideCombine))
+    
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    val= Array.tabulate[Partition](part.numPartitions)(i => new ShuffledRDDPartition(i))
+    
+    def getPreferredLocations(partition: Partition): Seq[String]
+    功能: 获取最佳分区存储位置列表
+    val dep = dependencies.head.asInstanceOf[ShuffleDependency[K, V, C]]
+    val metrics = context.taskMetrics().createTempShuffleReadMetrics()
+    val= SparkEnv.get.shuffleManager.getReader(
+      dep.shuffleHandle, split.index, split.index + 1, context, metrics)
+      .read()
+      .asInstanceOf[Iterator[(K, C)]]
+    
+    def clearDependencies(): Unit 
+    功能: 清理依赖
+    super.clearDependencies()
+    prev = null
+    
+    def isBarrier(): Boolean = false
+    功能: 确定是否有界
+}
+```
 
 #### SubtractedRDD
 
+```scala
+private[spark] class SubtractedRDD[K: ClassTag, V: ClassTag, W: ClassTag](
+    @transient var rdd1: RDD[_ <: Product2[K, V]],
+    @transient var rdd2: RDD[_ <: Product2[K, W]],
+    part: Partitioner)
+extends RDD[(K, V)](rdd1.context, Nil) {
+    介绍: 对于cogroup的优化版本,用于设置差,可以仅仅通过cogroup实现这个功能,但是效率比较低,因为rdd2 的记录都被保存在hashMap中.在这个实现中,rdd1的数据保存在内存中,rdd2 使用流式读取.当前rdd1的数据规模远远小于rdd2时很有用.
+    构造器参数:
+    	rdd1	rdd1
+    	rdd2	rdd2
+    	part	分区器
+    属性:
+    #name @partitioner = Some(part)	分区器
+    操作集:
+    def clearDependencies(): Unit
+    功能: 清理依赖
+    super.clearDependencies()
+    rdd1 = null
+    rdd2 = null
+    
+    def rddDependency[T1: ClassTag, T2: ClassTag](rdd: RDD[_ <: Product2[T1, T2]])
+      : Dependency[_]
+    功能: 获取指定@rdd 的依赖
+    val= if (rdd.partitioner == Some(part)) {
+        logDebug("Adding one-to-one dependency with " + rdd)
+        new OneToOneDependency(rdd)
+      } else {
+        logDebug("Adding shuffle dependency with " + rdd)
+        new ShuffleDependency[T1, T2, Any](rdd, part)
+      }
+    
+    def getDependencies: Seq[Dependency[_]]
+    功能: 获取当前RDD依赖
+    val= Seq(rddDependency[K, V](rdd1), rddDependency[K, W](rdd2))
+    
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    1. 创建结果的维度
+    val array = new Array[Partition](part.numPartitions)
+    2. 设置每个分区值
+    for (i <- 0 until array.length) {
+      array(i) = new CoGroupPartition(i, Seq(rdd1, rdd2).zipWithIndex.map { case (rdd, j) =>
+        dependencies(j) match {
+          case s: ShuffleDependency[_, _, _] =>
+            None
+          case _ =>
+            Some(new NarrowCoGroupSplitDep(rdd, i, rdd.partitions(i)))
+        }
+      }.toArray)
+    }
+    val= array
+    
+    def integrate(depNum: Int, op: Product2[K, V] => Unit): Unit 
+    功能: 根据@depNum 判断依赖类型,并对每个数据进行处理
+    输入参数: depNum	依赖编号
+    	op	操作函数
+    dependencies(depNum) match {
+        // 窄依赖处理
+        case oneToOneDependency: OneToOneDependency[_] =>
+          val dependencyPartition = partition.narrowDeps(depNum).get.split
+          oneToOneDependency.rdd.iterator(dependencyPartition, context)
+            .asInstanceOf[Iterator[Product2[K, V]]].foreach(op)
+        // 宽依赖处理
+        case shuffleDependency: ShuffleDependency[_, _, _] =>
+          val metrics = context.taskMetrics().createTempShuffleReadMetrics()
+        // 获取宽依赖迭代器
+          val iter = SparkEnv.get.shuffleManager
+            .getReader(
+              shuffleDependency.shuffleHandle,
+              partition.index,
+              partition.index + 1,
+              context,
+              metrics)
+            .read()
+          iter.foreach(op)
+      }
+    
+    def getSeq(k: K): ArrayBuffer[V]
+    功能: 获取指定key的序列
+    val seq = map.get(k)
+    val= if (seq != null) {
+        seq
+    } else {
+        val seq = new ArrayBuffer[V]()
+        map.put(k, seq)
+        seq
+    }
+    
+    def compute(p: Partition, context: TaskContext): Iterator[(K, V)] 
+    功能: 计算分区数据
+    1. 设置分区和记录数据的map
+    val partition = p.asInstanceOf[CoGroupPartition]
+    val map = new JHashMap[K, ArrayBuffer[V]]
+    2. 将rdd1的value存储到map中
+    integrate(0, t => getSeq(t._1) += t._2)
+    3. 将rdd2的记录从记录中移除
+    integrate(1, t => map.remove(t._1))
+    val= map.asScala.iterator.map(t => t._2.iterator.map((t._1, _))).flatten
+}
+```
+
 #### UnionRDD
+
+```scala
+private[spark] class UnionPartition[T: ClassTag](
+    idx: Int,
+    @transient private val rdd: RDD[T],
+    val parentRddIndex: Int,
+    @transient private val parentRddPartitionIndex: Int)
+extends Partition {
+    介绍: UnionRDD的分区
+    构造器参数:
+    	idx	分区编号
+    	rdd	该分区的父RDD
+    	parentRddIndex	父RDD编号
+    	parentRddPartitionIndex	父RDD分区编号
+    属性:
+    #name @parentPartition: Partition = rdd.partitions(parentRddPartitionIndex)	父RDD指定分区
+    #name @index: Int = idx	分区编号
+    操作集:
+    def preferredLocations(): Seq[String] = rdd.preferredLocations(parentPartition)
+    功能: 获取rdd最优位置
+    
+    @throws(classOf[IOException])
+    private def writeObject(oos: ObjectOutputStream): Unit
+    功能: 写出本类默认属性
+    Utils.tryOrIOException {
+        parentPartition = rdd.partitions(parentRddPartitionIndex)
+        oos.defaultWriteObject()
+    }
+}
+```
+
+```scala
+object UnionRDD {
+    属性:
+    #name @partitionEvalTaskSupport #type @ForkJoinTaskSupport	分区重算任务
+    val= new ForkJoinTaskSupport(ThreadUtils.newForkJoinPool("partition-eval-task-support", 8))
+}
+```
+
+```scala
+@DeveloperApi
+class UnionRDD[T: ClassTag](
+    sc: SparkContext,
+    var rdds: Seq[RDD[T]])
+extends RDD[T](sc, Nil) { 
+	介绍: Union RDD
+    构造器参数:
+    	sc	spark上下文
+    	rdds	rdd列表
+    属性:
+    #name @isPartitionListingParallel #type @Boolean	分区是否需要并行列出(测试可见)
+    val= rdds.length > conf.get(RDD_PARALLEL_LISTING_THRESHOLD)
+    操作集:
+    def getDependencies: Seq[Dependency[_]]
+    功能: 获取依赖列表
+    val deps = new ArrayBuffer[Dependency[_]]
+    var pos = 0
+    for (rdd <- rdds) {
+      deps += new RangeDependency(rdd, 0, pos, rdd.partitions.length)
+      pos += rdd.partitions.length
+    }
+    val= deps
+    
+    def clearDependencies(): Unit
+    功能: 清除依赖
+    super.clearDependencies()
+    rdds = null
+    
+    def getPreferredLocations(s: Partition): Seq[String] 
+    功能: 获取最佳位置
+    val=  s.asInstanceOf[UnionPartition[T]].preferredLocations()
+    
+    def compute(s: Partition, context: TaskContext): Iterator[T]
+    功能: 计算分区数据
+    val part = s.asInstanceOf[UnionPartition[T]]
+    val= parent[T](part.parentRddIndex).iterator(part.parentPartition, context)
+    
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    1. 计算并行RDD
+    val parRDDs = if (isPartitionListingParallel) {
+      val parArray = new ParVector(rdds.toVector) // 设置并行向量表
+      // 设置并行列表的任务支持(用于调度和负载均衡)
+      parArray.tasksupport = UnionRDD.partitionEvalTaskSupport 
+      parArray
+    } else {
+      rdds // 没有并行直接使用本类RDD
+    }
+    2. 设置分区列表维度
+    val array = new Array[Partition](parRDDs.map(_.partitions.length).sum)
+    3. 设置列表的每一个元素
+    var pos = 0 // 位置指针
+    for ((rdd, rddIndex) <- rdds.zipWithIndex; split <- rdd.partitions) {
+      array(pos) = new UnionPartition(pos, rdd, rddIndex, split.index) // 设置每个位置的分区
+      pos += 1
+    }
+}
+```
 
 #### WholeTextFileRDD
 
+```scala
+private[spark] class WholeTextFileRDD(
+    sc : SparkContext,
+    inputFormatClass: Class[_ <: WholeTextFileInputFormat],
+    keyClass: Class[Text],
+    valueClass: Class[Text],
+    conf: Configuration,
+    minPartitions: Int)
+extends NewHadoopRDD[Text, Text](sc, inputFormatClass, keyClass, valueClass, conf) {
+    介绍: 全文RDD,全文内容作为一条记录
+    构造器参数:
+    	sc	spark上下文
+    	inputFormatClass	输入类别
+    	keyClass	key类型
+    	valueClass	value类型
+    	conf	配置
+    	minPartitions	最小分区数量
+    操作集:
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    1. 获取配置信息,并设置最小分区数量
+    val conf = getConf
+    conf.setIfUnset(FileInputFormat.LIST_STATUS_NUM_THREADS,
+      Runtime.getRuntime.availableProcessors().toString)
+    2. 获取输入方式
+    val inputFormat = inputFormatClass.getConstructor().newInstance()
+    inputFormat match {
+      case configurable: Configurable =>
+        configurable.setConf(conf)
+      case _ =>
+    }
+    val jobContext = new JobContextImpl(conf, jobId)
+    inputFormat.setMinPartitions(jobContext, minPartitions)
+    3. 设置分区数量,并填充分区内容
+    val rawSplits = inputFormat.getSplits(jobContext).toArray
+    val result = new Array[Partition](rawSplits.size)
+    for (i <- 0 until rawSplits.size) {
+      result(i) = new NewHadoopPartition(id, i, rawSplits(i).asInstanceOf[InputSplit with Writable])
+    }
+}
+```
+
 #### ZippedPartitionsRDD
 
+```scala
+private[spark] class ZippedPartitionsPartition(
+    idx: Int,
+    @transient private val rdds: Seq[RDD[_]],
+    @transient val preferredLocations: Seq[String])
+extends Partition {
+    介绍: 压缩分区RDD的分区
+    属性:
+        idx	分区编号
+        rdds	RDD列表
+    	preferredLocations	最佳位置列表
+    属性:
+    #name @index: Int = idx	分区索引
+    #name @partitionValues = rdds.map(rdd => rdd.partitions(idx))	分区值
+    操作集:
+    def partitions: Seq[Partition] = partitionValues
+    功能: 获取分区列表
+    
+    @throws(classOf[IOException])
+    private def writeObject(oos: ObjectOutputStream): Unit
+    功能: 写出默认属性
+    Utils.tryOrIOException {
+        partitionValues = rdds.map(rdd => rdd.partitions(idx))
+        oos.defaultWriteObject()
+    }
+}
+```
+
+```scala
+private[spark] abstract class ZippedPartitionsBaseRDD[V: ClassTag](
+    sc: SparkContext,
+    var rdds: Seq[RDD[_]],
+    preservesPartitioning: Boolean = false)
+extends RDD[V](sc, rdds.map(x => new OneToOneDependency(x))) {
+    介绍: 压缩分区基础RDD
+    构造器参数:
+    	preservesPartitioning	是否保留分区
+    属性:
+    #name @partitioner = if (preservesPartitioning) firstParent[Any].partitioner else None
+    操作集:
+    def getPreferredLocations(s: Partition): Seq[String] 
+    功能: 获取最佳位置列表
+    val= s.asInstanceOf[ZippedPartitionsPartition].preferredLocations
+    
+    def clearDependencies(): Unit
+    功能: 清理依赖
+    super.clearDependencies()
+    rdds = null
+    
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    1. 获取分区数量
+    val numParts = rdds.head.partitions.length
+    if (!rdds.forall(rdd => rdd.partitions.length == numParts)) {
+      throw new IllegalArgumentException(
+        s"Can't zip RDDs with unequal numbers of partitions: ${rdds.map(_.partitions.length)}")
+    }
+    2. 设置每个分区的值
+    Array.tabulate[Partition](numParts) { i =>
+      // 设置分区的最佳位置信息
+      val prefs = rdds.map(rdd => rdd.preferredLocations(rdd.partitions(i)))
+      val exactMatchLocations = prefs.reduce((x, y) => x.intersect(y))
+      val locs = if (!exactMatchLocations.isEmpty) exactMatchLocations else prefs.flatten.distinct
+      new ZippedPartitionsPartition(i, rdds, locs)
+    }
+}
+```
+
+```scala
+private[spark] class ZippedPartitionsRDD2[A: ClassTag, B: ClassTag, V: ClassTag](
+    sc: SparkContext,
+    var f: (Iterator[A], Iterator[B]) => Iterator[V], // 聚合函数
+    var rdd1: RDD[A],
+    var rdd2: RDD[B],
+    preservesPartitioning: Boolean = false)
+extends ZippedPartitionsBaseRDD[V](sc, List(rdd1, rdd2), preservesPartitioning) {
+    操作集:
+    def clearDependencies(): Unit 
+    功能: 清除依赖
+    super.clearDependencies()
+    rdd1 = null
+    rdd2 = null
+    f = null
+    
+    def compute(s: Partition, context: TaskContext): Iterator[V]
+    功能: 计算分区数据
+    1. 计算分区数量
+    val partitions = s.asInstanceOf[ZippedPartitionsPartition].partitions
+    2. 获取聚合后分区数据
+    f(rdd1.iterator(partitions(0), context), rdd2.iterator(partitions(1), context))
+}
+```
+
+```scala
+private[spark] class ZippedPartitionsRDD3
+  [A: ClassTag, B: ClassTag, C: ClassTag, V: ClassTag](
+    sc: SparkContext,
+    var f: (Iterator[A], Iterator[B], Iterator[C]) => Iterator[V],
+    var rdd1: RDD[A],
+    var rdd2: RDD[B],
+    var rdd3: RDD[C],
+    preservesPartitioning: Boolean = false)
+extends ZippedPartitionsBaseRDD[V](sc, List(rdd1, rdd2, rdd3), preservesPartitioning) {
+    介绍: 基于三元组的数据聚合
+    操作集:
+    def clearDependencies(): Unit
+    功能: 清理依赖
+    super.clearDependencies()
+    rdd1 = null
+    rdd2 = null
+    rdd3 = null
+    f = null
+    
+    def compute(s: Partition, context: TaskContext): Iterator[V]
+    功能: 计算聚合后的分区数据
+    val partitions = s.asInstanceOf[ZippedPartitionsPartition].partitions
+    val= f(rdd1.iterator(partitions(0), context),
+      rdd2.iterator(partitions(1), context),
+      rdd3.iterator(partitions(2), context))
+}
+```
+
+```scala
+private[spark] class ZippedPartitionsRDD4
+  [A: ClassTag, B: ClassTag, C: ClassTag, D: ClassTag, V: ClassTag](
+    sc: SparkContext,
+    var f: (Iterator[A], Iterator[B], Iterator[C], Iterator[D]) => Iterator[V],
+    var rdd1: RDD[A],
+    var rdd2: RDD[B],
+    var rdd3: RDD[C],
+    var rdd4: RDD[D],
+    preservesPartitioning: Boolean = false)
+extends ZippedPartitionsBaseRDD[V](sc, List(rdd1, rdd2, rdd3, rdd4), preservesPartitioning) {
+    操作集:
+    def clearDependencies(): Unit
+    功能: 清理依赖
+    super.clearDependencies()
+    rdd1 = null
+    rdd2 = null
+    rdd3 = null
+    rdd4 = null
+    f = null
+    
+    def compute(s: Partition, context: TaskContext): Iterator[V] 
+    功能: 计算分区聚合数据
+    val partitions = s.asInstanceOf[ZippedPartitionsPartition].partitions
+    val= f(rdd1.iterator(partitions(0), context),
+      rdd2.iterator(partitions(1), context),
+      rdd3.iterator(partitions(2), context),
+      rdd4.iterator(partitions(3), context))
+}
+```
+
 #### ZippedWithIndexRDD
+
+```scala
+private[spark] class ZippedWithIndexRDDPartition(val prev: Partition, val startIndex: Long)
+  extends Partition with Serializable {
+  介绍: 带有索引压缩的RDD分区
+  构造器参数:
+      	prev	父分区
+      	startIndex	索引起始号
+  override val index: Int = prev.index	父分区索引
+}
+```
+
+```scala
+private[spark]
+class ZippedWithIndexRDD[T: ClassTag](prev: RDD[T]) extends RDD[(T, Long)](prev) {
+    介绍: 压缩元素的RDD,排序基于分区编号,然分区内部按照元素进行排序,所以第一个元素再分区0中,最后一个元素再最大index中.
+    构造器参数:
+    	prev	父RDD
+    	T	父RDD类型
+    属性:
+    #name @startIndices #type @Array[Long] transient 初始索引
+    val= {
+        val n = prev.partitions.length
+    if (n == 0) {
+      Array.empty
+    } else if (n == 1) {
+      Array(0L)
+    } else {
+          prev.context.runJob(
+            prev,
+            Utils.getIteratorSize _,
+            0 until n - 1 // do not need to count the last partition
+          ).scanLeft(0L)(_ + _)
+        }
+    }
+    
+    操作集:
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    val= firstParent[T].partitions.map(x => 
+                                       new ZippedWithIndexRDDPartition(x, startIndices(x.index)))
+    
+    def getPreferredLocations(split: Partition): Seq[String]
+    功能: 获取最佳位置列表
+    val= firstParent[T].preferredLocations(split.asInstanceOf[ZippedWithIndexRDDPartition].prev)
+    
+    def compute(splitIn: Partition, context: TaskContext): Iterator[(T, Long)] 
+    功能: 计算分区数据(数据+索引)
+    val split = splitIn.asInstanceOf[ZippedWithIndexRDDPartition]
+    val parentIter = firstParent[T].iterator(split.prev, context)
+    val= Utils.getIteratorZipWithIndex(parentIter, split.startIndex)
+}
+```
 
 #### 基础拓展
