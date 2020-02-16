@@ -2059,6 +2059,1061 @@ private object PipedRDD {
 
 #### RDD
 
+```markdown
+介绍:
+	分布式弹性数据集,spark基本抽象.代表不可变,分区的集合元素,且可以并行操作.这个类包含所有RDD的操作,比如`map`,`filter`,和`persist`.除此之外,@PairRDDFunctions 包含仅仅kv对RDD进行的操作,比如`groupByKey`和`join`等等.@DoubleRDDFunctions 包含多元组类型RDD的操作.@SequenceFileRDDFunctions 包含的RDD可以存储为序列文件.所有操作都可以自动的从RDD中获取.
+    从内部来说,RDD包含如下几个部分:
+    1. 分区列表
+    2. 计算分片的函数
+    3. 其他RDD的依赖关系
+    4. kv RDD的分区器@Partitioner(说明这个RDD是hash分区的)
+    5. 最佳位置,用于计算每个分片(例如,HDFS的数据块位置)
+    所有spark的调度和执行都是基于这些方法,允许每种RDD按照自己的方式定义这些操作集.因此,用户可以实现客户RDD(从新的文件系统读取数据),通过覆盖这些函数.请参考spark paper 找到RDD的设计细节.
+```
+
+```scala
+abstract class RDD[T: ClassTag](
+    @transient private var _sc: SparkContext,
+    @transient private var deps: Seq[Dependency[_]]
+) extends Serializable with Logging {
+    构造器参数:
+    	sc	spark上下文
+    	deps	依赖列表
+    属性:
+    #name @partitioner: Option[Partitioner] = None	transient 分区器
+    #name @id: Int = sc.newRddId()	RDD唯一标识符(当前spark上下文中)
+    #name @name: String = _	rdd名称
+    #name @stateLock = new Integer(0)	状态锁
+    	锁定RDD内部所有可变状态,(持久化,分区,依赖等).由于RDD是用户可见的所有不使用this,因此用户可以自己添加锁到RDD中.对其进行共享则可能引发死锁,一个线程可能持有多个锁,用户处理链式RDD依赖.但是由于DAG是不存在环的,所以在一个DAG中至多存在一个锁,就不可能发生死锁. 使用Integer是因为其可以序列化,执行器可以引用相关属性.(尽管不能改变)
+    #name @dependencies_ : Seq[Dependency[_]] = _ volatile	依赖列表
+    #name @partitions_ : Array[Partition] = _ volatile transient 分区列表4
+    #name @storageLevel: StorageLevel = StorageLevel.NONE	存储等级
+    #name @creationSite = sc.getCallSite()	用户调用
+    #name @scope: Option[RDDOperationScope]	操作范围
+    #name @checkpointData: Option[RDDCheckpointData[T]] = None	检查点数据
+    #name @outputDeterministicLevel: DeterministicLevel.Value 输出决定等级
+    	val= if (isReliablyCheckpointed) {
+          DeterministicLevel.DETERMINATE
+        } else {
+          getOutputDeterministicLevel
+        }
+    #name @isBarrier_ : Boolean 	确定当前是否处于barrier stage 中
+    #name @checkpointAllMarkedAncestors 检查点已经是否标记父级RDD
+    val= Option(sc.getLocalProperty(RDD.CHECKPOINT_ALL_MARKED_ANCESTORS)).exists(_.toBoolean)
+    操作集:
+    def conf = sc.conf
+    功能: 获取配置信息
+    
+    @DeveloperApi
+    def compute(split: Partition, context: TaskContext): Iterator[T]
+    功能: 计算指定分区,获取分区数据,子类实现
+    
+    def sc: SparkContext
+    功能: 获取sc(检测)
+    if (_sc == null) {
+        throw new SparkException(
+            "This RDD lacks a SparkContext. It could happen in the following cases: \n(1) RDD " +
+            "transformations and actions are NOT invoked by the driver, but inside of other " +
+            "transformations; for example, rdd1.map(x => rdd2.values.count() * x) is invalid " +
+            "because the values transformation and count action cannot be performed inside of the " +
+            "rdd1.map transformation. For more information, see SPARK-5063.\n(2) When a Spark " +
+            "Streaming job recovers from checkpoint, this exception will be hit if a reference to " +
+            "an RDD not defined by the streaming job is used in DStream operations. For more " +
+            "information, See SPARK-13758.")
+    }
+    val=  _sc
+    
+    def getPartitions: Array[Partition]
+    功能: 获取RDD的分区列表,只会调用一次,所以在里面实现耗时的计算是没问题的.子类实现
+    
+    def getDependencies: Seq[Dependency[_]] = deps
+    功能: 获取依赖列表,子类实现,仅调用一次,可以接受耗时计算
+    
+    def getPreferredLocations(split: Partition): Seq[String] = Nil
+    功能: 获取最佳位置列表
+    
+    def sparkContext: SparkContext = sc
+    功能: 获取spark上下文
+    
+    def setName(_name: String): this.type 
+    功能: 设置spark RDD名称
+    name = _name
+    val= this
+    
+    def cache(): this.type = persist()
+    功能: 缓存RDD ,默认存储等级为MEMORY_ONLY
+    
+    def persist(): this.type = persist(StorageLevel.MEMORY_ONLY)
+    功能: 持久化RDD,默认存储等级MEMORY_ONLY
+    
+    def persist(newLevel: StorageLevel): this.type
+    功能: 指定存储等级,持久化RDD
+    val= if (isLocallyCheckpointed) {
+        // 意味着用户之前调用@localCheckpoint() 已经标记了RDD已经持久化,这里需要覆盖旧的存储等级(通过用户请求)
+        persist(LocalRDDCheckpointData.transformStorageLevel(newLevel), allowOverride = true)
+    }else{
+        persist(newLevel, allowOverride = false)
+    }
+    
+    def persist(newLevel: StorageLevel, allowOverride: Boolean): this.type
+    功能: 使用指定存储等级,标记RDD持久化状态.
+    输入参数:
+    	newLevel	目标存储等级
+    	allowOverride	是否允许新的存储等级覆盖
+    1. 处理不能覆盖的情况
+    if (storageLevel != StorageLevel.NONE && newLevel != storageLevel && !allowOverride) {
+      throw new UnsupportedOperationException(
+        "Cannot change storage level of an RDD after it was already assigned a level")
+    }
+    2. 首次存储处理
+    if (storageLevel == StorageLevel.NONE) {
+      sc.cleaner.foreach(_.registerRDDForCleanup(this))
+      sc.persistRDD(this)
+    }
+    3. 其他情况处理
+    storageLevel = newLevel
+    val= this
+    
+    def unpersist(blocking: Boolean = false): this.type
+    功能: 去持久化
+    输入参数:
+    	block	是否阻塞知道文件系统中删除指定RDD内容
+    sc.unpersistRDD(id, blocking)
+    storageLevel = StorageLevel.NONE
+    val= this
+    
+    def getStorageLevel: StorageLevel = storageLevel
+    功能: 获取存储等级
+    
+    def checkpointRDD: Option[CheckpointRDD[T]] = checkpointData.flatMap(_.checkpointRDD)
+    功能： 获取检查点RDD(如果设置检查点的情况下)
+    
+    def dependencies: Seq[Dependency[_]]
+    功能: 获取当前RDD的依赖列表,无论RDD是否设置检查点都要计算在内
+    checkpointRDD.map(r => List(new OneToOneDependency(r))).getOrElse {
+        // 处理检查点RDD中没有当前依赖的情况(重新计算RDD)
+      if (dependencies_ == null) {
+        stateLock.synchronized {
+          if (dependencies_ == null) {
+            dependencies_ = getDependencies
+          }
+        }
+      }
+      dependencies_
+    }
+    
+    @Since("1.6.0")
+    final def getNumPartitions: Int = partitions.length
+    功能: 获取当前RDD的分区数量
+    
+    final def partitions: Array[Partition] 
+    功能: 获取当前RDD的分区列表,无论是否设置检查点都要考虑
+    val= checkpointRDD.map(_.partitions).getOrElse {
+        // 处理没有设置检查点的情况(重新计算分区)
+      if (partitions_ == null) {
+        stateLock.synchronized {
+          if (partitions_ == null) {
+            partitions_ = getPartitions
+            partitions_.zipWithIndex.foreach { case (partition, index) =>
+              require(partition.index == index,
+                s"partitions($index).partition == ${partition.index}, but it should equal $index")
+            }
+          }
+        }
+      }
+      partitions_
+    }
+    
+    def preferredLocations(split: Partition): Seq[String]
+    功能: 获取当前分区的最佳位置列表,考虑到是否设置了检查点
+    val= checkpointRDD.map(_.getPreferredLocations(split)).getOrElse {
+      	// 没有设置检查点,需要重新计算
+        getPreferredLocations(split)
+    }
+    
+    def iterator(split: Partition, context: TaskContext): Iterator[T]
+    功能: RDD内部方法,缓存命中则从缓存获取,否则重新计算,不可以被用户直接调用,但是可以被子类RDD实现.
+    val= if (storageLevel != StorageLevel.NONE) {
+      getOrCompute(split, context)
+    } else {
+      computeOrReadCheckpoint(split, context)
+    }
+    
+    def visit(rdd: RDD[_]): Unit 
+    功能: 使用并查集的思想,求祖先列表
+    val narrowDependencies = rdd.dependencies.filter(_.isInstanceOf[NarrowDependency[_]])
+      val narrowParents = narrowDependencies.map(_.rdd)
+      val narrowParentsNotVisited = narrowParents.filterNot(ancestors.contains)
+      narrowParentsNotVisited.foreach { parent =>
+        ancestors.add(parent)
+        visit(parent)
+      }
+    
+    def getNarrowAncestors: Seq[RDD[_]]
+    功能: 计算窄依赖祖先列表,使用DFS
+    1. 设置祖先列表
+    val ancestors = new mutable.HashSet[RDD[_]]
+    2. 求取祖先列表
+    visit(this)
+    3. 出去自己,返回
+    val= ancestors.filterNot(_ == this).toSeq
+    
+    def computeOrReadCheckpoint(split: Partition, context: TaskContext): Iterator[T]
+    功能: 计算或者读取检查点RDD数据
+    val= if (isCheckpointedAndMaterialized) { // 经过检查点的实体化,从检查点中获取数据
+      firstParent[T].iterator(split, context)
+    } else { // 没有设置检查点,直接计算分区数据
+      compute(split, context)
+    }
+    
+    def getOrCompute(partition: Partition, context: TaskContext): Iterator[T]
+    功能: 获取或者计算分区数据,如果RDD缓存命中,则使用@RDD.iterator()
+    1. 获取分区对应的数据块标识符
+    val blockId = RDDBlockId(id, partition.index)
+    var readCachedBlock = true
+    2. 计算数据块信息
+    val temp =
+    SparkEnv.get.blockManager.getOrElseUpdate(blockId, storageLevel, elementClassTag, () => {
+      readCachedBlock = false // 缓存中不存在,计算RDD
+      computeOrReadCheckpoint(partition, context)
+    })
+    3. 获取迭代计算值
+    val= temp match {
+        case Left(blockResult) => // 数据块形式的结果,需要从数据块中获取迭代器
+        if (readCachedBlock) { // 从缓存中读取数据块迭代器信息
+          val existingMetrics = context.taskMetrics().inputMetrics
+          existingMetrics.incBytesRead(blockResult.bytes) // 更新度量值
+          new InterruptibleIterator[T](context, blockResult.data.asInstanceOf[Iterator[T]]) {
+            override def next(): T = {
+              existingMetrics.incRecordsRead(1)
+              delegate.next()
+            }
+          }
+        } else { // 从数据块中计算迭代器信息
+          new InterruptibleIterator(context, blockResult.data.asInstanceOf[Iterator[T]])
+        }
+      case Right(iter) =>
+        new InterruptibleIterator(context, iter.asInstanceOf[Iterator[T]])
+    }
+    
+    def withScope[U](body: => U): U = RDDOperationScope.withScope[U](sc)(body)
+    功能: 计算指定代码块@body,所有新的RDD都会在这个代码块中创建
+    
+    def map[U: ClassTag](f: T => U): RDD[U]
+    功能: 计算新的RDD,通过对RDD中的每个元素进行@f 函数操作
+    val cleanF = sc.clean(f)
+    val= new MapPartitionsRDD[U, T](this, (_, _, iter) => iter.map(cleanF))
+    
+    def flatMap[U: ClassTag](f: T => TraversableOnce[U]): RDD[U] 
+    功能: 通过指定映射函数@f 将源RDD中每个元素进行映射,并将映射结果形成列表@TraversableOnce,进而形成新的RDD
+    
+    def filter(f: T => Boolean): RDD[T]
+    功能: 返回新的RDD将会保留满足过滤函数@f 要求的元素值
+    val cleanF = sc.clean(f)
+    val= new MapPartitionsRDD[T, T](
+      this,
+      (_, _, iter) => iter.filter(cleanF),
+      preservesPartitioning = true)
+    
+    def distinct(): RDD[T] = withScope { distinct(partitions.length)}
+    功能: 对RDD进行去重
+    
+    def removeDuplicatesInPartition(partition: Iterator[T]): Iterator[T]
+    功能: 对迭代器中元素进行去重
+    val map = new ExternalAppendOnlyMap[T, Null, Null](
+        createCombiner = _ => null,
+        mergeValue = (a, b) => a,
+        mergeCombiners = (a, b) => a)
+    map.insertAll(partition.map(_ -> null))
+    val= map.iterator.map(_._1) // 获取去重的key
+    
+    def distinct(numPartitions: Int)(implicit ord: Ordering[T] = null): RDD[T]
+    功能: 返回包含去重元素的RDD
+    val= withScope {
+        partitioner match {
+          case Some(_) if numPartitions == partitions.length =>
+            mapPartitions(removeDuplicatesInPartition, preservesPartitioning = true)
+          case _ => map(x => (x, null)).reduceByKey((x, _) => x, numPartitions).map(_._1)
+        }
+    }
+    
+    def repartition(numPartitions: Int)(implicit ord: Ordering[T] = null): RDD[T]
+    功能: 获取一个新的RDD,分区数量为@numPartitions
+    可以增加或者减少RDD的并行度,使用shuffle去重新分布,数据.
+    如果分区数量减少了可以使用@coalesce,这样可以减少一个shuffle
+    val= withScope { coalesce(numPartitions, shuffle = true) }
+    
+    def union(other: RDD[T]): RDD[T] = withScope { sc.union(this, other) }
+    功能: 获取一个新RDD,为当前RDD与@other RDD的合集
+    
+    def ++(other: RDD[T]): RDD[T] = withScope { this.union(other) }
+    功能: 获取与指定RDD@other 联合的新的RDD
+    
+    def sortBy[K](
+      f: (T) => K,
+      ascending: Boolean = true,
+      numPartitions: Int = this.partitions.length)
+      (implicit ord: Ordering[K], ctag: ClassTag[K]): RDD[T]
+    功能: 将当前RDD按照key进行排序,并返回
+    输入参数: 
+    	f	关键字排序函数
+    	ascending	是否升序
+    	numPartitions	分区数量
+    val= this.keyBy[K](f)
+          .sortByKey(ascending, numPartitions)
+          .values
+    
+    def intersection(other: RDD[T]): RDD[T]
+    功能: 获取与指定RDD的交集,输出结果不会包含任何重复的key,尽管输入RDD可能包含,注意内部会引起shuffle
+    val= withScope{ this.map(v => (v, null)).cogroup(other.map(v => (v, null)))
+        .filter { case (_, (leftGroup, rightGroup)) => leftGroup.nonEmpty && rightGroup.nonEmpty }
+        .keys}
+    
+    def intersection(
+      other: RDD[T],
+      partitioner: Partitioner)(implicit ord: Ordering[T] = null): RDD[T]
+    功能: 获取与指定RDD的交集,输出结果不会包含任何重复的key,尽管输入RDD可能包含,注意内部会引起shuffle
+    	分区器@partitioner 是用于配置给结果RDD的
+    val= withScope {
+        this.map(v => (v, null)).cogroup(other.map(v => (v, null)), partitioner)
+        .filter { case (_, (leftGroup, rightGroup)) => leftGroup.nonEmpty && rightGroup.nonEmpty }
+        .keys
+    }
+    
+    def intersection(other: RDD[T], numPartitions: Int): RDD[T]
+    功能: 获取与指定RDD的交集,输出结果不会包含任何重复的key,尽管输入RDD可能包含,注意内部会引起shuffle,在集群内使用hash分区,@numPartitions 结果RDD的分区数量
+    val= intersection(other, new HashPartitioner(numPartitions))
+    
+    def glom(): RDD[Array[T]]
+    功能: 返回一个RDD,将每个分区内的所有元素进行合并,并返回一个列表
+    val= withScope {
+        new MapPartitionsRDD[Array[T], T](this, (_, _, iter) => Iterator(iter.toArray))
+      }
+    
+    def cartesian[U: ClassTag](other: RDD[U]): RDD[(T, U)]
+    功能: 获取与@other 形成的笛卡尔RDD形式
+    val= withScope{new CartesianRDD(sc, this, other)}
+    
+    def groupBy[K](f: T => K)(implicit kt: ClassTag[K]): RDD[(K, Iterable[T])] 
+    功能: 返回分组完毕的RDD,每个组包含一个key和一个元素的序列(映射到那个key). 每个组的元素顺序不能够保证,每次计算的顺序也不可估计.
+    注意: 这个操作开销较大,如果你想通过聚合求和或者平均值,请使用@PairRDDFunctions.aggregateByKey 或者@PairRDDFunctions.reduceByKey 这样效果会比较好.
+    val= withScope { groupBy[K](f, defaultPartitioner(this)) }
+    
+    def groupBy[K](
+      f: T => K,
+      numPartitions: Int)(implicit kt: ClassTag[K]): RDD[(K, Iterable[T])] 
+    功能: 类似@groupBy[K](f: T => K)(implicit kt: ClassTag[K]) 指示这里规定类结果RDD的分区数量
+    val= groupBy(f, new HashPartitioner(numPartitions))
+    
+    def groupBy[K](f: T => K, p: Partitioner)(implicit kt: ClassTag[K], ord: Ordering[K] = null)
+      : RDD[(K, Iterable[T])]
+    功能: 类似上面两个
+    val= withScope {
+        val cleanF = sc.clean(f)
+        this.map(t => (cleanF(t), t)).groupByKey(p)
+      }
+    
+    def pipe(command: String): RDD[String]
+    功能: 将管道输入元素创建一个RDD返回,类似于Runtime.exec() 使用串的标准分词器,对其进行分词并执行
+    val= pipe(PipedRDD.tokenize(command))
+    
+    def pipe(command: String, env: Map[String, String]): RDD[String]
+    功能: 同上,这里指的里系统环境表@env
+    val = pipe(PipedRDD.tokenize(command), env)
+    
+    def pipe(
+      command: Seq[String],
+      env: Map[String, String] = Map(),
+      printPipeContext: (String => Unit) => Unit = null,
+      printRDDElement: (T, String => Unit) => Unit = null,
+      separateWorkingDir: Boolean = false,
+      bufferSize: Int = 8192,
+      encoding: String = Codec.defaultCharsetCodec.name): RDD[String]
+    功能: 同上,结果RDD通过在每个分区中执行指定进程生成.每个分区的输入元素都写到了进程的标准输入.结果RDD的分区包含进程的标准输出,每行标准输出对于一个元素.所有的空分区由一个进程调用.打印行为可以使用两个函数自定义.
+    输入参数:
+    	command	进程执行指令
+    	env	环境变量集合
+    	printPipeContext	打印函数
+    	printRDDElement 使用这个函数,通过自定义实现如何管道传输数据,这个函数每个RDD元素会作为第一参数,打印函数作为第二调用函数,
+    	separateWorkingDir	每个任务的工作目录
+    	bufferSize	标准输入缓冲区大小
+    	encoding	字符编码类型
+    val= new PipedRDD(this, command, env,
+      if (printPipeContext ne null) sc.clean(printPipeContext) else null,
+      if (printRDDElement ne null) sc.clean(printRDDElement) else null,
+      separateWorkingDir,
+      bufferSize,
+      encoding)
+    
+    def mapPartitions[U: ClassTag](
+      f: Iterator[T] => Iterator[U],
+      preservesPartitioning: Boolean = false): RDD[U]
+    功能: 获取对分区进行函数映射@f 的结果RDD
+    val= withScope {
+        val cleanedF = sc.clean(f)
+        new MapPartitionsRDD(
+          this,
+          (_: TaskContext, _: Int, iter: Iterator[T]) => cleanedF(iter),
+          preservesPartitioning)
+      }
+    
+    def mapPartitionsWithIndexInternal[U: ClassTag]
+    功能: 带有索引的分区映射,获取映射之后的RDD
+    只有可以确认RDD元素是可序列化的,且不需要清理闭包,才可以使用.
+    val= new MapPartitionsRDD(
+      this,
+      (_: TaskContext, index: Int, iter: Iterator[T]) => f(index, iter),
+      preservesPartitioning = preservesPartitioning,
+      isOrderSensitive = isOrderSensitive)
+    
+    def mapPartitionsInternal[U: ClassTag](
+      f: Iterator[T] => Iterator[U],
+      preservesPartitioning: Boolean = false): RDD[U] 
+    功能: spark内部的map映射,可以忽略闭包清理
+    val= new MapPartitionsRDD(
+      this,
+      (_: TaskContext, _: Int, iter: Iterator[T]) => f(iter),
+      preservesPartitioning)
+    
+    def mapPartitionsWithIndex[U: ClassTag](
+      f: (Int, Iterator[T]) => Iterator[U],
+      preservesPartitioning: Boolean = false): RDD[U]
+    功能: 对分区使用映射函数@f 进行处理,获取结果RDD.且对原始分区的索引进行定位追踪.
+    val= withScope {
+    val cleanedF = sc.clean(f) // 清除闭包
+    new MapPartitionsRDD(
+      this,
+      (_: TaskContext, index: Int, iter: Iterator[T]) => cleanedF(index, iter),
+      preservesPartitioning)
+  	}	
+    
+    def mapPartitionsWithIndex[U: ClassTag](
+      f: (Int, Iterator[T]) => Iterator[U],
+      preservesPartitioning: Boolean,
+      isOrderSensitive: Boolean): RDD[U]
+    功能: 同上,@isOrderSensitive 表示函数是否是对排序敏感,如果敏感,那么改变输入属性,结果将会变化,多数情况下对排序时敏感的.
+    val= withScope {
+    val cleanedF = sc.clean(f)
+        new MapPartitionsRDD(
+          this,
+          (_: TaskContext, index: Int, iter: Iterator[T]) => cleanedF(index, iter),
+          preservesPartitioning,
+          isOrderSensitive = isOrderSensitive)
+      }
+    
+    def zip[U: ClassTag](other: RDD[U]): RDD[(T, U)]
+    功能: 与指定RDD@other 进行拉链操作,返回kv对,第一个元素是每个RDD的元素,第二个元素是每个RDD的元素.假定两个RDD含有相同数量分区和元素.
+    val= withScope {
+        zipPartitions(other, preservesPartitioning = false) { (thisIter, otherIter) =>
+          new Iterator[(T, U)] {
+            def hasNext: Boolean = (thisIter.hasNext, otherIter.hasNext) match {
+              case (true, true) => true
+              case (false, false) => false
+              case _ => throw new SparkException("Can only zip RDDs with " +
+                "same number of elements in each partition")
+            }
+            def next(): (T, U) = (thisIter.next(), otherIter.next())
+          }
+        }
+      }
+    
+    def zipPartitions[B: ClassTag, V: ClassTag]
+      (rdd2: RDD[B], preservesPartitioning: Boolean)
+      (f: (Iterator[T], Iterator[B]) => Iterator[V]): RDD[V]
+    功能: 获取拉链RDD分区
+    输入参数: 
+    	rdd2	RDD
+    	f	拉链转换函数
+    val= new ZippedPartitionsRDD2(sc, sc.clean(f), this, rdd2, preservesPartitioning)
+    
+    def zipPartitions[B: ClassTag, V: ClassTag]
+      (rdd2: RDD[B])
+      (f: (Iterator[T], Iterator[B]) => Iterator[V]): RDD[V]
+    功能: 同上
+    val= zipPartitions(rdd2, preservesPartitioning = false)(f)
+    
+    def zipPartitions[B: ClassTag, C: ClassTag, V: ClassTag]
+      (rdd2: RDD[B], rdd3: RDD[C], preservesPartitioning: Boolean)
+      (f: (Iterator[T], Iterator[B], Iterator[C]) => Iterator[V]): RDD[V]
+    功能: 同上,三值拉链
+    val= new ZippedPartitionsRDD3(sc, sc.clean(f), this, rdd2, rdd3, preservesPartitioning)
+    
+    def zipPartitions[B: ClassTag, C: ClassTag, V: ClassTag]
+      (rdd2: RDD[B], rdd3: RDD[C])
+      (f: (Iterator[T], Iterator[B], Iterator[C]) => Iterator[V]): RDD[V]
+    功能: 同上,三值拉链
+    val =zipPartitions(rdd2, rdd3, preservesPartitioning = false)(f)
+    
+    def zipPartitions[B: ClassTag, C: ClassTag, D: ClassTag, V: ClassTag]
+      (rdd2: RDD[B], rdd3: RDD[C], rdd4: RDD[D], preservesPartitioning: Boolean)
+      (f: (Iterator[T], Iterator[B], Iterator[C], Iterator[D]) => Iterator[V]): RDD[V]
+    功能: 同上,四值拉链
+    val= new ZippedPartitionsRDD4(sc, sc.clean(f), this, rdd2, rdd3, rdd4, preservesPartitioning)
+    
+    def zipPartitions[B: ClassTag, C: ClassTag, D: ClassTag, V: ClassTag]
+      (rdd2: RDD[B], rdd3: RDD[C], rdd4: RDD[D])
+      (f: (Iterator[T], Iterator[B], Iterator[C], Iterator[D]) => Iterator[V]): RDD[V]
+    功能: 同上,四值拉链
+    val= zipPartitions(rdd2, rdd3, rdd4, preservesPartitioning = false)(f)
+    
+    def foreach(f: T => Unit): Unit
+    功能: RDD元素遍历操作 @f为遍历动作
+    val= withScope {
+        val cleanF = sc.clean(f)
+        sc.runJob(this, (iter: Iterator[T]) => iter.foreach(cleanF))
+      }
+    
+    def foreachPartition(f: Iterator[T] => Unit): Unit
+    功能: 分区遍历操作 @f 为分区操作函数
+    val= withScope {
+        val cleanF = sc.clean(f)
+        sc.runJob(this, (iter: Iterator[T]) => cleanF(iter))
+      }
+    
+    def collect(): Array[T]
+    功能: 获取所有元素形成的列表,注意使用这个方法时请保证数据量不要太大,所有数据会存储到执行器的driver端.
+    val= withScope {
+        val results = sc.runJob(this, (iter: Iterator[T]) => iter.toArray)
+        Array.concat(results: _*)
+      }
+    
+    def toLocalIterator: Iterator[T]
+    功能: 转化为本地迭代器(包含RDD的所有元素)
+    def collectPartition(p: Int): Array[T] = { // 获取迭代器列表中第p个
+      sc.runJob(this, (iter: Iterator[T]) => iter.toArray, Seq(p)).head
+    }
+    val= partitions.indices.iterator.flatMap(i => collectPartition(i))
+    
+    def collect[U: ClassTag](f: PartialFunction[T, U]): RDD[U]
+    功能: 获取与函数@f 计算值匹配的元素的RDD
+    val= withScope {
+        val cleanF = sc.clean(f)
+        filter(cleanF.isDefinedAt).map(cleanF)
+      }
+    
+    def subtract(other: RDD[T]): RDD[T]
+    功能: 求当前RDD与指定RDD@other 的差集RDD
+    val= withScope {subtract(other, partitioner.getOrElse(new HashPartitioner(partitions.length))) }
+    
+    def subtract(other: RDD[T], numPartitions: Int): RDD[T]
+    功能: 同上,指定了分区数量
+    val= withScope {
+        subtract(other, new HashPartitioner(numPartitions))
+      }
+    
+    def subtract(
+      other: RDD[T],
+      p: Partitioner)(implicit ord: Ordering[T] = null): RDD[T]
+    功能: 差集RDD,指定了分区器
+    val= withScope {
+        if (partitioner == Some(p)) {
+          val p2 = new Partitioner() {
+            override def numPartitions: Int = p.numPartitions
+            override def getPartition(k: Any): Int = p.getPartition(k.asInstanceOf[(Any, _)]._1)
+          }
+          this.map(x => (x, null)).subtractByKey(other.map((_, null)), p2).keys
+        } else {
+          this.map(x => (x, null)).subtractByKey(other.map((_, null)), p).keys
+        }
+    }
+    
+    def reduce(f: (T, T) => T): T
+    功能: 使用指定函数@f 对RDD的元素进行reduce操作
+    1. 获取迭代器reduce函数
+    val cleanF = sc.clean(f)
+    val reducePartition: Iterator[T] => Option[T] = iter => {
+      if (iter.hasNext) {
+        Some(iter.reduceLeft(cleanF))
+      } else {
+        None
+      }
+    }
+    2. 获取合并结果
+    var jobResult: Option[T] = None
+    val mergeResult = (_: Int, taskResult: Option[T]) => {
+      if (taskResult.isDefined) {
+        jobResult = jobResult match {
+          case Some(value) => Some(f(value, taskResult.get))
+          case None => taskResult
+        }
+      }
+    }
+    3. 对合并结果(迭代器)再次进行合并
+    sc.runJob(this, reducePartition, mergeResult)
+    
+    def treeReduce(f: (T, T) => T, depth: Int = 2): T
+    功能: 使用多级树对RDD进行合并
+    0. 树深度断言
+    require(depth >= 1, s"Depth must be greater than or equal to 1 but got $depth.")
+    1. 迭代器reduce函数
+    val cleanF = context.clean(f)
+    val reducePartition: Iterator[T] => Option[T] = iter => {
+      if (iter.hasNext) {
+        Some(iter.reduceLeft(cleanF))
+      } else {
+        None
+      }
+    }
+    2. 获取部分聚合函数
+    val partiallyReduced = mapPartitions(it => Iterator(reducePartition(it)))
+    val op: (Option[T], Option[T]) => Option[T] = (c, x) => {
+      if (c.isDefined && x.isDefined) {
+        Some(cleanF(c.get, x.get))
+      } else if (c.isDefined) {
+        c
+      } else if (x.isDefined) {
+        x
+      } else {
+        None
+      }
+    }
+    3. 进行树状聚合,并获取结果
+    val= partiallyReduced.treeAggregate(Option.empty[T])(op, op, depth)
+      .getOrElse(throw new UnsupportedOperationException("empty collection"))
+    
+    def fold(zeroValue: T)(op: (T, T) => T): T
+    功能: 聚合每个分区中的元素,然后聚合所有分区的结果使用指定的函数,和中立的零值@zeroValue ,函数op允许修改第一个参数,并作为返回的结果,从而并对象内存分配.但是第二个参数不能修改.
+    这个功能与scala基础包中的,不使用在分布式状态下的方法有些差异.这个fold操作用于每个分区中,将这个结果堆叠到最终结果中.因为这个函数不是交换的,所以与基础包下的fold不一样.
+    输入参数:
+    	zeroValue	每个分区操作的初始值,通用也是分区合并到最终结果的计算初始值
+    	op	结果合并函数
+    1. 获取分区合并值
+    // 拷贝一份初始值,因为每部分任务都需要初始值
+    var jobResult = Utils.clone(zeroValue, sc.env.closureSerializer.newInstance())
+    val cleanOp = sc.clean(op)
+    val foldPartition = (iter: Iterator[T]) => iter.fold(zeroValue)(cleanOp)
+    val mergeResult = (_: Int, taskResult: T) => jobResult = op(jobResult, taskResult)
+    2. 合并获取最终结果
+    sc.runJob(this, foldPartition, mergeResult)
+    val= jobResult
+    
+    def count(): Long = sc.runJob(this, Utils.getIteratorSize _).sum
+    功能: 计算RDD元素数量
+    
+    def countApprox(
+      timeout: Long,
+      confidence: Double = 0.95): PartialResult[BoundedDouble]
+    功能: 获取近似计数值
+    输入参数:
+    	timeout	计算时间上限
+    	confidence	置信值
+    0. 置信值参数断言
+    require(0.0 <= confidence && confidence <= 1.0, s"confidence ($confidence) must be in [0,1]")
+    1. 获取元素计数函数(每个任务的每个迭代器计算)
+    val countElements: (TaskContext, Iterator[T]) => Long = { (_, iter) =>
+      var result = 0L
+      while (iter.hasNext) {
+        result += 1L
+        iter.next()
+      }
+      result
+    }
+    2. 计算近似计数值
+    val evaluator = new CountEvaluator(partitions.length, confidence)
+    val= sc.runApproximateJob(this, countElements, evaluator, timeout)
+    
+    def aggregate[U: ClassTag](zeroValue: U)(seqOp: (U, T) => U, combOp: (U, U) => U): U
+    功能: 聚合每个分区的元素,然后将聚合结果聚合所有分区,得到结果值,使用给定合并函数和初始值@zeroValue.这个方法能够获取一个新类型的结果值.因此,需要将T合并成U的函数.这两个函数第一个参数都可以修改值,以便于减小内存分配量.
+    输入:
+    	seqOp	分区内合并函数
+    	combOp	分区合并函数
+    val= withScope {
+        var jobResult = Utils.clone(zeroValue, sc.env.serializer.newInstance())
+        val cleanSeqOp = sc.clean(seqOp)
+        val cleanCombOp = sc.clean(combOp)
+        val aggregatePartition = (it: Iterator[T]) => it.aggregate(zeroValue)(cleanSeqOp, cleanCombOp)
+        val mergeResult = (_: Int, taskResult: U) => jobResult = combOp(jobResult, taskResult)
+        sc.runJob(this, aggregatePartition, mergeResult)
+        jobResult
+    }
+    
+    def treeAggregate[U: ClassTag](zeroValue: U)(
+      seqOp: (U, T) => U,
+      combOp: (U, U) => U,
+      depth: Int = 2): U 
+    功能: 使用树的多级合并对RDD进行聚合
+    val= if (partitions.length == 0) {
+      Utils.clone(zeroValue, context.env.closureSerializer.newInstance())
+    } else {
+      val cleanSeqOp = context.clean(seqOp)
+      val cleanCombOp = context.clean(combOp)
+      val aggregatePartition = // 获取分区合并函数
+        (it: Iterator[T]) => it.aggregate(zeroValue)(cleanSeqOp, cleanCombOp)
+      // 获取分区内聚合结果
+      var partiallyAggregated: RDD[U] = mapPartitions(it => Iterator(aggregatePartition(it)))
+      var numPartitions = partiallyAggregated.partitions.length
+      val scale = math.max(math.ceil(math.pow(numPartitions, 1.0 / depth)).toInt, 2)
+      while (numPartitions > scale + math.ceil(numPartitions.toDouble / scale)) {
+        numPartitions /= scale
+        val curNumPartitions = numPartitions
+        partiallyAggregated = partiallyAggregated.mapPartitionsWithIndex {
+          (i, iter) => iter.map((i % curNumPartitions, _))
+        }.foldByKey(zeroValue, new HashPartitioner(curNumPartitions))(cleanCombOp).values
+      }
+      val copiedZeroValue = Utils.clone(zeroValue, sc.env.closureSerializer.newInstance())
+      partiallyAggregated.fold(copiedZeroValue)(cleanCombOp) // 获取分区合并结果
+    }
+    
+    def countByValue()(implicit ord: Ordering[T] = null): Map[T, Long]
+    功能: 返回当前kv对的value计数值(使用map表示信息),由于计算结果会存储到驱动器内存中,所以计算规模不能过大
+    val= map(value => (value, null)).countByKey()
+    
+    def countByValueApprox(timeout: Long, confidence: Double = 0.95)
+      (implicit ord: Ordering[T] = null)
+      : PartialResult[Map[T, BoundedDouble]]
+    功能: 近似计算RDD中value的分布情况
+    1. 参数合法性校验
+    require(0.0 <= confidence && confidence <= 1.0, s"confidence ($confidence) must be in [0,1]")
+    if (elementClassTag.runtimeClass.isArray) {
+      throw new SparkException("countByValueApprox() does not support arrays")
+    }
+    2. 设置计数函数
+    val countPartition: (TaskContext, Iterator[T]) => OpenHashMap[T, Long] = { (_, iter) =>
+      val map = new OpenHashMap[T, Long]
+      iter.foreach {
+        t => map.changeValue(t, 1L, _ + 1L)
+      }
+      map
+    }
+    3. 运行计数任务,获取计数信息
+    val evaluator = new GroupedCountEvaluator[T](partitions.length, confidence)
+    val= sc.runApproximateJob(this, countPartition, evaluator, timeout)
+    
+    def countApproxDistinct(p: Int, sp: Int): Long
+    功能: 近似计算去重元素数量
+    算法基于streamlib对HyperLogLog算法的实现,紧缺的为1.054 / sqrt(2^p),设置一个非零孩子sp(大于p),可能会触发稀疏表示,这样就会缩小内存占有量,增加计算准确度.
+    输入参数:
+    	p	普通测试集精确度,如果sp不等于0,那么0<p<sp
+    	sp	稀疏集合的精确度,0<sp<32 如果sp=0,那么跳过稀疏化
+    1. 参数合法性校验
+    require(p >= 4, s"p ($p) must be >= 4")
+    require(sp <= 32, s"sp ($sp) must be <= 32")
+    require(sp == 0 || p <= sp, s"p ($p) cannot be greater than sp ($sp)")
+    2. 创建一个稀疏化的计数器
+    val zeroCounter = new HyperLogLogPlus(p, sp)
+    3. 获取计算结果
+    val= aggregate(zeroCounter)(
+      (hll: HyperLogLogPlus, v: T) => { // 分区内部聚合
+        hll.offer(v)
+        hll
+      },
+      (h1: HyperLogLogPlus, h2: HyperLogLogPlus) => { // 分区间聚合
+        h1.addAll(h2)
+        h1
+      }).cardinality()
+    
+    def countApproxDistinct(relativeSD: Double = 0.05): Long
+    功能: 同上,relativeSD为相关度,数字越小,则需要创建更多的空间,必须大于0.000017
+    require(relativeSD > 0.000017, s"accuracy ($relativeSD) must be greater than 0.000017")
+    val p = math.ceil(2.0 * math.log(1.054 / relativeSD) / math.log(2)).toInt
+    val= countApproxDistinct(if (p < 4) 4 else p, 0)
+    
+    def zipWithIndex(): RDD[(T, Long)]
+    功能: 带上RDD索引对其进行拉链,顺序时第一个基于分区编号,然后在分区内部按照记录排序,所以第一个元素分区号为0.类似于scala的拉链.但是类型使用的是long(分区).这个方法会触发spark job,当内部RDD包含多个分区时.
+    注意: 有些RDD,比如groupBy()返回的RDD,不保证分区内元素的有序性.因此,指定给元素的分区编号就不能保证了.如果RDD重新计算过,甚至会改变.如果需要定长排序,用于保证同样的分配,可以使用sortByKey()进行排序,或者将其存储到文件中.
+    val= withScope { new ZippedWithIndexRDD(this) }
+    
+    def zipWithUniqueId(): RDD[(T, Long)]
+    功能： 对RDD进行拉链，产生唯一的编号。比如说的k个分区，会产生编号k，n+k（n是分区总数）
+    val= withScope {
+        val n = this.partitions.length.toLong
+        this.mapPartitionsWithIndex { case (k, iter) =>
+          Utils.getIteratorZipWithIndex(iter, 0L).map { case (item, i) =>
+            (item, i * n + k)
+          }
+        }
+      }
+    
+    def first(): T
+    功能: 获取RDD首个元素
+    val= withScope {
+        take(1) match {
+          case Array(t) => t
+          case _ => throw new UnsupportedOperationException("empty collection")
+        }
+    }
+    
+    def top(num: Int)(implicit ord: Ordering[T]): Array[T]
+    功能： 获取RDD中的TOP K的元素，形成列表
+    val= withScope { takeOrdered(num)(ord.reverse) }
+    
+    def max()(implicit ord: Ordering[T]): T = withScope { this.reduce(ord.max) }
+    功能: 获取RDD最大元素 
+    
+    def min()(implicit ord: Ordering[T]): T = withScope { this.reduce(ord.min) }
+    功能: 获取RDD最小元素
+    
+    def isEmpty(): Boolean = withScope { partitions.length == 0 || take(1).length == 0 }
+    功能: 确定RDD是否为空
+    
+    def saveAsTextFile(path: String): Unit = withScope { saveAsTextFile(path, null) }
+    功能: 存储RDD到指定文件中
+    
+    def saveAsTextFile(path: String, codec: Class[_ <: CompressionCodec]): Unit
+    功能: 同上,这里可以设置压缩方式
+    this.mapPartitions { iter =>
+      val text = new Text()
+      iter.map { x =>
+        require(x != null, "text files do not allow null rows")
+        text.set(x.toString)
+        (NullWritable.get(), text)
+      }
+    }.saveAsHadoopFile[TextOutputFormat[NullWritable, Text]](path, codec)
+    
+    def saveAsObjectFile(path: String): Unit
+    功能: 将RDD存储为序列化完成的序列文件
+    val= this.mapPartitions(iter => iter.grouped(10).map(_.toArray))
+      .map(x => (NullWritable.get(), new BytesWritable(Utils.serialize(x))))
+      .saveAsSequenceFile(path)
+    
+    def keyBy[K](f: T => K): RDD[(K, T)]
+    功能: 创建当前RDD元素的元组,使用函数@f 构建元组参数
+    val cleanedF = sc.clean(f)
+    val= map(x => (cleanedF(x), x))
+    
+    def collectPartitions(): Array[Array[T]]
+    功能: 测试方法,用于查看每个分区的内容
+    val= withScope {
+        sc.runJob(this, (iter: Iterator[T]) => iter.toArray)
+      }
+    
+    def checkpoint(): Unit
+    功能: 为当前RDD设置检查点,将会保存在检查点目录下,所有父RDD引用会被移除,必须在任务执行在RDD之后,才可以调用.否则会需要重新计算.建议持久化到内存中。
+    RDDCheckpointData.synchronized {
+        // 使用全局锁，保证子RDD指向正确的父RDD，为之后的访问考虑
+         if (context.checkpointDir.isEmpty) {
+          throw new SparkException("Checkpoint directory has not been set in the SparkContext")
+        } else if (checkpointData.isEmpty) {
+          checkpointData = Some(new ReliableRDDCheckpointData(this))
+        }
+    }
+    
+    def localCheckpoint(): this.type
+    功能： 本地检查点
+   	这种对于拥有长的血缘关系的RDD，且需要周期性清空（GraphX）的RDD有效，可以跳过将RDD实体化到文件系统中的工作。 本地检查点牺牲了容错性，它写到了执行器中的本地存储，而不是一个可靠的文件系统。影响时执行器一旦计算期间失败，检查点数据就再也拿不出来了。
+    使用动态内存分配是不安全的，使得移除执行器的时候会一同将缓存数据块一同。
+    1. 动态内存分配处理
+    if (conf.get(DYN_ALLOCATION_ENABLED) &&
+        conf.contains(DYN_ALLOCATION_CACHED_EXECUTOR_IDLE_TIMEOUT)) {
+      logWarning("Local checkpointing is NOT safe to use with dynamic allocation, " +
+        "which removes executors along with their cached blocks. If you must use both " +
+        "features, you are advised to set `spark.dynamicAllocation.cachedExecutorIdleTimeout` " +
+        "to a high value. E.g. If you plan to use the RDD for 1 hour, set the timeout to " +
+        "at least 1 hour.")
+    }
+    2. 持久化RDD
+    if (storageLevel == StorageLevel.NONE) {
+      persist(LocalRDDCheckpointData.DEFAULT_STORAGE_LEVEL)
+    } else { // 覆盖式持久化,保证正确性
+      persist(LocalRDDCheckpointData.transformStorageLevel(storageLevel), allowOverride = true)
+    }
+    3. RDD实体化
+    if (isCheckpointedAndMaterialized) {
+      logWarning("Not marking RDD for local checkpoint because it was already " +
+        "checkpointed and materialized")
+    } else {
+      checkpointData match {
+        case Some(_: ReliableRDDCheckpointData[_]) => logWarning(
+          "RDD was already marked for reliable checkpointing: overriding with local checkpoint.")
+        case _ =>
+      }
+      checkpointData = Some(new LocalRDDCheckpointData(this))
+    }
+    val= this
+    
+    def isCheckpointed: Boolean = isCheckpointedAndMaterialized
+    功能: 检查RDD是否设置检查点,是否实体化
+    
+    def isCheckpointedAndMaterialized: Boolean =
+    checkpointData.exists(_.isCheckpointed)
+    功能: 测试使用,检查持久化数据中是否包含@isCheckpointed 用于确定是否实体化
+    
+    def isLocallyCheckpointed: Boolean
+    功能: 确定是否处于本地检查点实体化
+    val= checkpointData match {
+      case Some(_: LocalRDDCheckpointData[T]) => true
+      case _ => false
+    }
+    
+    def isReliablyCheckpointed: Boolean
+    功能: 确定是否为可靠性检查点
+    val= checkpointData match {
+      case Some(reliable: ReliableRDDCheckpointData[_]) if reliable.isCheckpointed => true
+      case _ => false
+    }
+    
+    def getCheckpointFile: Option[String]
+    功能: 获取检查点文件名称
+    val= checkpointData match {
+      case Some(reliable: ReliableRDDCheckpointData[T]) => reliable.getCheckpointDir
+      case _ => None
+    }
+    
+    def toDebugString: String
+    功能： 转化为debug信息
+    
+    @Experimental
+    @Since("2.4.0")
+    def barrier(): RDDBarrier[T] = withScope(new RDDBarrier[T](this))
+    功能: 运行spark job时将该stage标记位barrier stage。由任务失败时，不需要重启失败任务，而是放弃整个任务，来个这个stage重新运行所有任务。
+    
+    def getCreationSite: String = Option(creationSite).map(_.shortForm).getOrElse("")
+    功能: 获取用户调用
+    
+    def elementClassTag: ClassTag[T] = classTag[T]
+    功能： 获取RDD元素类型
+    
+    def firstParent[U: ClassTag]: RDD[U]
+    功能： 获取第一个父RDD
+    val= dependencies.head.rdd.asInstanceOf[RDD[U]]
+    
+    def parent[U: ClassTag](j: Int): RDD[U]
+    功能: 获取第j个父RDD
+    val= dependencies(j).rdd.asInstanceOf[RDD[U]]
+    
+    def context: SparkContext = sc
+    功能： 获取spark上下文
+    
+    def clearDependencies(): Unit
+    功能： 清理当前RDD的依赖
+    val= stateLock.synchronized {
+        dependencies_ = null
+      }
+    
+    def toJavaRDD() : JavaRDD[T] = {  new JavaRDD(this)(elementClassTag) }
+    功能: 转换为Java类型的RDD
+    
+    def isBarrier(): Boolean = isBarrier_
+    功能： 检查当前是否为一个barrier stage
+    
+    def getOutputDeterministicLevel: DeterministicLevel.Value
+    功能： 获取当前决定等级
+    
+    def toString: String
+    功能： 信息显示
+    
+    def markCheckpointed(): Unit
+    功能: 标记检查点
+    改变当前RDD的依赖,创建检查点文件,并且忘记之前的依赖关系和分区信息
+    clearDependencies() // 清除依赖
+    partitions_ = null // 忘记分区信息
+    deps = null  // 忘记依赖关系
+    
+    def retag(cls: Class[T]): RDD[T]
+    功能: 改变RDD的类标签为cls(用于解决Java-scala的兼容问题)
+    val classTag: ClassTag[T] = ClassTag.apply(cls)
+    this.retag(classTag)
+    
+    def retag(implicit classTag: ClassTag[T]): RDD[T]
+    功能: 同上
+    val= this.mapPartitions(identity, preservesPartitioning = true)(classTag)
+    
+    def doCheckpoint(): Unit
+    功能: 保存RDD检查点文件,任务完成调用.建议使用内存存放检查点信息.
+    val= RDDOperationScope.withScope(sc, "checkpoint", allowNesting = false, ignoreParent = true) {
+      if (!doCheckpointCalled) {
+        doCheckpointCalled = true
+        if (checkpointData.isDefined) {
+          if (checkpointAllMarkedAncestors) { // 先对父RDD进行检查点设置,因为之后会忘却依赖关系
+            dependencies.foreach(_.rdd.doCheckpoint())
+          }
+          checkpointData.get.checkpoint() 
+        } else {
+          dependencies.foreach(_.rdd.doCheckpoint())
+        }
+      }
+    }
+    
+    def take(num: Int): Array[T]
+    功能: 获取RDD中前@num个元素,首次扫描一个分区的时候使用,使用这个分区的计算结果,去估量其他分区需要获取多少.
+    注意: 小数据量时使用,计算结果会存储到driver侧内存中.
+    1. 获取RDD扫描因子
+    val scaleUpFactor = Math.max(conf.get(RDD_LIMIT_SCALE_UP_FACTOR), 2)
+    2. take 0特殊情况
+    val= new Array[T](0)
+    3. 其他情况
+    val buf = new ArrayBuffer[T]
+    val totalParts = this.partitions.length
+    var partsScanned = 0
+    while (buf.size < num && partsScanned < totalParts) {
+        var numPartsToTry = 1L
+        val left = num - buf.size
+        if (partsScanned > 0) {
+          if (buf.isEmpty) {
+            numPartsToTry = partsScanned * scaleUpFactor
+          } else {
+            numPartsToTry = Math.ceil(1.5 * left * partsScanned / buf.size).toInt
+            numPartsToTry = Math.min(numPartsToTry, partsScanned * scaleUpFactor)
+          }
+        }
+        val p = partsScanned.until(math.min(partsScanned + numPartsToTry, totalParts).toInt)
+        val res = sc.runJob(this, (it: Iterator[T]) => it.take(left).toArray, p)
+        res.foreach(buf ++= _.take(num - buf.size))
+        partsScanned += p.size
+    }
+    
+    def takeOrdered(num: Int)(implicit ord: Ordering[T]): Array[T]
+    功能: 获取top K,注意计算结果存储在driver的内存中(使用堆空间为k的优先队列即可解决)
+    if (num == 0) {
+      Array.empty
+    } else {
+      val mapRDDs = mapPartitions { items =>\
+        val queue = new BoundedPriorityQueue[T](num)(ord.reverse)
+        queue ++= collectionUtils.takeOrdered(items, num)(ord)
+        Iterator.single(queue)
+      }
+      if (mapRDDs.partitions.length == 0) {
+        Array.empty
+      } else {
+        mapRDDs.reduce { (queue1, queue2) =>
+          queue1 ++= queue2
+          queue1
+        }.toArray.sorted(ord)
+      }
+    }
+}
+```
+
+```scala
+object RDD {
+    属性:
+    #name @CHECKPOINT_ALL_MARKED_ANCESTORS="spark.checkpoint.checkpointAllMarkedAncestors"
+    
+    操作集:
+    def rddToPairRDDFunctions[K, V](rdd: RDD[(K, V)])
+    (implicit kt: ClassTag[K], vt: ClassTag[V], ord: Ordering[K] = null): PairRDDFunctions[K, V]
+    功能: 普通RDD转PairRDD
+    val=new PairRDDFunctions(rdd) 
+    
+    def rddToAsyncRDDActions[T: ClassTag](rdd: RDD[T]): AsyncRDDActions[T]
+    功能: RDD转异步RDD动作
+    val=  new AsyncRDDActions(rdd)
+    
+    def rddToOrderedRDDFunctions[K : Ordering : ClassTag, V: ClassTag](rdd: RDD[(K, V)])
+    : OrderedRDDFunctions[K, V, (K, V)]
+    功能: RDD转排序RDD
+    
+    def doubleRDDToDoubleRDDFunctions(rdd: RDD[Double]): DoubleRDDFunctions
+    =new DoubleRDDFunctions(rdd)
+    功能: RDD转DOubleRDD
+    
+    def numericRDDToDoubleRDDFunctions[T](rdd: RDD[T])(implicit num: Numeric[T])
+    : DoubleRDDFunctions
+    功能: 数字类型rdd转doubleRDD
+    val= new DoubleRDDFunctions(rdd.map(x => num.toDouble(x)))
+}
+```
+
+```scala
+private[spark] object DeterministicLevel extends Enumeration {
+    val DETERMINATE, UNORDERED, INDETERMINATE = Value
+    介绍: 
+    	DETERMINATE	可重现
+    	INDETERMINATE	不可重现
+    	UNORDERED	输入顺序无关性
+}
+```
+
 #### RDDBarrier
 
 ```scala
@@ -3123,3 +4178,7 @@ class ZippedWithIndexRDD[T: ClassTag](prev: RDD[T]) extends RDD[(T, Long)](prev)
 ```
 
 #### 基础拓展
+
+1.  [spark paper](http://people.csail.mit.edu/matei/papers/2012/nsdi_spark.pdf)
+2.  闭包清理
+3.  [Art Cardinality Estimation Algorithm](https://doi.org/10.1145/2452376.2452456)
