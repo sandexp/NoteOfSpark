@@ -1084,6 +1084,179 @@ private[spark] class EmptyRDD[T: ClassTag](sc: SparkContext) extends RDD[T](sc, 
 
 #### HadoopRDD
 
+```scala
+private[spark] class HadoopPartition(rddId: Int, override val index: Int, s: InputSplit)
+extends Partition {
+    介绍: spark 分片类,包装了hadoop 的输入分片
+    构造器参数:
+    	rddId	rdd编号
+    	index	索引号
+    	s	输入分片
+    属性:
+    #name @inputSplit = new SerializableWritable[InputSplit](s)	输入分片
+    操作集:
+    def hashCode(): Int = 31 * (31 + rddId) + index
+    功能: 计算hashcode
+    
+    def equals(other: Any): Boolean = super.equals(other)
+    功能: 判断分区是否相等
+    
+    def getPipeEnvVars(): Map[String, String]
+    功能: 使用通道,将环境变量添加到用户环境变量中.
+    val= {
+    val envVars: Map[String, String] = if (inputSplit.value.isInstanceOf[FileSplit]) {
+      val is: FileSplit = inputSplit.value.asInstanceOf[FileSplit]
+      Map("map_input_file" -> is.getPath().toString(),
+        "mapreduce_map_input_file" -> is.getPath().toString())
+    } else {
+      Map()
+    }
+    envVars
+  }
+}
+```
+
+```scala
+@DeveloperApi
+class HadoopRDD[K, V](
+    sc: SparkContext,
+    broadcastedConf: Broadcast[SerializableConfiguration],
+    initLocalJobConfFuncOpt: Option[JobConf => Unit],
+    inputFormatClass: Class[_ <: InputFormat[K, V]],
+    keyClass: Class[K],
+    valueClass: Class[V],
+    minPartitions: Int)
+extends RDD[(K, V)](sc, Nil) with Logging {
+    介绍: 读取存储在hadoop中的数据(HDFS,HBase,S3),提供基本的核心的使用.
+    构造器参数:
+        sc	spark上下文
+        broadcastedConf	广播变量配置
+        initLocalJobConfFuncOpt	初始化本地job配置函数
+        inputFormatClass	输入类型
+        keyClass	key类标签
+        valueClass	value类标签
+        minPartitions	分区数量
+    属性:
+    #name @jobConfCacheKey: String = "rdd_%d_job_conf".format(id)	job配置key
+    #name @inputFormatCacheKey: String = "rdd_%d_input_format".format(id)	输入形式缓存key
+    #name @createTime = new Date() 创建时间
+    #name @shouldCloneJobConf = sparkContext.conf.getBoolean("spark.hadoop.cloneConf", false) 是否需要克隆配置
+    #name @ignoreCorruptFiles = sparkContext.conf.get(IGNORE_CORRUPT_FILES) 
+    是否忽略无效文件
+    #name @ignoreMissingFiles = sparkContext.conf.get(IGNORE_MISSING_FILES) 
+    是否忽视丢失文件
+    #name @ignoreEmptySplits = sparkContext.conf.get(HADOOP_RDD_IGNORE_EMPTY_SPLITS)
+    是否忽视空数据块
+    操作集:
+    def getJobConf(): JobConf
+    功能: 获取jobconf
+    
+    def getInputFormat(conf: JobConf): InputFormat[K, V]
+    功能: 获取输入类型
+    
+    def getPartitions: Array[Partition]
+    功能: 获取分区列表
+    
+    def compute(theSplit: Partition, context: TaskContext): InterruptibleIterator[(K, V)]
+    功能: 计算分区数据
+    
+    @DeveloperApi
+    def mapPartitionsWithInputSplit[U: ClassTag](
+        f: (InputSplit, Iterator[(K, V)]) => Iterator[U],
+        preservesPartitioning: Boolean = false): RDD[U]
+    功能: 在分区上使用map映射,给分片提供基于分区的处理方法
+    
+    def getPreferredLocations(split: Partition): Seq[String]
+    功能: 获取指定分区的最佳位置列表
+    
+    def checkpoint(): Unit={}
+    功能: Hadoop RDD不设置检查点
+    
+    def getConf: Configuration = getJobConf()
+    功能: 获取配置信息
+    
+    def persist(storageLevel: StorageLevel): this.type
+    功能: 持久化
+    if (storageLevel.deserialized) {
+      logWarning("Caching HadoopRDDs as deserialized objects usually leads to undesired" +
+        " behavior because Hadoop's RecordReader reuses the same Writable object for all records." +
+        " Use a map transformation to make copies of the records.")
+    }
+    super.persist(storageLevel)
+}
+```
+
+```scala
+private[spark] object HadoopRDD extends Logging {
+    属性:
+    #name @CONFIGURATION_INSTANTIATION_LOCK = new Object() 配置实例化锁
+    #name @RECORDS_BETWEEN_BYTES_READ_METRIC_UPDATES = 256 读取度量值的计数值
+    操作集:
+    def getCachedMetadata(key: String): Any = SparkEnv.get.hadoopJobMetadata.get(key)
+    功能: 获取指定的hadoop job元数据
+    
+    def putCachedMetadata(key: String, value: Any): Unit
+    功能: 存放元数据信息
+    SparkEnv.get.hadoopJobMetadata.put(key, value)
+    
+    def addLocalConfiguration(jobTrackerId: String, jobId: Int, splitId: Int, attemptId: Int,conf: JobConf): Unit
+    功能: 添加本地配置到单个分区上
+    val jobID = new JobID(jobTrackerId, jobId)
+    val taId = new TaskAttemptID(new TaskID(jobID, TaskType.MAP, splitId), attemptId)
+    conf.set("mapreduce.task.id", taId.getTaskID.toString)
+    conf.set("mapreduce.task.attempt.id", taId.toString)
+    conf.setBoolean("mapreduce.task.ismap", true)
+    conf.setInt("mapreduce.task.partition", splitId)
+    conf.set("mapreduce.job.id", jobID.toString)
+}
+```
+
+```scala
+private[spark] class HadoopMapPartitionsWithSplitRDD[U: ClassTag, T: ClassTag](
+      prev: RDD[T],
+      f: (InputSplit, Iterator[T]) => Iterator[U],
+      preservesPartitioning: Boolean = false)
+extends RDD[U](prev) {
+    构造器参数:
+    	prev	父RDD
+    	f	分区转换函数
+    	preservesPartitioning	是否保持分区
+    属性:
+    #name @partitioner = if (preservesPartitioning) firstParent[T].partitioner else None
+    分区器
+    操作集:
+    def getPartitions: Array[Partition] = firstParent[T].partitions
+    功能: 获取分区列表
+    
+    def compute(split: Partition, context: TaskContext): Iterator[U] 
+    功能: 计算分区信息
+    val= {
+      val partition = split.asInstanceOf[HadoopPartition]
+      val inputSplit = partition.inputSplit.value
+      f(inputSplit, firstParent[T].iterator(split, context))
+    }
+    
+    def convertSplitLocationInfo(
+       infos: Array[SplitLocationInfo]): Option[Seq[String]]
+    功能: 转换分区本地信息
+    val=  {
+    Option(infos).map(_.flatMap { loc =>
+      val locationStr = loc.getLocation
+      if (locationStr != "localhost") {
+        if (loc.isInMemory) {
+          logDebug(s"Partition $locationStr is cached by Hadoop.")
+          Some(HDFSCacheTaskLocation(locationStr).toString)
+        } else {
+          Some(HostTaskLocation(locationStr).toString)
+        }
+      } else {
+        None
+      }
+    })
+  }
+}
+```
+
 #### InputFileBlockHolder
 
 ```scala
@@ -1540,6 +1713,731 @@ extends Logging with Serializable {
 ```
 
 #### PairRDDFunctions
+
+```scala
+class PairRDDFunctions[K, V](self: RDD[(K, V)])
+    (implicit kt: ClassTag[K], vt: ClassTag[V], ord: Ordering[K] = null)
+extends Logging with Serializable {
+    介绍: pairRDD函数
+    def combineByKeyWithClassTag[C](
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C,
+      partitioner: Partitioner,
+      mapSideCombine: Boolean = true,
+      serializer: Serializer = null)(implicit ct: ClassTag[C]): RDD[(K, C)]
+    功能： 通用函数，用于对key进行的合并，使用用户定义的归并函数将RDD[K,V]转换为RDD[K,C]用于指定合并的类型C,用户需要提供三个函数:
+    `createCombiner` 将V转换为C的函数
+    `mergeValue`	将V合并成C的函数
+    `mergeCombiners`	将两个C转化成1个C
+    除此之外,用户可以控制输出RDD的分区,以及是否开启map侧的聚合(如果一个mapper产生多个值的情况下)
+    注意到,V和C类型可以不同,比如(Int,Int) -> (Int, Seq[Int])
+    输入参数:
+    	createCombiner	合并函数
+    	mergeValue	归并函数
+    	mergeCombiners	合并器归并
+    	partitioner	分区器
+    	mapSideCombine	map侧是否归并
+    1. 参数检测
+    require(mergeCombiners != null, "mergeCombiners must be defined")
+    if (keyClass.isArray) {
+      if (mapSideCombine) {
+        throw new SparkException("Cannot use map-side combining with array keys.")
+      }
+      if (partitioner.isInstanceOf[HashPartitioner]) {
+        throw new SparkException("HashPartitioner cannot partition array keys.")
+      }
+    }
+    2. 获取合并器
+    val aggregator = new Aggregator[K, V, C](
+      self.context.clean(createCombiner),
+      self.context.clean(mergeValue),
+      self.context.clean(mergeCombiners))
+    3. 获取归并后的RDD
+    val= if (self.partitioner == Some(partitioner)) {
+      self.mapPartitions(iter => {
+        val context = TaskContext.get()
+        new InterruptibleIterator(context, aggregator.combineValuesByKey(iter, context))
+      }, preservesPartitioning = true)
+    } else {
+      new ShuffledRDD[K, V, C](self, partitioner)
+        .setSerializer(serializer)
+        .setAggregator(aggregator)
+        .setMapSideCombine(mapSideCombine)
+    }
+    
+    def combineByKey[C](
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C,
+      partitioner: Partitioner,
+      mapSideCombine: Boolean = true,
+      serializer: Serializer = null): RDD[(K, C)]
+    功能: 合并每个key的元素,使用用户的合并函数,是一个后台函数,不会提供类信息给shuffle
+    val= self.withScope {
+        combineByKeyWithClassTag(createCombiner, mergeValue, mergeCombiners,
+          partitioner, mapSideCombine, serializer)(null)
+      }
+    
+    def combineByKey[C](
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C,
+      numPartitions: Int): RDD[(K, C)]
+    功能: @combineByKeyWithClassTag 的简化版本,对输出RDD进行hash分区,方法具有向后兼容性,不通过合并的类标签信息给shuffle
+    val= self.withScope {
+        combineByKeyWithClassTag(
+            createCombiner, mergeValue, mergeCombiners, numPartitions)(null)
+      }
+    
+    def combineByKeyWithClassTag[C](
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C,
+      numPartitions: Int)(implicit ct: ClassTag[C]): RDD[(K, C)]
+    功能: 对输出RDD进行hash分区,简化@combineByKeyWithClassTag
+    val= self.withScope {
+        combineByKeyWithClassTag(createCombiner, mergeValue, mergeCombiners,
+          new HashPartitioner(numPartitions))
+      }
+    
+    def aggregateByKey[U: ClassTag](zeroValue: U, numPartitions: Int)(seqOp: (U, V) => U,
+      combOp: (U, U) => U): RDD[(K, U)]
+    功能: 归并每个key的值,使用给定合并函数和初始值@zeroValue,这个函数返回结果类型U,而不是这个RDD的输出类型V,因此,需要对V合并到U中,用户合并两个U类的数据,后续是合并两个分区的值.每个避免不必要的内存分配,所有的函数都运行修改和返回(首个参数).,而非是创建一个新的U.
+    val= self.withScope {
+        aggregateByKey(zeroValue, new HashPartitioner(numPartitions))(seqOp, combOp)
+      }
+    
+    def aggregateByKey[U: ClassTag](zeroValue: U, partitioner: Partitioner)
+    (seqOp: (U, V) => U,combOp: (U, U) => U): RDD[(K, U)]
+    功能: 对每个key进行归并,使用指定的归并函数@seq和指定初始值@zeroValue,这个函数返回了不同的类型U而不是RDD的类型V,形式操作函数用户将所有函数的值合并成一个值@combOp .为了避免内存不必要的分配,第一个参数是可以进行修改的.而非是创建一个新的类型U.
+    1. 获取初始值副本,以便于获得每个key的副本
+    val zeroBuffer = SparkEnv.get.serializer.newInstance().serialize(zeroValue)
+    val zeroArray = new Array[Byte](zeroBuffer.limit)
+    zeroBuffer.get(zeroArray)
+    2. 创建序列化相关参数
+    lazy val cachedSerializer = SparkEnv.get.serializer.newInstance()
+    val createZero = () => cachedSerializer.deserialize[U](ByteBuffer.wrap(zeroArray))
+    3. 清除归并的闭包信息
+    val cleanedSeqOp = self.context.clean(seqOp)
+    val= combineByKeyWithClassTag[U](
+        (v: V) => cleanedSeqOp(createZero(), v), //创建类型转换函数
+      cleanedSeqOp,  // 分区内部合并函数
+      combOp, // 分区间合并函数
+      partitioner)	
+    
+    def foldByKey(zeroValue: V,partitioner: Partitioner)(func: (V, V) => V): RDD[(K, V)]
+    功能: 对每个key使用相关函数对值进行合并,中间值会被添加到每次结果计算中
+    1. 获取初始值副本,用于发送到每次计算中
+    val zeroBuffer = SparkEnv.get.serializer.newInstance().serialize(zeroValue)
+    val zeroArray = new Array[Byte](zeroBuffer.limit)
+    zeroBuffer.get(zeroArray)
+    lazy val cachedSerializer = SparkEnv.get.serializer.newInstance()
+    val createZero = () => cachedSerializer.deserialize[V](ByteBuffer.wrap(zeroArray))
+    2. 清理闭包
+    val cleanedFunc = self.context.clean(func)
+    val= combineByKeyWithClassTag[V]((v: V) => cleanedFunc(createZero(), v),
+      cleanedFunc, cleanedFunc, partitioner)
+    
+    def foldByKey(zeroValue: V, numPartitions: Int)(func: (V, V) => V): RDD[(K, V)]
+    功能: 同上,指定了分区数量
+    val= self.withScope {foldByKey(zeroValue, defaultPartitioner(self))(func)}
+    
+    def sampleByKey(withReplacement: Boolean,
+      fractions: Map[K, Double],
+      seed: Long = Utils.random.nextLong): RDD[(K, V)]
+    功能: 返回RDD key采样的子集(通过分层采用),对于不同的key使用可变的采样比例,创建当前RDD的采样.作为指定的采样因子@fractions,用于采样比例的key.
+    输入参数:
+    withReplacement	是否采用替代式采样
+    fractions	采样因子(采样比例)
+    seed	随机种子
+    返回包含采样子集的RDD.
+    0. 采样因子断言
+    require(fractions.values.forall(v => v >= 0.0), "Negative sampling rates.")
+    1. 获取采样函数
+    val samplingFunc = if (withReplacement) {
+      // 可替代采样泊松分布
+      StratifiedSamplingUtils.getPoissonSamplingFunction(self, fractions, false, seed)
+    } else {
+      // 不可替代采样伯努利分布
+      StratifiedSamplingUtils.getBernoulliSamplingFunction(self, fractions, false, seed)
+    }
+    val= self.mapPartitionsWithIndex(
+        samplingFunc, preservesPartitioning = true, isOrderSensitive = true)
+    
+    def sampleByKeyExact(
+      withReplacement: Boolean,
+      fractions: Map[K, Double],
+      seed: Long = Utils.random.nextLong): RDD[(K, V)]
+    功能: 返回RDD子集安装key进行采样,准确的包含了每层的math.ceil(numItems * samplingRate)个元素.
+    (按照key进行精确采样)
+    require(fractions.values.forall(v => v >= 0.0), "Negative sampling rates.")
+	1. 获取采样函数(使用精确采样)
+    val samplingFunc = if (withReplacement) {
+      StratifiedSamplingUtils.getPoissonSamplingFunction(self, fractions, true, seed)
+    } else {
+      StratifiedSamplingUtils.getBernoulliSamplingFunction(self, fractions, true, seed)
+    }
+    val= self.mapPartitionsWithIndex
+    (samplingFunc, preservesPartitioning = true, isOrderSensitive = true)
+    
+    def reduceByKey(partitioner: Partitioner, func: (V, V) => V): RDD[(K, V)]
+    功能: 按照key进行合并,使用指定的聚合函数@func ,允许再每个mapper上进行合并,再将结果发送到reducer上.相似与MR的combine.
+    val= self.withScope {
+        combineByKeyWithClassTag[V]((v: V) => v, func, func, partitioner)
+      }
+    
+    def reduceByKey(func: (V, V) => V, numPartitions: Int): RDD[(K, V)]
+    功能: 同上,指定了分区数量@numPartitions
+    val=self.withScope{reduceByKey(new HashPartitioner(numPartitions), func)}
+    
+    def reduceByKey(func: (V, V) => V):RDD[(K, V)]=self.withScope{ 	
+        reduceByKey(defaultPartitioner(self), func)}
+	功能: 默认reduce
+    
+    def reduceByKeyLocally(func: (V, V) => V): Map[K, V]
+    功能: 本地reduce,按照Map的形式将结果返回给master
+    1. 参数检验
+    val cleanedF = self.sparkContext.clean(func)
+    if (keyClass.isArray) {
+      throw new SparkException("reduceByKeyLocally() does not support array keys")
+    }
+    2. 获取reduce分区
+    val reducePartition = (iter: Iterator[(K, V)]) => {
+      val map = new JHashMap[K, V]
+      iter.foreach { pair =>
+        val old = map.get(pair._1)
+        map.put(pair._1, if (old == null) pair._2 else cleanedF(old, pair._2))
+      }
+      Iterator(map)
+    } : Iterator[JHashMap[K, V]]
+    3. 获取归并函数
+    val mergeMaps = (m1: JHashMap[K, V], m2: JHashMap[K, V]) => {
+      m2.asScala.foreach { pair =>
+        val old = m1.get(pair._1)
+        m1.put(pair._1, if (old == null) pair._2 else cleanedF(old, pair._2))
+      }
+      m1
+    } : JHashMap[K, V]
+    4. 获取合并之后的结果
+    val= self.mapPartitions(reducePartition).reduce(mergeMaps).asScala
+    
+    def countByKey(): Map[K, Long]
+    功能:对key的数量计数
+    val= self.withScope {
+        self.mapValues(_ => 1L).reduceByKey(_ + _).collect().toMap
+      }
+    注意: 结果是存储在driver的内存中的,所以数据集不能太大.
+    
+    def countByKeyApprox(timeout: Long, confidence: Double = 0.95)
+      : PartialResult[Map[K, BoundedDouble]]
+    功能: 近似计算key的数量,时间上限为timeout,置信值为0.95
+    val= self.withScope {
+        self.map(_._1).countByValueApprox(timeout, confidence)
+      }
+    
+    def countApproxDistinctByKey(
+      p: Int,
+      sp: Int,
+      partitioner: Partitioner): RDD[(K, Long)]
+    功能: 近似计算去重key的数量
+    0. 参数断言
+    require(p >= 4, s"p ($p) must be >= 4")
+    require(sp <= 32, s"sp ($sp) must be <= 32")
+    require(sp == 0 || p <= sp, s"p ($p) cannot be greater than sp ($sp)")
+    1. 创建HLL函数
+    val createHLL = (v: V) => {
+      val hll = new HyperLogLogPlus(p, sp)
+      hll.offer(v)
+      hll
+    }
+    2. HLL与值的合并
+    val mergeValueHLL = (hll: HyperLogLogPlus, v: V) => {
+      hll.offer(v)
+      hll
+    }
+    3. HLL的合并
+    val mergeHLL = (h1: HyperLogLogPlus, h2: HyperLogLogPlus) => {
+      h1.addAll(h2)
+      h1
+    }
+    val= combineByKeyWithClassTag(createHLL, mergeValueHLL, mergeHLL, partitioner)
+      .mapValues(_.cardinality())
+    
+    def countApproxDistinctByKey(
+      relativeSD: Double,
+      partitioner: Partitioner): RDD[(K, Long)]
+    功能: 计算近似去重的key数量,relativeSD是相关精确度,不能小于0.000017
+    val= self.withScope {
+        require(relativeSD > 0.000017, s"accuracy ($relativeSD) must be greater than 0.000017")
+        val p = math.ceil(2.0 * math.log(1.054 / relativeSD) / math.log(2)).toInt
+        assert(p <= 32)
+        countApproxDistinctByKey(if (p < 4) 4 else p, 0, partitioner)
+      }
+    
+    def countApproxDistinctByKey(
+      relativeSD: Double,
+      numPartitions: Int): RDD[(K, Long)] 
+    功能: 同上
+    val= self.withScope {
+        countApproxDistinctByKey(relativeSD, new HashPartitioner(numPartitions))
+      }
+    
+    def countApproxDistinctByKey(relativeSD: Double = 0.05): RDD[(K, Long)]
+    功能: 同上,指定了相关精确度
+    val= self.withScope {
+        countApproxDistinctByKey(relativeSD, defaultPartitioner(self))
+      }
+    
+    def groupByKey(partitioner: Partitioner): RDD[(K, Iterable[V])]
+    功能: 对每个key进行分组,运行分区的控制,通过传递一个分区器,去产生新的pair RDD.每个组中元素的顺序不确定,与每次RDD执行也不具有可重现性.
+    val= self.withScope {
+  	// 不应当使用map侧join,因为map的combine不会减少shuffle数据数量,而且需要map侧数据插入到hash表中.会导致更多的对象.
+    val createCombiner = (v: V) => CompactBuffer(v)
+    val mergeValue = (buf: CompactBuffer[V], v: V) => buf += v
+    val mergeCombiners = (c1: CompactBuffer[V], c2: CompactBuffer[V]) => c1 ++= c2
+    val bufs = combineByKeyWithClassTag[CompactBuffer[V]](
+      createCombiner, mergeValue, mergeCombiners, partitioner, mapSideCombine = false)
+    bufs.asInstanceOf[RDD[(K, Iterable[V])]]
+  }
+    
+    def groupByKey(numPartitions: Int): RDD[(K, Iterable[V])] 
+    功能: 按照指定分区数量,进行分组
+    val= self.withScope {
+        groupByKey(new HashPartitioner(numPartitions))
+      }
+    
+    def partitionBy(partitioner: Partitioner): RDD[(K, V)]
+    功能: 使用指定分区器对RDD进行分区,并返回
+    1. 参数校验
+    if (keyClass.isArray && partitioner.isInstanceOf[HashPartitioner]) {
+      throw new SparkException("HashPartitioner cannot partition array keys.")
+    }
+    2. 获取重新分区的RDD
+    val= if (self.partitioner == Some(partitioner)) {
+      self
+    } else { // 检测到新的分区方案,对数据进行shuffle重分区
+      new ShuffledRDD[K, V, V](self, partitioner)
+    }
+    
+    def join[W](other: RDD[(K, W)], partitioner: Partitioner): RDD[(K, (V, W))]
+    功能: 返回包含所有pair元素的RDD用于匹配指定RDD@other,每个形式会被返回，形式为(k,(v1,v2)).v1为this,v2为other.
+    val= self.withScope {
+        this.cogroup(other, partitioner).flatMapValues( pair =>
+          for (v <- pair._1.iterator; w <- pair._2.iterator) yield (v, w)
+        )
+      }
+    
+    def leftOuterJoin[W](
+      other: RDD[(K, W)],
+      partitioner: Partitioner): RDD[(K, (V, Option[W]))]
+    功能: 返回(k,(v,Some(w))),其中w为other,v为this,可以保证this的元素不为空
+    val= self.withScope {
+        this.cogroup(other, partitioner).flatMapValues { pair =>
+          if (pair._2.isEmpty) {
+            pair._1.iterator.map(v => (v, None))
+          } else {
+            for (v <- pair._1.iterator; w <- pair._2.iterator) yield (v, Some(w))
+          }
+        }
+      }
+    
+    def rightOuterJoin[W](other: RDD[(K, W)], partitioner: Partitioner)
+      : RDD[(K, (Option[V], W))]
+    功能: 类似上述,other不含空值
+    val= self.withScope {
+        this.cogroup(other, partitioner).flatMapValues { pair =>
+          if (pair._1.isEmpty) {
+            pair._2.iterator.map(w => (None, w))
+          } else {
+            for (v <- pair._1.iterator; w <- pair._2.iterator) yield (Some(v), w)
+          }
+        }
+      }
+    
+    def fullOuterJoin[W](other: RDD[(K, W)], partitioner: Partitioner)
+      : RDD[(K, (Option[V], Option[W]))]
+    功能: 返回形式(k, (Some(v), Some(w)))
+    val= self.withScope {
+        this.cogroup(other, partitioner).flatMapValues {
+          case (vs, Seq()) => vs.iterator.map(v => (Some(v), None))
+          case (Seq(), ws) => ws.iterator.map(w => (None, Some(w)))
+          case (vs, ws) => for (v <- vs.iterator; w <- ws.iterator) 
+            yield (Some(v), Some(w))
+        }
+      }
+    
+    def combineByKey[C](
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C): RDD[(K, C)]
+    功能: @combineByKeyWithClassTag 的简单实现,结果RDD使用指定的分区器.方法时向后兼容的,不使用合并器标签
+    val= self.withScope {
+        combineByKeyWithClassTag(createCombiner, mergeValue, mergeCombiners)(null)
+      }
+    
+    def combineByKeyWithClassTag[C](
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C)(implicit ct: ClassTag[C]): RDD[(K, C)]
+    val= self.withScope {
+        combineByKeyWithClassTag(createCombiner, mergeValue,
+                                 mergeCombiners, defaultPartitioner(self))
+      }
+    
+    def groupByKey(): RDD[(K, Iterable[V])]
+    功能: 默认的按key分组,分区内部数据不定,不具有可重现性
+    val= self.withScope {
+        groupByKey(defaultPartitioner(self))
+      }
+    
+    def join[W](other: RDD[(K, W)]): RDD[(K, (V, W))]
+    功能: 默认inner join 
+    val= self.withScope {
+        join(other, defaultPartitioner(self, other))
+      }
+    
+    def join[W](other: RDD[(K, W)], numPartitions: Int): RDD[(K, (V, W))]
+    功能: 使用指定分区数量的join
+    val= self.withScope {
+        join(other, new HashPartitioner(numPartitions))
+      }
+    
+    def leftOuterJoin[W](other: RDD[(K, W)]): RDD[(K, (V, Option[W]))]
+    功能: 与指定RDD@other 的外部join
+    val= self.withScope {
+        leftOuterJoin(other, defaultPartitioner(self, other))
+      }
+    
+    def leftOuterJoin[W](
+      other: RDD[(K, W)],
+      numPartitions: Int): RDD[(K, (V, Option[W]))]
+    功能: 指定分区数量的左外连接
+    val= self.withScope {
+        leftOuterJoin(other, new HashPartitioner(numPartitions))
+      }
+    
+    def rightOuterJoin[W](other: RDD[(K, W)]): RDD[(K, (Option[V], W))]
+    功能: 右外链接
+    val= self.withScope {
+        rightOuterJoin(other, defaultPartitioner(self, other))
+      }
+    
+    def rightOuterJoin[W](
+      other: RDD[(K, W)],
+      numPartitions: Int): RDD[(K, (Option[V], W))] 
+    功能: 指定分区数量的右外链接
+    val= self.withScope {
+        rightOuterJoin(other, new HashPartitioner(numPartitions))
+      }
+    
+    def fullOuterJoin[W](other: RDD[(K, W)]): RDD[(K, (Option[V], Option[W]))]
+    功能: 全连接
+    val= self.withScope { fullOuterJoin(other, defaultPartitioner(self, other)) }
+    
+    def fullOuterJoin[W](
+      other: RDD[(K, W)],
+      numPartitions: Int): RDD[(K, (Option[V], Option[W]))] = self.withScope {
+    fullOuterJoin(other, new HashPartitioner(numPartitions)) }
+    功能: 指定分区数量的全连接
+    
+    def collectAsMap(): Map[K, V]
+    功能: 将RDD的kv信息以Map形式发送给master,发送的数据不能太大(类型不是multiMap)
+    val= self.withScope {
+        val data = self.collect()
+        val map = new mutable.HashMap[K, V]
+        map.sizeHint(data.length)
+        data.foreach { pair => map.put(pair._1, pair._2) }
+        map
+      }
+    
+    def mapValues[U](f: V => U): RDD[(K, U)]
+    功能: 不改变key,使用指定函数@f 将value值改变也会保留RDD分区,不会产生shuffle
+    val= self.withScope {
+        val cleanF = self.context.clean(f)
+        new MapPartitionsRDD[(K, U), (K, V)](self,
+          (context, pid, iter) => iter.map { case (k, v) => (k, cleanF(v)) },
+          preservesPartitioning = true)
+      }
+    
+    def flatMapValues[U](f: V => TraversableOnce[U]): RDD[(K, U)]
+    功能: 不改变key,使用flatMap函数传递给kv RDD,保留了原始RDD的分区.
+    输入参数:
+    	f	flatMap函数
+    val= self.withScope {
+        val cleanF = self.context.clean(f)
+        new MapPartitionsRDD[(K, U), (K, V)](self,
+          (context, pid, iter) => iter.flatMap { case (k, v) =>
+            cleanF(v).map(x => (k, x))
+          },
+          preservesPartitioning = true)
+      }
+    
+    def cogroup[W1, W2, W3](other1: RDD[(K, W1)],
+      other2: RDD[(K, W2)],
+      other3: RDD[(K, W3)],
+      partitioner: Partitioner)
+      : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2], Iterable[W3]))]
+    功能: 对于每个key,this,other1,other2,other3,返回一个元素用户合并者几个数值
+    1. 参数校验
+    if (partitioner.isInstanceOf[HashPartitioner] && keyClass.isArray) {
+      throw new SparkException("HashPartitioner cannot partition array keys.")
+    }
+    2. 参数聚合
+    val cg = new CoGroupedRDD[K](Seq(self, other1, other2, other3), partitioner)
+    cg.mapValues { case Array(vs, w1s, w2s, w3s) =>
+       (vs.asInstanceOf[Iterable[V]],
+         w1s.asInstanceOf[Iterable[W1]],
+         w2s.asInstanceOf[Iterable[W2]],
+         w3s.asInstanceOf[Iterable[W3]])}
+    
+    def cogroup[W](other: RDD[(K, W)], partitioner: Partitioner)
+      : RDD[(K, (Iterable[V], Iterable[W]))]
+    功能: 一个RDD归并
+    val= self.withScope {
+        if (partitioner.isInstanceOf[HashPartitioner] && keyClass.isArray) {
+          throw new SparkException("HashPartitioner cannot partition array keys.")
+        }
+        val cg = new CoGroupedRDD[K](Seq(self, other), partitioner)
+        cg.mapValues { case Array(vs, w1s) =>
+          (vs.asInstanceOf[Iterable[V]], w1s.asInstanceOf[Iterable[W]])
+        }
+      }
+    
+    def cogroup[W1, W2](other1: RDD[(K, W1)], other2: RDD[(K, W2)], partitioner: Partitioner)
+      : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2]))]
+    功能: 两个RDD归并
+    val= self.withScope {
+        if (partitioner.isInstanceOf[HashPartitioner] && keyClass.isArray) {
+          throw new SparkException("HashPartitioner cannot partition array keys.")
+        }
+        val cg = new CoGroupedRDD[K](Seq(self, other1, other2), partitioner)
+        cg.mapValues { case Array(vs, w1s, w2s) =>
+          (vs.asInstanceOf[Iterable[V]],
+            w1s.asInstanceOf[Iterable[W1]],
+            w2s.asInstanceOf[Iterable[W2]])
+        }
+      }
+    
+    def cogroup[W1, W2, W3](other1: RDD[(K, W1)], other2: RDD[(K, W2)], other3: RDD[(K, W3)]): RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2], Iterable[W3]))]
+    功能: 三个RDD归并
+    val= self.withScope {
+        cogroup(other1, other2, other3, defaultPartitioner(self, other1, other2, other3))
+      }
+    
+    def cogroup[W](other: RDD[(K, W)]): RDD[(K, (Iterable[V], Iterable[W]))]
+    功能: 默认两个RDD合并
+    val= self.withScope {
+        cogroup(other, defaultPartitioner(self, other))
+      }
+    
+    def cogroup[W1, W2](other1: RDD[(K, W1)], other2: RDD[(K, W2)])
+      : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2]))]
+    功能: 两个三个RDD合并
+    val= self.withScope {
+        cogroup(other1, other2, defaultPartitioner(self, other1, other2))
+      }
+    
+    def cogroup[W](
+      other: RDD[(K, W)],
+      numPartitions: Int): RDD[(K, (Iterable[V], Iterable[W]))] 
+    功能: 指定分区,两个RDD合并
+    val= self.withScope {
+        cogroup(other, new HashPartitioner(numPartitions))
+      }
+    
+    def cogroup[W1, W2, W3](other1: RDD[(K, W1)],
+      other2: RDD[(K, W2)],
+      other3: RDD[(K, W3)],
+      numPartitions: Int)
+      : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2], Iterable[W3]))]
+    功能: 4个RDD合并,指定分区
+    val= self.withScope {
+        cogroup(other1, other2, other3, new HashPartitioner(numPartitions))
+      }
+    
+    def groupWith[W](other: RDD[(K, W)]): RDD[(K, (Iterable[V], Iterable[W]))]
+    功能: cogroup 别名
+    val= self.withScope {cogroup(other, defaultPartitioner(self, other))}
+    
+    def groupWith[W1, W2](other1: RDD[(K, W1)], other2: RDD[(K, W2)])
+      : RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2]))]
+    val= self.withScope {
+    	cogroup(other1, other2, defaultPartitioner(self, other1, other2))}
+    
+    def groupWith[W1, W2, W3](other1: RDD[(K, W1)], other2: RDD[(K, W2)], other3: RDD[(K, W3)]): RDD[(K, (Iterable[V], Iterable[W1], Iterable[W2], Iterable[W3]))]
+    val= self.withScope {
+        cogroup(other1, other2, other3, defaultPartitioner(self, other1, other2, other3))
+      }
+    
+    def subtractByKey[W: ClassTag](other: RDD[(K, W)]): RDD[(K, V)]
+    功能: 将this中减去@other 的差集
+    val= self.withScope {
+        subtractByKey(other, self.partitioner.
+                      getOrElse(new HashPartitioner(self.partitions.length)))
+      }
+    
+    def subtractByKey[W: ClassTag](
+      other: RDD[(K, W)],
+      numPartitions: Int): RDD[(K, V)]
+    功能: 从this中减去@other 的差集
+    val= self.withScope {
+        subtractByKey(other, new HashPartitioner(numPartitions))
+      }
+    
+    def subtractByKey[W: ClassTag](other: RDD[(K, W)], p: Partitioner): RDD[(K, V)]
+    功能: 指定分区方式的,差集求法
+    val= self.withScope {
+        new SubtractedRDD[K, V, W](self, other, p)
+      }
+    
+    def lookup(key: K): Seq[V]
+    功能: 查找指定key的value序列,如果已知分区器,只需要搜索分区
+    val= self.withScope {
+        self.partitioner match {
+          case Some(p) =>
+            val index = p.getPartition(key)
+            val process = (it: Iterator[(K, V)]) => {
+              val buf = new ArrayBuffer[V]
+              for (pair <- it if pair._1 == key) {
+                buf += pair._2
+              }
+              buf
+            } : Seq[V]
+            val res = self.context.runJob(self, process, Array(index))
+            res(0)
+          case None =>
+            self.filter(_._1 == key).map(_._2).collect()
+        }
+      }
+    
+    def saveAsHadoopFile[F <: OutputFormat[K, V]](
+      path: String)(implicit fm: ClassTag[F]): Unit
+    功能: 输出RDD到一个支持RDD的文件系统中,使用@OutputFormat 支持RDD的kv类型
+    val= self.withScope {
+    saveAsHadoopFile(path, keyClass, valueClass, fm.runtimeClass.asInstanceOf[Class[F]])
+    }	
+    
+    def saveAsHadoopFile[F <: OutputFormat[K, V]](
+      path: String,
+      codec: Class[_ <: CompressionCodec])(implicit fm: ClassTag[F]): Unit
+    功能: 同上,不过可以指定压缩类型
+    val= self.withScope {
+        val runtimeClass = fm.runtimeClass
+        saveAsHadoopFile(path, keyClass, valueClass, runtimeClass.asInstanceOf[Class[F]], codec)
+      }
+    
+    def saveAsNewAPIHadoopFile[F <: NewOutputFormat[K, V]](
+      path: String)(implicit fm: ClassTag[F]): Unit
+    功能: 使用hadoop新api实现上述逻辑
+    val= self.withScope {
+        saveAsNewAPIHadoopFile(path, keyClass, valueClass, fm.runtimeClass.asInstanceOf[Class[F]])
+      }
+    
+    def saveAsNewAPIHadoopFile(
+      path: String,
+      keyClass: Class[_],
+      valueClass: Class[_],
+      outputFormatClass: Class[_ <: NewOutputFormat[_, _]],
+      conf: Configuration = self.context.hadoopConfiguration): Unit
+    功能: 功能同上
+    val= self.withScope {
+        // 重命名hadoopConf 避免配置遮蔽,参照SPARK-2038
+        val hadoopConf = conf
+        val job = NewAPIHadoopJob.getInstance(hadoopConf)
+        job.setOutputKeyClass(keyClass)
+        job.setOutputValueClass(valueClass)
+        job.setOutputFormatClass(outputFormatClass)
+        val jobConfiguration = job.getConfiguration
+        jobConfiguration.set("mapreduce.output.fileoutputformat.outputdir", path)
+        saveAsNewAPIHadoopDataset(jobConfiguration)
+      }
+    
+    def saveAsHadoopFile(
+      path: String,
+      keyClass: Class[_],
+      valueClass: Class[_],
+      outputFormatClass: Class[_ <: OutputFormat[_, _]],
+      codec: Class[_ <: CompressionCodec]): Unit
+    功能: 同上,指定了压缩方式@codec
+    val= self.withScope {
+        saveAsHadoopFile(path, keyClass, valueClass, outputFormatClass,
+          new JobConf(self.context.hadoopConfiguration), Option(codec))
+      }
+    
+    def saveAsHadoopFile(
+      path: String,
+      keyClass: Class[_],
+      valueClass: Class[_],
+      outputFormatClass: Class[_ <: OutputFormat[_, _]],
+      conf: JobConf = new JobConf(self.context.hadoopConfiguration),
+      codec: Option[Class[_ <: CompressionCodec]] = None): Unit
+    功能: 同上
+    val= self.withScope {
+        val hadoopConf = conf
+        hadoopConf.setOutputKeyClass(keyClass)
+        hadoopConf.setOutputValueClass(valueClass)
+        conf.setOutputFormat(outputFormatClass)
+        for (c <- codec) {
+          hadoopConf.setCompressMapOutput(true)
+          hadoopConf.set("mapreduce.output.fileoutputformat.compress", "true")
+          hadoopConf.setMapOutputCompressorClass(c)
+          hadoopConf.set("mapreduce.output.fileoutputformat.compress.codec", c.getCanonicalName)
+          hadoopConf.set("mapreduce.output.fileoutputformat.compress.type",
+            CompressionType.BLOCK.toString)
+        }
+        if (conf.getOutputCommitter == null) {
+          hadoopConf.setOutputCommitter(classOf[FileOutputCommitter])
+        }
+        val speculationEnabled = self.conf.get(SPECULATION_ENABLED)
+        val outputCommitterClass = hadoopConf.get("mapred.output.committer.class", "")
+        if (speculationEnabled && outputCommitterClass.contains("Direct")) {
+          val warningMessage =
+            s"$outputCommitterClass may be an output committer that writes data directly to " +
+              "the final location. Because speculation is enabled, this output committer may " +
+              "cause data loss (see the case in SPARK-10063). If possible, please use an output " +
+              "committer that does not have this behavior (e.g. FileOutputCommitter)."
+          logWarning(warningMessage)
+        }
+        FileOutputFormat.setOutputPath(hadoopConf,
+          SparkHadoopWriterUtils.createPathFromString(path, hadoopConf))
+        saveAsHadoopDataset(hadoopConf)
+  }
+                                                                           
+    def saveAsNewAPIHadoopDataset(conf: Configuration): Unit
+    功能: 保存为Hadoop数据集
+    val= self.withScope {
+        val config = new HadoopMapReduceWriteConfigUtil[K, V](new SerializableConfiguration(conf))
+        SparkHadoopWriter.write(
+          rdd = self,
+          config = config)
+      }
+    
+    def saveAsHadoopDataset(conf: JobConf): Unit
+    功能: 同上
+    val= self.withScope {
+        val config = new HadoopMapRedWriteConfigUtil[K, V](new SerializableJobConf(conf))
+        SparkHadoopWriter.write(
+          rdd = self,
+          config = config)
+      }
+    
+    def keys: RDD[K] = self.map(_._1)
+    功能: 获取pair RDD中key形成的RDD
+    
+    def values: RDD[V] = self.map(_._2)
+    功能: 获取pair RDD中value形成的RDD
+    
+    def keyClass: Class[_] = kt.runtimeClass
+    功能: 获取key的类标签
+    
+    def valueClass: Class[_] = vt.runtimeClass
+    功能: 获取value的类标签
+    
+    def keyOrdering: Option[Ordering[K]] = Option(ord)
+    功能: 获取key排序方式
+}
+```
 
 #### ParallelCollectionRDD
 
