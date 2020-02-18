@@ -731,16 +731,96 @@ extends Logging {
         blockInfoManager.removeBlock(blockId)
     }
     
+    def dropBlock[T](blockId: BlockId, entry: MemoryEntry[T]): Unit
+    功能: 扔掉指定数据块@blockId
+    1. 获取指定数据块@blockId 的数据块
+    val data = entry match {
+          case DeserializedMemoryEntry(values, _, _) => Left(values)
+          case SerializedMemoryEntry(buffer, _, _) => Right(buffer)
+        }
+    2. 将指定数据块从内存中移出
+    val newEffectiveStorageLevel =
+          blockEvictionHandler.dropFromMemory(blockId, () => data)(entry.classTag)
+    3. 移出数据块
+    if (newEffectiveStorageLevel.isValid) {
+        // 数据块仍旧存储于至少一个存储中,则释放锁,但是并不需要删除数据块
+        blockInfoManager.unlock(blockId)
+    } else {
+        // 如果数据块不存在于任何存储中,删除数据块信息,以便于数据块可以再次被存储
+        blockInfoManager.removeBlock(blockId)
+    }
+    
     def evictBlocksToFreeSpace(
       blockId: Option[BlockId],
       space: Long,
       memoryMode: MemoryMode): Long 
     功能: 回收数据块已达到释放空间的功能
+    尝试释放数据块内存，用户存储特点的数据块，如果数据块大于内存或者需要替代同一个RDD的其他数据块时会引发失败。(会导致RDD循环替代格式的浪费,以及内存容量不足的问题),需要块管理器对操作进行临界资源管理.
     输入参数:
     	blockId	数据块标识符
     	space	数据块大小
     	memoryMode	内存模式
-
+	返回释放的内存量
+    0. 存储空间大小断言
+    assert(space > 0)
+    1. 移除指定数据块内存
+    memoryManager.synchronized {
+      var freedMemory = 0L
+      val rddToAdd = blockId.flatMap(getRddId)
+      val selectedBlocks = new ArrayBuffer[BlockId]
+      def blockIsEvictable(blockId: BlockId, entry: MemoryEntry[_]): Boolean = {
+        entry.memoryMode == memoryMode && (rddToAdd.isEmpty || rddToAdd != getRddId(blockId))
+      }
+      entries.synchronized {
+        val iterator = entries.entrySet().iterator()
+        while (freedMemory < space && iterator.hasNext) {
+          val pair = iterator.next()
+          val blockId = pair.getKey
+          val entry = pair.getValue
+          if (blockIsEvictable(blockId, entry)) {
+              if (blockInfoManager.lockForWriting(blockId, blocking = false).isDefined) {
+              selectedBlocks += blockId
+              freedMemory += pair.getValue.size
+            }
+          } 
+       if (freedMemory >= space) { // 执行对内存的释放
+        var lastSuccessfulBlock = -1
+        try {
+          logInfo(s"${selectedBlocks.size} blocks selected for dropping " +
+            s"(${Utils.bytesToString(freedMemory)} bytes)")
+          (0 until selectedBlocks.size).foreach { idx =>
+              // 释放所有的数据块
+            val blockId = selectedBlocks(idx)
+            val entry = entries.synchronized {
+              entries.get(blockId)
+            }
+            if (entry != null) {
+              dropBlock(blockId, entry)
+              afterDropAction(blockId)
+            }
+            lastSuccessfulBlock = idx
+          }
+          logInfo(s"After dropping ${selectedBlocks.size} blocks, " +
+            s"free memory is ${Utils.bytesToString(maxMemory - blocksMemoryUsed)}")
+          freedMemory //返回释放内存大小
+        } finally {
+          if (lastSuccessfulBlock != selectedBlocks.size - 1) {
+            (lastSuccessfulBlock + 1 until selectedBlocks.size).foreach { idx =>
+              val blockId = selectedBlocks(idx)
+              blockInfoManager.unlock(blockId)
+            }
+          }
+        }
+      } else {
+        blockId.foreach { id =>
+          logInfo(s"Will not store $id")
+        }
+        selectedBlocks.foreach { id =>
+          blockInfoManager.unlock(id)
+        }
+        0L
+      }
+    }
 }
 ```
 
@@ -3500,6 +3580,538 @@ private[spark] object RDDInfo {
 ```
 
 #### ShuffleBlockFetcherIterator
+
+```markdown
+这是一个迭代器,用于获取多个数据块.对于本地数据块,可以从本地块管理器中获取本地数据块.通过提供的数据块传输服务从远端获取数据块.
+创建一个迭代器(数据块,输入流)元组,所以调用者可以按照接受数据的管道形式处理数据块.
+构造器参数:
+	context	任务上下文(用于度量值更新)
+	shuffleClient	shuffle客户端
+	blockManager	块管理器
+	blocksByAddress	块管理器列表
+	streamWrapper	流包装器(包装输入流)
+	maxBytesInFlight	在给定点远端获取的最大数据量(字节)
+	maxReqsInFlight	在指定点远端请求获取的最大数据块
+	maxBlocksInFlightPerAddress	对于指定主机端口号指定时间最大shuffle数据块数量
+	maxReqSizeShuffleToMem	可以shuffle到内存中请求最大数据量
+	detectCorrupt	是否弃用数据块
+	shuffleMetrics	shuffle度量器
+	doBatchFetch	是否批量获取数据块
+```
+
+```scala
+private[spark]
+final class ShuffleBlockFetcherIterator(
+    context: TaskContext,
+    shuffleClient: BlockStoreClient,
+    blockManager: BlockManager,
+    blocksByAddress: Iterator[(BlockManagerId, Seq[(BlockId, Long, Int)])],
+    streamWrapper: (BlockId, InputStream) => InputStream,
+    maxBytesInFlight: Long,
+    maxReqsInFlight: Int,
+    maxBlocksInFlightPerAddress: Int,
+    maxReqSizeShuffleToMem: Long,
+    detectCorrupt: Boolean,
+    detectCorruptUseExtraMemory: Boolean,
+    shuffleMetrics: ShuffleReadMetricsReporter,
+    doBatchFetch: Boolean)
+extends Iterator[(BlockId, InputStream)] with DownloadFileManager with Logging {
+    属性:
+    #name @targetRemoteRequestSize = math.max(maxBytesInFlight / 5, 1L)	目标远端请求量
+    #name @numBlocksToFetch = 0	需要获取的数据块数量
+    #name @numBlocksProcessed = 0	调用者使用的数据块数量
+    	当numBlocksProcessed=numBlocksToFetch 时,迭代器不可以使用
+    #name @startTimeNs = System.nanoTime()	开始时间
+    #name @localBlocks = scala.collection.mutable.LinkedHashSet[(BlockId, Int)]()
+    	本地数据块列表
+    #name @hostLocalBlocksByExecutor #type @LinkHashMap	执行器本地数据块映射表
+    val= LinkedHashMap[BlockManagerId, Seq[(BlockId, Long, Int)]]()
+    #name @hostLocalBlocks = scala.collection.mutable.LinkedHashSet[(BlockId, Int)]()
+    本地数据块列表
+    #name @results = new LinkedBlockingQueue[FetchResult]	结果队列
+    用于放置结果的阻塞队列,运行在同步模式下
+    #name @currentResult: SuccessFetchResult = null	当前执行结果
+    当前@FetchResult 正在执行,定位它,因此可以释放当前缓冲区,考虑到运行中的异常.
+    #name @fetchRequests = new Queue[FetchRequest]	获取结果队列
+    #name @deferredFetchRequests = new HashMap[BlockManagerId, Queue[FetchRequest]]()
+    	延期获取请求映射表(就是第一次入队列时没有进行处理的数据块@BlockManagerId),当满足重试条件的时候会进行重试.
+    #name @bytesInFlight = 0L	请求的字节数量
+    #name @reqsInFlight = 0	当前的请求数量
+    #name @numBlocksInFlightPerAddress = new HashMap[BlockManagerId, Int]()
+    	每个地址数据块数量映射表
+    #name @corruptedBlocks = mutable.HashSet[BlockId]()	弃用数据块集合
+    #name @isZombie = false @GuardedBy("this")
+    迭代器存活标记(为true表示回调接口不会将结果置入@results中)
+    #name @shuffleFilesSet = mutable.HashSet[DownloadFile]() @GuardedBy("this")
+    shuffle文件数据集（当执行cleanup时会清空，这个是为了防止磁盘文件泄漏）
+    #name @onCompleteCallback = new ShuffleFetchCompletionListener(this)
+    完成时回调事件
+    操作集：
+    def releaseCurrentResultBuffer(): Unit
+    功能: 释放当前结果缓冲,并置null使得@cleanup时不会再次清除
+    if (currentResult != null) {
+      // 释放缓冲区
+      currentResult.buf.release()
+    }
+    currentResult = null
+    
+    def createTempFile(transportConf: TransportConf): DownloadFile 
+    功能: 创建临时文件
+    val= new SimpleDownloadFile(
+      blockManager.diskBlockManager.createTempLocalBlock()._2, transportConf)
+    
+    def registerTempFileToClean(file: DownloadFile): Boolean 
+    功能: 注册需要清理的临时文件@file
+    val= synchronized {
+        if (isZombie) {
+          false
+        } else {
+          shuffleFilesSet += file
+          true
+        }
+    }
+    
+    def cleanup(): Unit
+    功能: 释放所有没有被反序列化的缓冲区
+    1. 设置弃用标记
+    synchronized {
+      isZombie = true
+    }
+    2. 释放结果队列的缓冲区
+    val iter = results.iterator()
+    while (iter.hasNext) {
+      val result = iter.next()
+      result match {
+        case SuccessFetchResult(_, _, address, _, buf, _) =>
+          if (address != blockManager.blockManagerId) {
+            shuffleMetrics.incRemoteBytesRead(buf.size)
+            if (buf.isInstanceOf[FileSegmentManagedBuffer]) {
+              shuffleMetrics.incRemoteBytesReadToDisk(buf.size)
+            }
+            shuffleMetrics.incRemoteBlocksFetched(1)
+          }
+          buf.release()
+        case _ =>
+      }
+    }
+    3. 删除shuffle文件集的内容
+    shuffleFilesSet.foreach { file =>
+      if (!file.delete()) {
+        logWarning("Failed to cleanup shuffle fetch temp file " + file.path())
+      }
+    }
+    
+    def sendRequest(req: FetchRequest): Unit
+    功能: 发送获取请求@req
+    1. 设置度量参数
+    bytesInFlight += req.size // 更新读取字节量
+    reqsInFlight += 1 / 请求数量+1
+    2. 查找数据块信息ID
+    val infoMap = req.blocks.map {
+      case FetchBlockInfo(blockId, size, mapIndex) => (blockId.toString, (size, mapIndex))
+    }.toMap
+    val remainingBlocks = new HashSet[String]() ++= infoMap.keys
+    val blockIds = req.blocks.map(_.blockId.toString)
+    val address = req.address
+    3. 设置监听器信息
+    val blockFetchingListener = new BlockFetchingListener {
+      override def onBlockFetchSuccess(blockId: String, buf: ManagedBuffer): Unit = {
+        ShuffleBlockFetcherIterator.this.synchronized {
+          if (!isZombie) {
+            buf.retain()
+            remainingBlocks -= blockId
+            results.put(new SuccessFetchResult(BlockId(blockId), infoMap(blockId)._2,
+              address, infoMap(blockId)._1, buf, remainingBlocks.isEmpty))
+            logDebug("remainingBlocks: " + remainingBlocks)
+          }
+        }
+        logTrace(s"Got remote block $blockId after ${Utils.getUsedTimeNs(startTimeNs)}")
+      }
+      override def onBlockFetchFailure(blockId: String, e: Throwable): Unit = {
+        logError(s"Failed to get block(s) from ${req.address.host}:${req.address.port}", e)
+        results.put(new FailureFetchResult(BlockId(blockId), infoMap(blockId)._2, address, e))
+      }
+    }
+    4. 超出指定数量时,将shuffle数据块写出到磁盘上(由于shuffle数据块已经经过加密和压缩),所以不需要对其进行再加工,直接写出即可
+    if (req.size > maxReqSizeShuffleToMem) {
+      shuffleClient.fetchBlocks(address.host, address.port, 
+                                address.executorId, blockIds.toArray,
+        blockFetchingListener, this)
+    } else {
+      shuffleClient.fetchBlocks(address.host, address.port, 
+                                address.executorId, blockIds.toArray,
+        blockFetchingListener, null)
+    }
+    
+    def partitionBlocksByFetchMode(): ArrayBuffer[FetchRequest]
+    功能: 获取执行结果列表
+    
+    def assertPositiveBlockSize(blockId: BlockId, blockSize: Long): Unit
+    功能: 断言数据块大小为正数
+    if (blockSize < 0) {
+      throw BlockException(blockId, "Negative block size " + size)
+    } else if (blockSize == 0) {
+      throw BlockException(blockId, "Zero-sized blocks should be excluded.")
+    }
+    
+    def checkBlockSizes(blockInfos: Seq[(BlockId, Long, Int)]): Unit
+    功能: 检查数据块大小
+    
+    def mergeFetchBlockInfo(toBeMerged: ArrayBuffer[FetchBlockInfo]): FetchBlockInfo
+    功能: 获取数据块信息
+    val= {
+      val startBlockId = toBeMerged.head.blockId.asInstanceOf[ShuffleBlockId]
+      FetchBlockInfo(
+        ShuffleBlockBatchId(
+          startBlockId.shuffleId,
+          startBlockId.mapId,
+          startBlockId.reduceId,
+          toBeMerged.last.blockId.asInstanceOf[ShuffleBlockId].reduceId + 1),
+        toBeMerged.map(_.size).sum,
+        toBeMerged.head.mapIndex)
+    }
+    
+    def mergeContinuousShuffleBlockIdsIfNeeded(
+      blocks: ArrayBuffer[FetchBlockInfo]): ArrayBuffer[FetchBlockInfo]
+    功能: 合并连续shuffle数据块列表
+    1. 获取结果集
+    val result = if (doBatchFetch) {
+      var curBlocks = new ArrayBuffer[FetchBlockInfo]
+      val mergedBlockInfo = new ArrayBuffer[FetchBlockInfo]
+      val iter = blocks.iterator
+
+      while (iter.hasNext) {
+        val info = iter.next()
+        val curBlockId = info.blockId.asInstanceOf[ShuffleBlockId]
+        if (curBlocks.isEmpty) {
+          curBlocks += info
+        } else {
+          if (curBlockId.mapId != curBlocks.head.blockId.asInstanceOf[ShuffleBlockId].mapId) {
+            mergedBlockInfo += mergeFetchBlockInfo(curBlocks)
+            curBlocks.clear()
+          }
+          curBlocks += info
+        }
+      }
+    }
+    if (curBlocks.nonEmpty) {
+        mergedBlockInfo += mergeFetchBlockInfo(curBlocks)
+      }
+    mergedBlockInfo
+    else
+    	blocks
+    2. 更新度量信息
+    numBlocksToFetch += result.size
+    val= result
+    
+    def hasNext: Boolean = numBlocksProcessed < numBlocksToFetch
+    功能: 确定是否有下一个元素
+    
+    def next(): (BlockId, InputStream) 
+    功能: 获取下一个(BlockId,InputStream)原则,如果任务失败会使用@cleanUp清理所有的输入流,调用者需要关闭输入流,因为不会再被使用.主要目的是竟可能的释放空间.
+    
+    def toCompletionIterator: Iterator[(BlockId, InputStream)]
+    功能: 获取需要完成的迭代器
+    val= {
+        CompletionIterator[(BlockId, InputStream), this.type](this,
+          onCompleteCallback.onComplete(context))
+    }
+    
+    def throwFetchFailedException(
+      blockId: BlockId,
+      mapIndex: Int,
+      address: BlockManagerId,
+      e: Throwable):Nothing 
+    功能: 抛出获取失败异常
+    
+    def initialize(): Unit
+    功能: 初始化
+    1. 添加完成回调的监听事件
+    context.addTaskCompletionListener(onCompleteCallback)
+    2. 设置不同获取模式的分区数据块(本地,主机本地,远端数据块)
+    val remoteRequests = partitionBlocksByFetchMode()
+    fetchRequests ++= Utils.randomize(remoteRequests)
+    assert ((0 == reqsInFlight) == (0 == bytesInFlight),
+      "expected reqsInFlight = 0 but found reqsInFlight = " + reqsInFlight +
+      ", expected bytesInFlight = 0 but found bytesInFlight = " + bytesInFlight)
+    3. 发出数据块的初始化请求,跳转到最大字节处
+    fetchUpToMaxBytes()
+    4. 确定需要获取的数量
+    val numFetches = remoteRequests.size - fetchRequests.size
+    5. 获取本地数据块
+    fetchLocalBlocks()
+    if (hostLocalBlocks.nonEmpty) {
+      blockManager.hostLocalDirManager.foreach(fetchHostLocalBlocks)
+    }
+    
+    def fetchUpToMaxBytes(): Unit
+    功能: 发送获取数据到最大字节处,如果你不能获取一个远端主机,则会将请求置入下次处理的队列
+    if (deferredFetchRequests.nonEmpty) {
+      for ((remoteAddress, defReqQueue) <- deferredFetchRequests) {
+        while (isRemoteBlockFetchable(defReqQueue) &&
+            !isRemoteAddressMaxedOut(remoteAddress, defReqQueue.front)) {
+          val request = defReqQueue.dequeue()
+          logDebug(s"Processing deferred fetch request for $remoteAddress with "
+            + s"${request.blocks.length} blocks")
+          send(remoteAddress, request)
+          if (defReqQueue.isEmpty) {
+            deferredFetchRequests -= remoteAddress
+          }
+        }
+      }
+    }
+    while (isRemoteBlockFetchable(fetchRequests)) {
+      val request = fetchRequests.dequeue()
+      val remoteAddress = request.address
+      if (isRemoteAddressMaxedOut(remoteAddress, request)) {
+        logDebug(s"Deferring fetch request for $remoteAddress 
+        with ${request.blocks.size} blocks")
+      val defReqQueue = deferredFetchRequests.getOrElse(remoteAddress,
+                                                        new Queue[FetchRequest]())
+        defReqQueue.enqueue(request)
+        deferredFetchRequests(remoteAddress) = defReqQueue
+      } else {
+        send(remoteAddress, request)
+      }
+    }
+    def send(remoteAddress: BlockManagerId, request: FetchRequest): Unit = {
+      sendRequest(request)
+      numBlocksInFlightPerAddress(remoteAddress) =
+        numBlocksInFlightPerAddress.getOrElse(remoteAddress, 0) + request.blocks.size
+    }
+    def isRemoteBlockFetchable(fetchReqQueue: Queue[FetchRequest]): Boolean = {
+      fetchReqQueue.nonEmpty &&
+        (bytesInFlight == 0 ||
+          (reqsInFlight + 1 <= maxReqsInFlight &&
+            bytesInFlight + fetchReqQueue.front.size <= maxBytesInFlight))
+    }
+    def isRemoteAddressMaxedOut(remoteAddress: BlockManagerId, request: FetchRequest): Boolean = {
+      numBlocksInFlightPerAddress.getOrElse(remoteAddress, 0) + request.blocks.size >
+        maxBlocksInFlightPerAddress
+    }
+    
+    def fetchLocalBlocks(): Unit
+    功能: 获取本地数据块
+    在获取远端数据块时允许获取本地数据块,由于`ManagedBuffer`内存的创建输入流时的懒加载方式
+    val iter = localBlocks.iterator
+    while (iter.hasNext) {
+      val (blockId, mapIndex) = iter.next()
+      try {
+        val buf = blockManager.getLocalBlockData(blockId)
+        shuffleMetrics.incLocalBlocksFetched(1)
+        shuffleMetrics.incLocalBytesRead(buf.size)
+        buf.retain()
+        results.put(new SuccessFetchResult(blockId, mapIndex, 	blockManager.blockManagerId,buf.size(), buf, false))
+      } catch {
+        case e: Exception =>
+          e match {
+            case ce: ClosedByInterruptException =>
+              logError("Error occurred while fetching local blocks, " + ce.getMessage)
+            case ex: Exception => 
+              logError("Error occurred while fetching local blocks", ex)
+          }
+          results.put(new FailureFetchResult(blockId, mapIndex,
+                                             blockManager.blockManagerId, e))
+          return
+      }
+    }
+    
+    def fetchHostLocalBlock(
+      blockId: BlockId,
+      mapIndex: Int,
+      localDirs: Array[String],
+      blockManagerId: BlockManagerId): Boolean
+    功能: 确认是否获取主机本地数据块
+    val= {
+        try {
+          val buf = blockManager.getHostLocalShuffleData(blockId, localDirs)
+          buf.retain()
+          results.put(SuccessFetchResult(blockId, mapIndex, blockManagerId
+                                         , buf.size(), buf,isNetworkReqDone = false))
+          true
+        } catch {
+          case e: Exception =>
+            logError(s"Error occurred while fetching local blocks", e)
+            results.put(FailureFetchResult(blockId, mapIndex, blockManagerId, e))
+            false
+        }
+      }
+    
+    def fetchHostLocalBlocks(hostLocalDirManager: HostLocalDirManager): Unit
+    功能: 获取主机本地数据块
+    val cachedDirsByExec = hostLocalDirManager.getCachedHostLocalDirs()
+    val (hostLocalBlocksWithCachedDirs, hostLocalBlocksWithMissingDirs) =
+      hostLocalBlocksByExecutor
+        .map { case (hostLocalBmId, bmInfos) =>
+          (hostLocalBmId, bmInfos, cachedDirsByExec.get(hostLocalBmId.executorId))
+        }.partition(_._3.isDefined)
+    val bmId = blockManager.blockManagerId
+    val immutableHostLocalBlocksWithoutDirs =
+      hostLocalBlocksWithMissingDirs.map { case (hostLocalBmId, bmInfos, _) =>
+        hostLocalBmId -> bmInfos
+      }.toMap
+    if (immutableHostLocalBlocksWithoutDirs.nonEmpty) {
+      logDebug(s"Asynchronous fetching host-local blocks without cached executors' dir: " +
+        s"${immutableHostLocalBlocksWithoutDirs.mkString(", ")}")
+      val execIdsWithoutDirs = immutableHostLocalBlocksWithoutDirs.keys.map(_.executorId).toArray
+      hostLocalDirManager.getHostLocalDirs(execIdsWithoutDirs) {
+        case Success(dirs) =>
+          immutableHostLocalBlocksWithoutDirs.foreach { case (hostLocalBmId, blockInfos) =>
+            blockInfos.takeWhile { case (blockId, _, mapIndex) =>
+              fetchHostLocalBlock(
+                blockId,
+                mapIndex,
+                dirs.get(hostLocalBmId.executorId),
+                hostLocalBmId)
+            }
+          }
+          logDebug(s"Got host-local blocks (without cached executors' dir) in " +
+            s"${Utils.getUsedTimeNs(startTimeNs)}")
+
+        case Failure(throwable) =>
+          logError(s"Error occurred while fetching host local blocks", throwable)
+          val (hostLocalBmId, blockInfoSeq) = immutableHostLocalBlocksWithoutDirs.head
+          val (blockId, _, mapIndex) = blockInfoSeq.head
+          results.put(FailureFetchResult(blockId, mapIndex, hostLocalBmId, throwable))
+      }
+    }
+    if (hostLocalBlocksWithCachedDirs.nonEmpty) {
+      logDebug(s"Synchronous fetching host-local blocks with cached executors' dir: " +
+          s"${hostLocalBlocksWithCachedDirs.mkString(", ")}")
+      hostLocalBlocksWithCachedDirs.foreach { case (_, blockInfos, localDirs) =>
+        blockInfos.foreach { case (blockId, _, mapIndex) =>
+          if (!fetchHostLocalBlock(blockId, mapIndex, localDirs.get, bmId)) {
+            return
+          }
+        }
+      }
+      logDebug(s"Got host-local blocks (with cached executors' dir) in " +
+        s"${Utils.getUsedTimeNs(startTimeNs)}")
+    }
+}
+```
+
+```scala
+private class BufferReleasingInputStream(
+    private[storage] val delegate: InputStream,
+    private val iterator: ShuffleBlockFetcherIterator,
+    private val blockId: BlockId,
+    private val mapIndex: Int,
+    private val address: BlockManagerId,
+    private val detectCorruption: Boolean)
+extends InputStream {
+    介绍: 辅助类,可以确保@ManagedBuffer 在输入流上被释放,且如果关闭输入流压缩和加密为true就会解除流的使用.
+    构造器参数:
+    	delegate	代理输入流
+    	iterator	shuffle数据块基本迭代器
+    	blockId	数据块标识符
+    	mapIndex	map位置
+    	address	块管理器标识符
+    	detectCorruption	是否弃用的标记
+    操作集:
+    def read(): Int
+    功能: 读取数据
+    val= try {
+      delegate.read()
+    } catch {
+      case e: IOException if detectCorruption =>
+        IOUtils.closeQuietly(this)
+        iterator.throwFetchFailedException(blockId, mapIndex, address, e)
+    }
+    
+    def close(): Unit
+    功能: 关闭输入流
+    if (!closed) {
+      delegate.close()
+      iterator.releaseCurrentResultBuffer()
+      closed = true
+    }
+    
+    def available(): Int = delegate.available()
+    功能: 确认是否可用
+    
+    def mark(readlimit: Int): Unit = delegate.mark(readlimit)
+    功能: 标记读取位置
+    
+    def skip(n: Long): Long
+    功能: 跳读n位
+    val= try {
+      delegate.skip(n)
+    } catch {
+      case e: IOException if detectCorruption =>
+        IOUtils.closeQuietly(this)
+        iterator.throwFetchFailedException(blockId, mapIndex, address, e)
+    }
+    
+    def markSupported(): Boolean = delegate.markSupported()
+    功能: 标记是否支持
+    
+    def read(b: Array[Byte]): Int
+    功能: 读取一个缓冲区内容
+    val= try {
+      delegate.read(b)
+    } catch {
+      case e: IOException if detectCorruption =>
+        IOUtils.closeQuietly(this)
+        iterator.throwFetchFailedException(blockId, mapIndex, address, e)
+    }
+    
+    def read(b: Array[Byte], off: Int, len: Int): Int
+    功能: 读取缓冲区的一个范围
+    val= try {
+      delegate.read(b, off, len)
+    } catch {
+      case e: IOException if detectCorruption =>
+        IOUtils.closeQuietly(this)
+        iterator.throwFetchFailedException(blockId, mapIndex, address, e)
+    }
+    
+    def reset(): Unit = delegate.reset()
+    功能: 重置
+}
+```
+
+```scala
+private[storage] object ShuffleBlockFetcherIterator {
+    内部类:
+    case class FetchBlockInfo(
+    blockId: BlockId,
+    size: Long,
+    mapIndex: Int)
+    介绍: 获取数据块信息
+    
+    case class FetchRequest(address: BlockManagerId, blocks: Seq[FetchBlockInfo]) {
+        val size = blocks.map(_.size).sum
+      }
+    介绍: 获取请求
+    
+    sealed trait FetchResult {
+        val blockId: BlockId
+        val address: BlockManagerId
+    }
+    介绍: 获取结果
+    
+    case class SuccessFetchResult(
+        blockId: BlockId,
+        mapIndex: Int,
+        address: BlockManagerId,
+        size: Long,
+        buf: ManagedBuffer,
+        isNetworkReqDone: Boolean) extends FetchResult {
+        require(buf != null)
+        require(size >= 0)
+    }
+    介绍: 成功获取结果
+    
+    case class FailureFetchResult(
+      blockId: BlockId,
+      mapIndex: Int,
+      address: BlockManagerId,
+      e: Throwable)
+    extends FetchResult
+    介绍: 失败获取结果
+}
+```
 
 #### StorageLevel
 
