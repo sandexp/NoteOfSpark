@@ -42,11 +42,592 @@
 
 #### Aggregator
 
+```scala
+@DeveloperApi
+case class Aggregator[K, V, C] (
+    createCombiner: V => C,
+    mergeValue: (C, V) => C,
+    mergeCombiners: (C, C) => C) {
+    介绍: 用于合并数据的函数集合
+    构造器:
+        createCombiner	创建聚合初始值的函数
+        mergeValue	将聚合值合并成新的值的函数
+        mergeCombiners	对于多个@mergeValue 值,将其合并为一个值
+    操作集:
+    def combineValuesByKey(
+      iter: Iterator[_ <: Product2[K, V]],
+      context: TaskContext): Iterator[(K, C)]
+    功能: 按照key进行合并
+    val= {
+        val combiners = new ExternalAppendOnlyMap[K, V, C](createCombiner, mergeValue
+                                                           , mergeCombiners)
+        combiners.insertAll(iter)
+        updateMetrics(context, combiners)
+        combiners.iterator
+      }
+    
+    def combineCombinersByKey(
+      iter: Iterator[_ <: Product2[K, C]],
+      context: TaskContext): Iterator[(K, C)]
+    功能: 按照key聚合合并器
+    val= {
+        val combiners = new ExternalAppendOnlyMap[K, C, C](identity, mergeCombiners,
+                                                           mergeCombiners)
+        combiners.insertAll(iter)
+        updateMetrics(context, combiners)
+        combiners.iterator
+      }
+    
+    def updateMetrics(context: TaskContext, map: ExternalAppendOnlyMap[_, _, _]): Unit
+    功能: 更新度量值
+    Option(context).foreach { c =>
+      c.taskMetrics().incMemoryBytesSpilled(map.memoryBytesSpilled)
+      c.taskMetrics().incDiskBytesSpilled(map.diskBytesSpilled)
+      c.taskMetrics().incPeakExecutionMemory(map.peakMemoryUsedBytes)
+    }
+}
+```
+
 #### BarrierCoordinator
+
+```scala
+private[spark] class BarrierCoordinator
+    timeoutInSecs: Long,
+    listenerBus: LiveListenerBus,
+override val rpcEnv: RpcEnv) extends ThreadSafeRpcEndpoint with Logging {
+    介绍: 屏蔽的协调者,用于处理全局的同步请求(来自@BarrierTaskContext),每个全局同步请求产生于@BarrierTaskContext.barrier(),使用stageId + stageAttemptId + barrierEpoch 唯一标识.回应所有的块全局同步请求,对于一个收到的@barrier() 调用.如果协调者 不能够再指定时间内收集到指定数量的请求,使得所有请求失败,并抛出异常.    
+    构造器参数:
+    	timeoutInSecs	超时时间(秒)
+    	listenerBus	监听总线
+    	rpcEnv	RPC环境
+    属性:
+    #name @timer = new Timer("BarrierCoordinator barrier epoch increment timer")
+    	计时器
+    #name @listener #type @SparkListener	spark监听器(用于监听stage的完成)
+    val= new SparkListener {
+        override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit
+            = {
+          val stageInfo = stageCompleted.stageInfo
+          val barrierId = ContextBarrierId(stageInfo.stageId, stageInfo.attemptNumber)
+          cleanupBarrierStage(barrierId)
+        }
+      }
+    #name @states = new ConcurrentHashMap[ContextBarrierId, ContextBarrierState]
+    状态列表(对应于激活状态请求)
+    #name @clearStateConsumer	清理状态消费者
+    val= new Consumer[ContextBarrierState] {
+        override def accept(state: ContextBarrierState) = state.clear()
+      }
+    
+    操作集:
+    def cleanupBarrierStage(barrierId: ContextBarrierId): Unit 
+    功能: 清除指定stage请求编号的@ContextBarrierState状态位
+    1. 从状态表中移除
+    val barrierState = states.remove(barrierId)
+    if (barrierState != null) {
+      barrierState.clear()
+    }
+    
+    def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit]
+    功能: 接受并回应指定的RPC回调@context
+    case request @ RequestToSync(numTasks, stageId, stageAttemptId, _, _) =>
+      val barrierId = ContextBarrierId(stageId, stageAttemptId)
+      states.computeIfAbsent(barrierId,
+        (key: ContextBarrierId) => new ContextBarrierState(key, numTasks))
+      val barrierState = states.get(barrierId)
+      val= barrierState.handleRequest(context, request)
+}
+```
+
+```scala
+  private class ContextBarrierState(
+      val barrierId: ContextBarrierId,
+      val numTasks: Int) {
+      介绍: 隔离上下文状态
+      #name @barrierEpoch: Int = 0	barrier标识符
+      可能一个barrier stage请求含有多个@barrier() 使用@barrierEpoch 用于唯一标识.
+      #name @requesters: ArrayBuffer[RpcCallContext] = new ArrayBuffer[RpcCallContext](numTasks)
+      RPC请求列表
+      #name @timerTask: TimerTask = null	定时器任务
+      #name @clearStateConsumer #type @new Consumer[ContextBarrierState]	清理状态消费者
+      val= new Consumer[ContextBarrierState] {
+        override def accept(state: ContextBarrierState) = state.clear()
+      }
+      操作集:
+      def initTimerTask(state: ContextBarrierState): Unit 
+      功能: 初始化定时器任务,使用@barrier()
+      timerTask = new TimerTask {
+        override def run(): Unit = state.synchronized {
+          // 超时则将所有同步操作置为执行失败
+          requesters.foreach(_.sendFailure(new SparkException("The coordinator didn't get all " +
+            s"barrier sync requests for barrier epoch $barrierEpoch from $barrierId within " +
+            s"$timeoutInSecs second(s).")))
+          cleanupBarrierStage(barrierId)
+        }
+      }
+      
+      def cancelTimerTask(): Unit
+      功能: 放弃当前定时器任务,并释放内存
+      if (timerTask != null) {
+        timerTask.cancel()
+        timer.purge()
+        timerTask = null
+      }
+      
+      def maybeFinishAllRequesters(
+        requesters: ArrayBuffer[RpcCallContext],
+        numTasks: Int): Boolean
+      功能: 完成所有的屏蔽的同步请求(如果已经获取了所有同步请求)
+      val= if (requesters.size == numTasks) {
+        requesters.foreach(_.reply(()))
+        true
+      } else {
+        false
+      }
+      
+      def cleanupBarrierStage(barrierId: ContextBarrierId): Unit
+      功能: 清除指定的屏蔽stage
+      val barrierState = states.remove(barrierId) // 移除状态表中的索引
+      if (barrierState != null) {
+          barrierState.clear() // 清除内部状态
+      }
+      
+      def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit]
+      功能: 接受并回应指定消息
+      case request @ RequestToSync(numTasks, stageId, stageAttemptId, _, _) =>
+      val barrierId = ContextBarrierId(stageId, stageAttemptId)
+      states.computeIfAbsent(barrierId,
+        (key: ContextBarrierId) => new ContextBarrierState(key, numTasks))
+      val barrierState = states.get(barrierId)
+      barrierState.handleRequest(context, request)
+      
+      def handleRequest(requester: RpcCallContext, request: RequestToSync): Unit
+      功能: 处理请求@requester
+      处理全局同步请求,如果收集到足够的请求则执行成功,反之将之前的所有请求会失败
+      1. 获取请求编号
+      val taskId = request.taskAttemptId // 请求编号
+      val epoch = request.barrierEpoch // 屏蔽标识符
+      2. 请求任务数量断言(需要等于任务数量)
+      require(request.numTasks == numTasks, s"Number of tasks of $barrierId is " +
+        s"${request.numTasks} from Task $taskId, previously it was $numTasks.")
+      3. 处理请求
+      if (epoch != barrierEpoch) { // 非当前屏蔽任务,抛出异常
+        requester.sendFailure(new SparkException(s"The request to sync of $barrierId with " +
+          s"barrier epoch $barrierEpoch has already finished. Maybe task $taskId is not " +
+          "properly killed."))
+      } else {
+        if (requesters.isEmpty) { // 进行可能的定时器初始化(为了再指定时间内返回可靠结果)
+          initTimerTask(this)
+          timer.schedule(timerTask, timeoutInSecs * 1000)
+        }
+        requesters += requester // 更新请求列表
+        logInfo(s"Barrier sync epoch $barrierEpoch from $barrierId received update from Task " +
+          s"$taskId, current progress: ${requesters.size}/$numTasks.")
+        if (maybeFinishAllRequesters(requesters, numTasks)) { // 获取处理结果,并在处理完成的情况下进行任务重置
+          logInfo(s"Barrier sync epoch $barrierEpoch from $barrierId received all updates from " +
+            s"tasks, finished successfully.")
+          barrierEpoch += 1
+          requesters.clear()
+          cancelTimerTask()
+        }
+      }
+  }
+```
+
+```scala
+private[spark] sealed trait BarrierCoordinatorMessage extends Serializable
+介绍: 屏蔽协调者消息
+```
+
+```scala
+private[spark] case class RequestToSync(
+    numTasks: Int,
+    stageId: Int,
+    stageAttemptId: Int,
+    taskAttemptId: Long,
+    barrierEpoch: Int) extends BarrierCoordinatorMessage
+介绍: 同步请求,来自@BarrierTaskContext 的同步请求消息,使用identified by stageId + stageAttemptId + barrierEpoch 唯一标识
+参数:
+	numTasks	全局同步请求需要接受的数量
+	stageId	stageID
+	stageAttemptId	stage请求编号
+	taskAttemptId	当前任务请求编号
+	barrierEpoch	屏蔽标识符
+```
 
 #### BarrierTaskContext
 
+```scala
+@Experimental
+@Since("2.4.0")
+class BarrierTaskContext private[spark] (
+    taskContext: TaskContext) extends TaskContext with Logging {
+    介绍: @TaskContext 额外的上下文信息,屏蔽stage任务的工具,使用@BarrierTaskContext#get 获取屏蔽任务的屏蔽上下文.
+    属性:
+    #name @barrierCoordinator #type @RpcEndpointRef	屏蔽协调者
+    val= {
+        val env = SparkEnv.get
+        RpcUtils.makeDriverRef("barrierSync", env.conf, env.rpcEnv)
+      }
+    #name @barrierEpoch = 0	屏蔽标识符
+    #name @numTasks = getTaskInfos().size	当前屏蔽stage的任务数量
+    操作集:
+    @Experimental
+    @Since("2.4.0")
+    def getTaskInfos(): Array[BarrierTaskInfo]
+    功能: 获取屏蔽任务信息列表,按照分区编号排序
+    val addressesStr = Option(taskContext.getLocalProperty("addresses")).getOrElse("")
+    addressesStr.split(",").map(_.trim()).map(new BarrierTaskInfo(_))
+    
+    def isCompleted(): Boolean = taskContext.isCompleted()
+    功能: 确定任务是否完成
+    
+    def isInterrupted(): Boolean = taskContext.isInterrupted()
+    功能: 确认任务是否中断
+    
+    def addTaskCompletionListener(listener: TaskCompletionListener): this.type 
+    功能: 添加任务完成监听器
+    val= {
+        taskContext.addTaskCompletionListener(listener)
+        this
+      }
+    
+    def addTaskFailureListener(listener: TaskFailureListener): this.type
+    功能: 添加任务失败监听器
+    val= {
+        taskContext.addTaskFailureListener(listener)
+        this
+      }
+    
+    def stageId(): Int = taskContext.stageId()
+    功能: 获取stageID
+    
+    def stageAttemptNumber(): Int = taskContext.stageAttemptNumber()
+    功能: 获取stage请求数量
+    
+    def partitionId(): Int = taskContext.partitionId()
+    功能: 获取分区ID
+    
+    def attemptNumber(): Int = taskContext.attemptNumber()
+    功能: 获取任务请求数量
+    
+    def taskAttemptId(): Long = taskContext.taskAttemptId()
+    功能: 获取任务请求编号
+    
+    def getLocalProperty(key: String): String = taskContext.getLocalProperty(key)
+    功能: 获取本地属性
+    
+    def taskMetrics(): TaskMetrics = taskContext.taskMetrics()
+    功能: 获取任务度量器
+    
+    def getMetricsSources(sourceName: String): Seq[Source]=taskContext.getMetricsSources(sourceName)
+    功能: 获取独立资源
+    
+    def resources(): Map[String, ResourceInformation] = taskContext.resources()
+    功能: 获取任务资源列表
+    
+    def resourcesJMap(): java.util.Map[String, ResourceInformation] =resources().asJava
+    功能: 获取任务资源列表
+    
+    def killTaskIfInterrupted(): Unit = taskContext.killTaskIfInterrupted()
+    功能: 中断kill任务
+    
+    def getKillReason(): Option[String] = taskContext.getKillReason()
+    功能: 获取被kill的原因
+    
+    def taskMemoryManager(): TaskMemoryManager=taskContext.taskMemoryManager()
+    功能: 获取任务内存管理器
+    
+    def registerAccumulator(a: AccumulatorV2[_, _]): Unit=taskContext.setFetchFailed(fetchFailed)
+    功能: 注册累加器
+    
+    def markInterrupted(reason: String): Unit=taskContext.markInterrupted(reason)
+    功能: 标记中断
+    
+    def markTaskFailed(error: Throwable): Unit =taskContext.markTaskFailed(error)
+    功能: 标记任务失败
+    
+    def markTaskCompleted(error: Option[Throwable]): Unit=taskContext.markTaskCompleted(error)
+    功能: 标记任务完成
+    
+    def fetchFailed: Option[FetchFailedException]= taskContext.fetchFailed
+    功能: 获取失败原因
+    
+    def getLocalProperties: Properties = taskContext.getLocalProperties
+    功能: 获取本地属性
+    
+    @Experimental
+    @Since("2.4.0")
+    def barrier(): Unit
+    功能: 设置全局屏蔽,等待直到这个stage命中屏蔽部分.类似于MPI中的MPI_Barrier.这个函数会阻塞到所有任务到达同样stage的位置出(用于同步,确定执行顺序).
+    注意:
+        1. 需要使用try-catch 放置出现等待超时
+        2. 再同一个屏蔽stage中调用这个函数,会引发函数调用超时
+    1. 获取时间参数
+    val startTime = System.currentTimeMillis()
+    val timerTask = new TimerTask {
+      override def run(): Unit = {
+        logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) waiting " +
+          s"under the global sync since $startTime, has been waiting for " +
+          s"${MILLISECONDS.toSeconds(System.currentTimeMillis() - startTime)} seconds, " +
+          s"current barrier epoch is $barrierEpoch.")
+      }
+    }
+    timer.schedule(timerTask, 60000, 60000)
+    2. 处理启用线程
+    try {
+      val abortableRpcFuture = barrierCoordinator.askAbortable[Unit](
+        message = RequestToSync(numTasks, stageId, stageAttemptNumber, taskAttemptId,
+          barrierEpoch),
+        timeout = new RpcTimeout(365.days, "barrierTimeout"))
+      try {
+        while (!abortableRpcFuture.toFuture.isCompleted) { // 同步等待
+          try {
+            ThreadUtils.awaitResult(abortableRpcFuture.toFuture, 1.second) // 获取等待结果
+          } catch {
+            case _: TimeoutException | _: InterruptedException => // 获取超时,kill任务
+              taskContext.killTaskIfInterrupted()
+          }
+        }
+      } finally {
+        // 处理完毕,弃用线程
+        abortableRpcFuture.abort(taskContext.getKillReason().getOrElse("Unknown reason."))
+      }
+      barrierEpoch += 1
+      logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) finished " +
+        "global sync successfully, waited for " +
+        s"${MILLISECONDS.toSeconds(System.currentTimeMillis() - startTime)} seconds, " +
+        s"current barrier epoch is $barrierEpoch.")
+    } catch {
+      case e: SparkException =>
+        logInfo(s"Task $taskAttemptId from Stage $stageId(Attempt $stageAttemptNumber) failed " +
+          "to perform global sync, waited for " +
+          s"${MILLISECONDS.toSeconds(System.currentTimeMillis() - startTime)} seconds, " +
+          s"current barrier epoch is $barrierEpoch.")
+        throw e
+    } finally {
+      timerTask.cancel()
+      timer.purge()
+    }
+}
+```
+
+```scala
+@Experimental
+@Since("2.4.0")
+object BarrierTaskContext {
+    属性:
+    #name @timer = new Timer("Barrier task timer for barrier() calls.")	定时器
+    操作集:
+    @Experimental
+    @Since("2.4.0")
+    def get(): BarrierTaskContext = TaskContext.get().asInstanceOf[BarrierTaskContext]
+    功能: 获取屏蔽任务上下文
+}
+```
+
 #### ContextCleaner
+
+```scala
+private sealed trait CleanupTask
+private case class CleanRDD(rddId: Int) extends CleanupTask
+private case class CleanShuffle(shuffleId: Int) extends CleanupTask
+private case class CleanBroadcast(broadcastId: Long) extends CleanupTask
+private case class CleanAccum(accId: Long) extends CleanupTask
+private case class CleanCheckpoint(rddId: Int) extends CleanupTask
+```
+
+```scala
+private class CleanupTaskWeakReference(
+    val task: CleanupTask,
+    referent: AnyRef,
+    referenceQueue: ReferenceQueue[AnyRef])
+extends WeakReference(referent, referenceQueue)
+介绍: 清除任务的弱引用
+参数:
+	task 清除任务
+	referent	参考值
+	referenceQueue	参考队列
+```
+
+```scala
+private[spark] trait CleanerListener {
+  介绍: 清理器监听器
+  def rddCleaned(rddId: Int): Unit // 清理RDD
+  def shuffleCleaned(shuffleId: Int): Unit // 清理Shuffle
+  def broadcastCleaned(broadcastId: Long): Unit // 清理广播变量
+  def accumCleaned(accId: Long): Unit // 清理累加器
+  def checkpointCleaned(rddId: Long): Unit // 清理检查点
+}
+
+private object ContextCleaner {
+  介绍: 上下文清理器
+  private val REF_QUEUE_POLL_TIMEOUT = 100 // 参考队列轮询超时时间
+}
+```
+
+```scala
+private[spark] class ContextCleaner(
+    sc: SparkContext,
+    shuffleDriverComponents: ShuffleDriverComponents) extends Logging {
+    介绍:
+    异步RDD/Shuffle/广播变量清除器
+    保持每个RDD/shuffle依赖/广播变量的弱引用,
+    属性:
+    #name @referenceBuffer	参考缓冲区（保证弱引用不会被离开垃圾回收）
+    val= Collections.newSetFromMap[CleanupTaskWeakReference](new ConcurrentHashMap)
+    #name @referenceQueue = new ReferenceQueue[AnyRef]	参考队列
+    #name @listeners = new ConcurrentLinkedQueue[CleanerListener]()	监听器
+    #name @cleaningThread = new Thread() { override def run(): Unit = keepCleaning() }	清理器
+    #name @periodicGCService #type @ScheduledExecutorService	周期性GC服务
+    val= ThreadUtils.newDaemonSingleThreadScheduledExecutor("context-cleaner-periodic-gc")
+    #name @periodicGCInterval = sc.conf.get(CLEANER_PERIODIC_GC_INTERVAL)	GC周期
+    #name @blockOnCleanupTasks = sc.conf.get(CLEANER_REFERENCE_TRACKING_BLOCKING)	
+    	清理线程是否会阻塞清理任务
+    #name @blockOnShuffleCleanupTasks =sc.conf.get(CLEANER_REFERENCE_TRACKING_BLOCKING_SHUFFLE)
+    	清理线程是否会阻塞shuffle清理任务
+    #name @stopped = false volatile	停止状态
+    操作集：
+    def attachListener(listener: CleanerListener): Unit = listeners.add(listener)
+    功能: 添加监听器 
+    
+    def start(): Unit
+    功能： 启动监听器
+    1. 启动线程
+    cleaningThread.setDaemon(true)
+    cleaningThread.setName("Spark Context Cleaner")
+    cleaningThread.start()
+    2. 启动周期性GC
+    periodicGCService.scheduleAtFixedRate(() => System.gc(),
+      periodicGCInterval, periodicGCInterval, TimeUnit.SECONDS)
+    
+    def stop(): Unit
+    功能: 停止清理线程,等待线程完成当前任务
+    stopped = true
+    synchronized {
+      cleaningThread.interrupt()
+    }
+    cleaningThread.join()
+    periodicGCService.shutdown()
+    
+    def registerRDDForCleanup(rdd: RDD[_]): Unit=registerForCleanup(rdd, CleanRDD(rdd.id))
+    功能: GC时注册RDD
+    
+    def registerAccumulatorForCleanup(a: AccumulatorV2[_, _]): Unit
+    功能: GC时注册累加器
+    val= registerForCleanup(a, CleanAccum(a.id))
+    
+    def registerShuffleForCleanup(shuffleDependency: ShuffleDependency[_, _, _]): Unit
+    功能: GC时注册shuffle
+    val= registerForCleanup(shuffleDependency, CleanShuffle(shuffleDependency.shuffleId))
+    
+    def registerBroadcastForCleanup[T](broadcast: Broadcast[T]): Unit 
+    功能: GC时注册广播变量
+    val= registerForCleanup(broadcast, CleanBroadcast(broadcast.id))
+    
+    def registerRDDCheckpointDataForCleanup[T](rdd: RDD[_], parentId: Int): Unit
+    功能: GC时注册RDD检查点
+    val= registerForCleanup(rdd, CleanCheckpoint(parentId))
+    
+    def registerForCleanup(objectForCleanup: AnyRef, task: CleanupTask): Unit
+    功能: 注册信息@CleanupTaskWeakReference 到引用缓冲中@referenceBuffer
+	referenceBuffer.add(new CleanupTaskWeakReference(task, objectForCleanup, referenceQueue))
+    
+    def keepCleaning(): Unit
+    功能: 保持RDD/shuffle/广播变量状态
+    while (!stopped) {
+      try {
+        val reference = Option(referenceQueue.remove(ContextCleaner.REF_QUEUE_POLL_TIMEOUT))
+          .map(_.asInstanceOf[CleanupTaskWeakReference])
+        synchronized {
+          reference.foreach { ref =>
+            logDebug("Got cleaning task " + ref.task)
+            referenceBuffer.remove(ref)
+            ref.task match {
+              case CleanRDD(rddId) =>
+                doCleanupRDD(rddId, blocking = blockOnCleanupTasks)
+              case CleanShuffle(shuffleId) =>
+                doCleanupShuffle(shuffleId, blocking = blockOnShuffleCleanupTasks)
+              case CleanBroadcast(broadcastId) =>
+                doCleanupBroadcast(broadcastId, blocking = blockOnCleanupTasks)
+              case CleanAccum(accId) =>
+                doCleanupAccum(accId, blocking = blockOnCleanupTasks)
+              case CleanCheckpoint(rddId) =>
+                doCleanCheckpoint(rddId)
+            }
+          }
+        }
+      } catch {
+        case ie: InterruptedException if stopped => // ignore
+        case e: Exception => logError("Error in cleaning thread", e)
+      }
+    }
+    
+    def doCleanupRDD(rddId: Int, blocking: Boolean): Unit
+    功能: 清理RDD
+    try {
+      logDebug("Cleaning RDD " + rddId)
+      sc.unpersistRDD(rddId, blocking)
+      listeners.asScala.foreach(_.rddCleaned(rddId))
+      logDebug("Cleaned RDD " + rddId)
+    } catch {
+      case e: Exception => logError("Error cleaning RDD " + rddId, e)
+    }
+    
+    def doCleanupShuffle(shuffleId: Int, blocking: Boolean): Unit
+    功能: 清理shuffle
+    try {
+      logDebug("Cleaning shuffle " + shuffleId)
+      mapOutputTrackerMaster.unregisterShuffle(shuffleId)
+      shuffleDriverComponents.removeShuffle(shuffleId, blocking)
+      listeners.asScala.foreach(_.shuffleCleaned(shuffleId))
+      logDebug("Cleaned shuffle " + shuffleId)
+    } catch {
+      case e: Exception => logError("Error cleaning shuffle " + shuffleId, e)
+    }
+    
+    def doCleanupBroadcast(broadcastId: Long, blocking: Boolean): Unit 
+    功能: 清理广播变量
+    try {
+      logDebug(s"Cleaning broadcast $broadcastId")
+      broadcastManager.unbroadcast(broadcastId, true, blocking)
+      listeners.asScala.foreach(_.broadcastCleaned(broadcastId))
+      logDebug(s"Cleaned broadcast $broadcastId")
+    } catch {
+      case e: Exception => logError("Error cleaning broadcast " + broadcastId, e)
+    }
+    
+    def doCleanupAccum(accId: Long, blocking: Boolean): Unit
+    功能: 清理累加器
+    try {
+      logDebug("Cleaning accumulator " + accId)
+      AccumulatorContext.remove(accId)
+      listeners.asScala.foreach(_.accumCleaned(accId))
+      logDebug("Cleaned accumulator " + accId)
+    } catch {
+      case e: Exception => logError("Error cleaning accumulator " + accId, e)
+    }
+    
+    def doCleanCheckpoint(rddId: Int): Unit 
+    功能: 清理检查点
+    try {
+      logDebug("Cleaning rdd checkpoint data " + rddId)
+      ReliableRDDCheckpointData.cleanCheckpoint(sc, rddId)
+      listeners.asScala.foreach(_.checkpointCleaned(rddId))
+      logDebug("Cleaned rdd checkpoint data " + rddId)
+    }
+    catch {
+      case e: Exception => logError("Error cleaning rdd checkpoint data " + rddId, e)
+    }
+    
+    def broadcastManager = sc.env.broadcastManager
+    功能: 获取广播变量管理器
+    
+    def mapOutputTrackerMaster
+    功能: 获取Map输出定位器@MapOutputTrackerMaster
+    val= sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+}
+```
 
 #### BarrierTaskInfo
 
@@ -61,15 +642,533 @@ class BarrierTaskInfo private[spark] (val address: String)
 
 #### Dependency
 
+```scala
+@DeveloperApi
+abstract class Dependency[T] extends Serializable {
+  def rdd: RDD[T]
+}
+介绍: 依赖基本单元
+```
+
+```scala
+@DeveloperApi
+abstract class NarrowDependency[T](_rdd: RDD[T]) extends Dependency[T] {
+    介绍: 窄依赖基本单元(子RDD的每个分区依赖于父RDD的(少量)分区)
+    def rdd: RDD[T] = _rdd
+    功能: 获取RDD
+    
+    def getParents(partitionId: Int): Seq[Int]
+    功能: 获取子RDD分区的父分区,返回依赖的父分区
+}
+
+@DeveloperApi
+class OneToOneDependency[T](rdd: RDD[T]) extends NarrowDependency[T](rdd) {
+  介绍: 一对一依赖,属于窄依赖,父子RDD分区具有一对一关系
+  override def getParents(partitionId: Int): List[Int] = List(partitionId)
+}
+
+@DeveloperApi
+class RangeDependency[T](rdd: RDD[T], inStart: Int, outStart: Int, length: Int)
+extends NarrowDependency[T](rdd) {
+    介绍: 范围依赖(窄依赖)
+    介绍: 表示父子RDD指定范围内的分区一对一关系
+    参数:
+    	RDD 父RDD
+    	inStart	父RDD开始分区
+    	outStart	子RDD开始分区
+    	outStart	范围长度
+    def getParents(partitionId: Int): List[Int] 
+    功能: 获取父RDD分区编号列表
+    if (partitionId >= outStart && partitionId < outStart + length) {
+      List(partitionId - outStart + inStart)
+    } else {
+      Nil
+    }
+}
+
+@DeveloperApi
+class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
+    @transient private val _rdd: RDD[_ <: Product2[K, V]],
+    val partitioner: Partitioner,
+    val serializer: Serializer = SparkEnv.get.serializer,
+    val keyOrdering: Option[Ordering[K]] = None,
+    val aggregator: Option[Aggregator[K, V, C]] = None,
+    val mapSideCombine: Boolean = false,
+    val shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor)
+extends Dependency[Product2[K, V]] {
+    介绍: 代表shuffle范围的输出依赖,注意到由于是存在shuffle,RDD是@transient的,因此执行侧段无法获取这个RDD.
+    参数:
+        _rdd	父RDD
+        partitioner	分区器,用于对shuffle输出进行分区
+        serializer	序列化器
+        keyOrdering	RDD shuffle的key的排序
+        aggregator	RDDshuffle的聚合器
+        mapSideCombine	是否开启map侧,局部聚合
+        shuffleWriterProcessor	shuffle写出进程(控制@ShuffleMapTask 的写操作)
+    属性:
+    #name @keyClassName: String = reflect.classTag[K].runtimeClass.getName	key的类型
+    #name @valueClassName: String = reflect.classTag[V].runtimeClass.getName	value类型
+    #name @combinerClassName: Option[String]=Option(reflect.classTag[C]).map(_.runtimeClass.getName)
+    	合并器类型
+    #name @shuffleId: Int = _rdd.context.newShuffleId()	shuffleID
+    #name @shuffleHandle: ShuffleHandle = _rdd.context.env.shuffleManager.registerShuffle(
+    	shuffleId, this)	
+    	shuffle处理器
+    初始化操作：
+    if (mapSideCombine) {
+        require(aggregator.isDefined, "Map-side combine without Aggregator specified!")
+      }
+    功能: map 侧combine条件断言
+    
+    _rdd.sparkContext.cleaner.foreach(_.registerShuffleForCleanup(this))
+    功能: 清除当前依赖
+    
+    _rdd.sparkContext.shuffleDriverComponents.registerShuffle(shuffleId)
+    功能: 注册shuffle驱动器
+    
+    操作集:
+    def rdd: RDD[Product2[K, V]] = _rdd.asInstanceOf[RDD[Product2[K, V]]]
+    功能: 获取RDD
+}
+
+```
+
 #### ExecutorAllocationClient
+
+```scala
+private[spark] trait ExecutorAllocationClient {
+    介绍: 执行器分配客户端,与集群管理器进行交互,对执行器进行请求或者kill,当前只支持Yarn模式
+    操作集:
+    def getExecutorIds(): Seq[String]
+    功能: 获取执行器列表
+    
+    def isExecutorActive(id: String): Boolean
+    功能: 确定指定执行器是否存活
+    
+    def requestExecutors(numAdditionalExecutors: Int): Boolean
+    功能: 请求集群管理器中指定数量的执行器,返回这些执行器是否被集群管理器(Yarn)识别
+    
+    def killExecutorsOnHost(host: String): Boolean
+    功能: kill指定host的执行器
+    
+    def killExecutors(
+        executorIds: Seq[String], // 执行器列表
+        adjustTargetNumExecutors: Boolean, // kill之后是否重新调整目标执行器列表
+        countFailures: Boolean, //执行器上有任务运行,则计数值+1
+        force: Boolean = false): Seq[String] // 是否强制删除,默认false
+    功能: 请求集群管理器删除指定数量的执行器,返回kill的执行器
+    
+    def killExecutor(executorId: String): Boolean
+    功能: kill指定执行器
+    val= {
+        val killedExecutors = killExecutors(Seq(executorId), adjustTargetNumExecutors = true,
+          countFailures = false)
+        killedExecutors.nonEmpty && killedExecutors(0).equals(executorId)
+      }
+}
+```
 
 #### ExecutorAllocationManager
 
+```markdown
+介绍:
+	执行器分配管理器,
+```
+
+```scala
+
+```
+
 #### FutureAction
+
+```scala
+trait FutureAction[T] extends Future[T] {
+    介绍: 支持取消结果的动作线程任务类
+    def cancel(): Unit
+    功能: 取消动作
+    
+    def ready(atMost: Duration)(implicit permit: CanAwait): FutureAction.this.type
+    功能: 阻塞直到动作完成(等待)
+    输入参数: atMost	最大等待时间,可以为负数(不等待),也可以是Inf,表示无限等待.
+    
+    @throws(classOf[Exception])
+    override def result(atMost: Duration)(implicit permit: CanAwait): T
+    功能: 在最大等待时间内@atMost,等待和返回动作结果
+    
+    def onComplete[U](func: (Try[T]) => U)(implicit executor: ExecutionContext): Unit
+    功能: 动作完成调用此方法(无论是完成还是抛出异常)
+    
+    def isCompleted: Boolean
+    功能: 确定是否完成
+    
+    def isCancelled: Boolean
+    功能: 确定是否放弃
+    
+    def value: Option[Try[T]]
+    功能: 返回当前future 的value,如果任务没完成,则返回None,如果任务完成则返回Some(Success(t)),或者Some(Failure(error))(包含异常)
+    
+    @throws(classOf[SparkException])
+    def get(): T = ThreadUtils.awaitResult(this, Duration.Inf)
+    功能: 返回当前job的结果
+    
+    def jobIds: Seq[Int]
+    功能: 通过底层异步操作获取job ID列表
+}
+```
+
+```scala
+@DeveloperApi
+class SimpleFutureAction[T] private[spark](jobWaiter: JobWaiter[_], resultFunc: => T)
+extends FutureAction[T] {
+    介绍: 容纳触发job的动作结果,包含@count,@collect,@reduce操作
+    参数:
+    jobWaiter	DAG调度job
+    属性:
+    #name @_cancelled: Boolean = false	volatile	是否放弃当前任务
+    操作集:
+    def cancel(): Unit
+    功能: 放弃执行
+    _cancelled = true
+    jobWaiter.cancel() // 调度放弃当前任务(挂起)
+    
+    def ready(atMost: Duration)(implicit permit: CanAwait): SimpleFutureAction.this.type
+    功能: 等待任务直到动作完成
+    val= = {
+        jobWaiter.completionFuture.ready(atMost)
+        this
+      }
+    
+    @throws(classOf[Exception])
+    override def result(atMost: Duration)(implicit permit: CanAwait): T 
+    功能: 在规定时间内获取执行结果
+    val= = {
+        jobWaiter.completionFuture.ready(atMost)
+        assert(value.isDefined, "Future has not completed properly")
+        value.get.get
+      }
+    
+    def onComplete[U](func: (Try[T]) => U)(implicit executor: ExecutionContext): Unit 
+    功能: 完成后动作,动作函数@func
+    jobWaiter.completionFuture 
+    onComplete {_ => func(value.get)}
+    
+    def isCompleted: Boolean = jobWaiter.jobFinished
+    功能: 确认是否完成
+    
+    def isCancelled: Boolean = _cancelled
+    功能: 确认任务是否放弃
+    
+    def jobIds: Seq[Int] = Seq(jobWaiter.jobId)
+    功能: 异步获取job ID列表
+    
+    def value: Option[Try[T]]
+    功能: 返回当前future 的value,如果任务没完成,则返回None,如果任务完成则返回Some(Success(t)),或者Some(Failure(error))(包含异常)
+    val= jobWaiter.completionFuture.value.map {res => res.map(_ => resultFunc)}
+    
+    def transform[S](f: (Try[T]) => Try[S])(implicit e: ExecutionContext): Future[S]
+    功能: 转换函数,将T->S
+    val= jobWaiter.completionFuture.transform((u: Try[Unit]) => f(u.map(_ => resultFunc)))
+    
+    def transformWith[S](f: (Try[T]) => Future[S])(implicit e: ExecutionContext): Future[S]
+    功能: 转换函数
+    val= jobWaiter.completionFuture.transformWith((u: Try[Unit]) => f(u.map(_ => resultFunc)))
+}
+```
+
+```scala
+@DeveloperApi
+trait JobSubmitter {
+    def submitJob[T, U, R](
+        rdd: RDD[T],
+        processPartition: Iterator[T] => U,
+        partitions: Seq[Int],
+        resultHandler: (Int, U) => Unit,
+        resultFunc: => R): FutureAction[R]
+    功能: 提交job用于执行,并返回一个@FutureAction 这之中包含其执行结果
+}
+```
+
+```scala
+@DeveloperApi
+class ComplexFutureAction[T](run : JobSubmitter => Future[T])
+extends FutureAction[T] { self =>
+	介绍: @FutureAction 用于可以触发多个spark job的动作.例如,@take @takeSample
+    属性:
+    #name @_cancelled = false	volatile	放弃执行标志
+    #name @subActions: List[FutureAction[_]] = Nil	子动作列表
+    #name @p = Promise[T]().tryCompleteWith(run(jobSubmitter))	起信信号量
+    操作集:
+    def cancel(): Unit
+    功能: 放弃执行
+    synchronized {
+        _cancelled = true
+        p.tryFailure(new SparkException("Action has been cancelled"))
+        subActions.foreach(_.cancel())
+      }
+    
+    def isCancelled: Boolean = _cancelled
+    功能: 确认是否放弃执行
+    
+    @throws(classOf[InterruptedException])
+    @throws(classOf[scala.concurrent.TimeoutException])
+    override def ready(atMost: Duration)(implicit permit: CanAwait): this.type
+    功能: 阻塞等待结果
+    val= {
+        p.future.ready(atMost)(permit)
+        this
+      }
+    
+    @throws(classOf[Exception])
+    override def result(atMost: Duration)(implicit permit: CanAwait): T
+    功能: 获取执行结果
+    val= p.future.result(atMost)(permit)
+    
+    def onComplete[U](func: (Try[T]) => U)(implicit executor: ExecutionContext): Unit
+    功能: 动作完成执行内容
+    p.future.onComplete(func)(executor)
+    
+    def isCompleted: Boolean = p.isCompleted
+    功能: 确认是否完成
+    
+    def value: Option[Try[T]] = p.future.value
+    功能: 返回当前future 的value,如果任务没完成,则返回None,如果任务完成则返回Some(Success(t)),或者Some(Failure(error))(包含异常)
+    
+    def jobIds: Seq[Int] = subActions.flatMap(_.jobIds)
+    功能: 获取job ID列表
+    
+    def transform[S](f: (Try[T]) => Try[S])(implicit e:ExecutionContext):Future[S]
+    功能: 获取转换之后的结果
+    val= p.future.transform(f)
+    
+    def transformWith[S](f: (Try[T]) => Future[S])(implicit e: ExecutionContext): Future[S]
+    功能: 同上
+    val=  p.future.transformWith(f)
+}
+```
+
+```scala
+private[spark]
+class JavaFutureActionWrapper[S, T](futureAction: FutureAction[S], converter: S => T)
+extends JavaFutureAction[T] {
+    介绍: java类型线程动作的包装
+    def isCancelled: Boolean = futureAction.isCancelled
+    
+    def isDone: Boolean=futureAction.isCancelled || futureAction.isCompleted
+    
+    def jobIds(): java.util.List[java.lang.Integer]
+    val=  Collections.unmodifiableList(futureAction.jobIds.map(Integer.valueOf).asJava)
+    
+    def getImpl(timeout: Duration): T
+    val=  {
+        ThreadUtils.awaitReady(futureAction, timeout)
+        futureAction.value.get match {
+          case scala.util.Success(value) => converter(value)
+          case scala.util.Failure(exception) =>
+            if (isCancelled) {
+              throw new CancellationException("Job cancelled").initCause(exception)
+            } else {
+              throw new ExecutionException("Exception thrown by job", exception)
+            }
+        }
+    }
+    
+    def get(): T = getImpl(Duration.Inf)
+    
+    def get(timeout: Long, unit: TimeUnit): T=getImpl(Duration.fromNanos(unit.toNanos(timeout)))
+    
+    def cancel(mayInterruptIfRunning: Boolean): Boolean
+        val=  synchronized {
+        if (isDone) {
+          false
+        } else {
+          futureAction.cancel()
+          true
+        }
+      }
+}
+```
 
 #### Heartbeater
 
+```scala
+private[spark] class Heartbeater(
+    reportHeartbeat: () => Unit,
+    name: String,
+    intervalMs: Long) extends Logging {
+    介绍: 创建心跳线程,周期性调用汇报心跳@reportHeartbeat
+    参数:
+    	reportHeartbeat	汇报心跳函数
+    	name	心跳名称
+    	intervalMs	汇报周期
+    #name @heartbeater = ThreadUtils.newDaemonSingleThreadScheduledExecutor(name) 执行器心跳任务
+    操作集:
+    def start(): Unit 
+    功能: 调度任务开始汇报心跳
+    1. 计算初始时延
+    val initialDelay = intervalMs + (math.random * intervalMs).asInstanceOf[Int]
+    2. 获取心跳任务
+    val heartbeatTask = new Runnable() {
+      override def run(): Unit = Utils.logUncaughtExceptions(reportHeartbeat())
+    }
+    3. 定时汇报
+    heartbeater.scheduleAtFixedRate(heartbeatTask, initialDelay, intervalMs, TimeUnit.MILLISECONDS)
+    
+    def stop(): Unit
+    功能: 停止心跳线程
+    heartbeater.shutdown()
+    heartbeater.awaitTermination(10, TimeUnit.SECONDS)
+}
+```
+
 #### HeartbeatReceiver
+
+```scala
+private[spark] case class Heartbeat(
+    executorId: String,
+    accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
+    blockManagerId: BlockManagerId,
+    executorUpdates: Map[(Int, Int), ExecutorMetrics])
+介绍: 心跳,从执行器发送到驱动器上,定期共享信息,通过内部组件将执行器的存活信息汇报给驱动器.超过指定超时实现时,会失活,注意@spark.executor.heartbeatInterval < @spark.executor.heartbeatInterval
+
+private[spark] case object TaskSchedulerIsSet
+介绍: sparkContext提示心跳接收器@HeartbeatReceiver @SparkContext.taskScheduler已经创建
+
+private[spark] case object ExpireDeadHosts
+介绍: 崩溃的主机
+
+private case class ExecutorRegistered(executorId: String)
+介绍: 已经注册的执行器
+
+private case class ExecutorRemoved(executorId: String)
+介绍: 移除的执行器
+
+private[spark] case class HeartbeatResponse(reregisterBlockManager: Boolean)
+介绍: 心跳回应
+
+private[spark] object HeartbeatReceiver {
+   介绍: 心跳接收器
+  val ENDPOINT_NAME = "HeartbeatReceiver"	端点名称
+}
+```
+
+```scala
+private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
+extends SparkListener with ThreadSafeRpcEndpoint with Logging {
+    介绍: 存活在驱动器中,用于接收执行器的心跳
+    参数:
+    	sc	spark上下文
+    	clock	时钟
+    构造器:
+    def this(sc: SparkContext) {
+        this(sc, new SystemClock)
+      }
+    功能: 使用系统时钟
+    
+    sc.listenerBus.addToManagementQueue(this)
+    功能: 添加事件监听
+    属性:
+    #name @rpcEnv: RpcEnv = sc.env.rpcEnv	RPC环境
+    #name @scheduler: TaskScheduler = null	任务调度器
+    #name @executorLastSeen = new HashMap[String, Long]	执行器最新可见时间映射表
+    #name @executorTimeoutMs = sc.conf.get(config.STORAGE_BLOCKMANAGER_SLAVE_TIMEOUT)	执行器超时时间
+    #name @checkTimeoutIntervalMs = sc.conf.get(Network.NETWORK_TIMEOUT_INTERVAL)	检查周期
+    #name @executorHeartbeatIntervalMs = sc.conf.get(config.EXECUTOR_HEARTBEAT_INTERVAL) 执行器心跳周期
+    #name @timeoutCheckingTask: ScheduledFuture[_] = null	超时检查任务
+    #name @killExecutorThread = ThreadUtils.newDaemonSingleThreadExecutor("kill-executor-thread")
+    	kill任务线程
+    #name @eventLoopThread=ThreadUtils.newDaemonSingleThreadScheduledExecutor("heartbeat-
+    	receiver-event-loop-thread")
+    	时间环线程
+    操作集：
+    def onStart(): Unit
+    功能: 启动接收器
+    1. 启动超时检查任务
+    timeoutCheckingTask = eventLoopThread.scheduleAtFixedRate(
+      () => Utils.tryLogNonFatalError { Option(self).foreach(_.ask[Boolean](ExpireDeadHosts)) },
+      0, checkTimeoutIntervalMs, TimeUnit.MILLISECONDS)
+    
+    def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] 
+    功能: 接受和回复RPC信息
+    1. 本地收发处理
+    case ExecutorRegistered(executorId) =>
+      executorLastSeen(executorId) = clock.getTimeMillis()
+      context.reply(true)
+    case ExecutorRemoved(executorId) =>
+      executorLastSeen.remove(executorId)
+      context.reply(true)
+    case TaskSchedulerIsSet =>
+      scheduler = sc.taskScheduler
+      context.reply(true)
+    case ExpireDeadHosts =>
+      expireDeadHosts()
+      context.reply(true)
+    2. 回应远程执行器
+    case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorUpdates) =>
+      if (scheduler != null) {
+        if (executorLastSeen.contains(executorId)) {
+          executorLastSeen(executorId) = clock.getTimeMillis()
+          eventLoopThread.submit(new Runnable {
+            override def run(): Unit = Utils.tryLogNonFatalError {
+              val unknownExecutor = !scheduler.executorHeartbeatReceived(
+                executorId, accumUpdates, blockManagerId, executorUpdates)
+              val response = HeartbeatResponse(reregisterBlockManager = unknownExecutor)
+              context.reply(response)
+            }
+          })
+        } else {
+          logDebug(s"Received heartbeat from unknown executor $executorId")
+          context.reply(HeartbeatResponse(reregisterBlockManager = true))
+        }
+      } else {
+        logWarning(s"Dropping $heartbeat because TaskScheduler is not ready yet")
+        context.reply(HeartbeatResponse(reregisterBlockManager = true))
+      }
+    
+    def addExecutor(executorId: String): Option[Future[Boolean]]
+    功能: 添加指定执行器@executorId
+    val= Option(self).map(_.ask[Boolean](ExecutorRegistered(executorId)))
+    
+    def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit
+    功能: 添加执行器后动作,需要提示执行器注册完成
+    addExecutor(executorAdded.executorId)
+    
+    def removeExecutor(executorId: String): Option[Future[Boolean]]
+    功能: 移除执行器
+    val= Option(self).map(_.ask[Boolean](ExecutorRemoved(executorId)))
+    
+    def onExecutorRemoved(executorRemoved: SparkListenerExecutorRemoved): Unit
+    功能: 执行器移除动作,如果接收器没有停止,需要告知执行器移除消息,注意到必须要当执行器移除完毕之后采用汇报信息.主要是保护竞争条件.
+    removeExecutor(executorRemoved.executorId)\
+    
+    def onStop(): Unit
+    功能: 停止接收器
+    1. 关闭检查任务
+    if (timeoutCheckingTask != null) {
+      timeoutCheckingTask.cancel(true)
+    }
+    2. 关闭kill线程,和事件环线程
+    eventLoopThread.shutdownNow()
+    killExecutorThread.shutdownNow()
+    
+    def expireDeadHosts(): Unit
+    功能: 移除失活host
+    val now = clock.getTimeMillis()
+    for ((executorId, lastSeenMs) <- executorLastSeen) {
+      if (now - lastSeenMs > executorTimeoutMs) {
+        logWarning(s"Removing executor $executorId with no recent heartbeats: " +
+          s"${now - lastSeenMs} ms exceeds timeout $executorTimeoutMs ms")
+        scheduler.executorLost(executorId, SlaveLost("Executor heartbeat " +
+          s"timed out after ${now - lastSeenMs} ms"))
+        killExecutorThread.submit(new Runnable {
+          override def run(): Unit = Utils.tryLogNonFatalError {
+            sc.killAndReplaceExecutor(executorId)
+          }
+        })
+        executorLastSeen.remove(executorId)
+      }
+    }
+}
+```
 
 #### InternalAccumulator
 
@@ -1065,3 +2164,4 @@ private[spark] object TaskState extends Enumeration {
 
 1.  SSL
 2.  [加密协议](https://blogs.oracle.com/java-platform-group/entry/diagnosing_tls_ssl_and_https)
+3.   [内存屏障]([https://zh.wikipedia.org/zh-hans/%E5%86%85%E5%AD%98%E5%B1%8F%E9%9A%9C](https://zh.wikipedia.org/zh-hans/内存屏障))
