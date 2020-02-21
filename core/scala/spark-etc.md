@@ -772,11 +772,414 @@ private[spark] trait ExecutorAllocationClient {
 
 ```markdown
 介绍:
-	执行器分配管理器,
+	执行器分配管理器,这个代理依据负载动态的分配和移除执行器.
+	执行器分配管理器@ExecutorAllocationManager 维护一个指定移动数量的执行器,这个会周期性的同步到集群管理器中.目标开始于指定起始值,会因待定或者运行的任务进行改变.
+	减少目标执行器的数量发生在当前目标数量大于当前负载所需要的执行器.将会减少到可以立即运行待定或者运行任务的数量.
+	增加目标执行器的数量发生在积压任务,并等待调度的过程中.如果调度队列在N秒内没有排空,那么会添加新的执行器.如果队列持久化了M秒,那么更多的执行器会被添加.每轮添加的执行器数量以上一轮呈指数形式上升,数量上限是配置的属性值或者是可以运行的待定以及运行任务.
+	指数增加的原理有如下两层
+	1. 执行器数量开始需要缓慢增加,因为其他执行器可能需要变小.否则,添加的执行器数量会超过之后需要移除的执行器数量.
+	2. 执行器需要快速添加,因此执行器最大数量很大.否则,在重负载情况下将会花费较长时间
+	移除策略很简单,如果执行器宕机K秒,意味着这段时间内没有受到执行器的调度.注意到当宕机时间超过L秒,执行器缓存的数据会被移除.
+	在这些情况下都不存在重试的容错策略,因为假定了集群管理器最终会异步填充所有请求.
+	相关spark属性包含如下:
+	spark.dynamicAllocation.enabled	是否允许动态分配
+	spark.dynamicAllocation.minExecutors	执行器数量下限
+	spark.dynamicAllocation.maxExecutors	执行器数量上限
+    spark.dynamicAllocation.initialExecutors	初始执行器数量
+    spark.dynamicAllocation.executorAllocationRatio	执行器分配比例
+    	用于降低动态分配的并发度(当任务小的时候,会浪费系统资源)
+    spark.dynamicAllocation.schedulerBacklogTimeout(M)调度积压延时(超过这个数值,就会新建执行器)
+    spark.dynamicAllocation.sustainedSchedulerBacklogTimeout (N)	维持积压延时
+    	超过这个数值将会新建更多的执行器
+   	spark.dynamicAllocation.executorIdleTimeout (K)	执行器(空载)idle时间
+   		超过这个时间空载(没有缓存数据),执行器将会被移除
+   	spark.dynamicAllocation.cachedExecutorIdleTimeout (L)	缓存执行器(非空载)延时
+    	超过这个值,执行器也会被移除
+  	构造器参数:
+  		client	执行分配客户端
+  		listenerBus	监听总线
+  		conf	spark配置
+  		cleaner	上下文清理器
+  		clock	系统时钟
 ```
 
 ```scala
+private[spark] class ExecutorAllocationManager(
+    client: ExecutorAllocationClient,
+    listenerBus: LiveListenerBus,
+    conf: SparkConf,
+    cleaner: Option[ContextCleaner] = None,
+    clock: Clock = new SystemClock())
+extends Logging {
+    属性:
+    #name @minNumExecutors = conf.get(DYN_ALLOCATION_MIN_EXECUTORS)	最小执行器数量
+    #name @maxNumExecutors = conf.get(DYN_ALLOCATION_MAX_EXECUTORS)	最大执行器数量
+    #name @initialNumExecutors = Utils.getDynamicAllocationInitialExecutors(conf)	
+    	初始化执行器数量
+    #name @schedulerBacklogTimeoutS = conf.get(DYN_ALLOCATION_SCHEDULER_BACKLOG_TIMEOUT)
+    	调度积压延时
+    #name @sustainedSchedulerBacklogTimeoutS	维持积压延时
+    val= conf.get(DYN_ALLOCATION_SUSTAINED_SCHEDULER_BACKLOG_TIMEOUT)
+    #name @testing = conf.get(DYN_ALLOCATION_TESTING)	测试
+    #name @tasksPerExecutorForFullParallelism	每个执行器开启全部并行的task数量(只支持YARN调度)
+    val= conf.get(EXECUTOR_CORES) / conf.get(CPUS_PER_TASK)
+    #name @executorAllocationRatio=conf.get(DYN_ALLOCATION_EXECUTOR_ALLOCATION_RATIO)
+    	执行器分配比例
+    #name @numExecutorsToAdd = 1	需要添加的执行器数量
+    #name @numExecutorsTarget = initialNumExecutors	目标执行器数量
+    #name @addTime: Long = NOT_SET	待定任务转化为未调度任务的时间
+    #name @intervalMillis	轮询周期
+    val= if (Utils.isTesting) {
+      conf.get(TEST_SCHEDULE_INTERVAL)
+    } else {
+      100
+    }
+    #name @listener = new ExecutorAllocationListener	监听器
+    #name @executorMonitor = new ExecutorMonitor(conf, client, listenerBus, clock)
+    	执行器监视器
+    #name @executor	调度任务执行器
+    val= ThreadUtils.newDaemonSingleThreadScheduledExecutor("spark
+    -dynamic-executor-allocation")
+	#name @executorAllocationManagerSource = new ExecutorAllocationManagerSource
+    	执行器分配管理资源
+    #name @initializing: Boolean = true	初始化状态
+    	在执行器空载超时或者stage提交时为false
+    #name @localityAwareTasks = 0	位置感知任务数量(用于执行器替代)
+    #name @hostToLocalTaskCount: Map[String, Int] = Map.empty	本地任务表
+    操作集：
+    def validateSettings(): Unit
+    功能： 参数校验
+    
+    def start(): Unit
+    功能: 启动管理器
+    1. 添加监听事件到监听总线
+    listenerBus.addToManagementQueue(listener)
+    listenerBus.addToManagementQueue(executorMonitor)
+    cleaner.foreach(_.attachListener(executorMonitor))
+    2. 获取调度任务
+    val scheduleTask = new Runnable() {
+      override def run(): Unit = {
+        try {
+          schedule()
+        } catch {
+          case ct: ControlThrowable =>
+            throw ct
+          case t: Throwable =>
+            logWarning(s"Uncaught exception in thread ${Thread.currentThread().getName}", t)
+        }
+      }
+    }
+    3. 延时调度
+    executor.scheduleWithFixedDelay(scheduleTask, 0, intervalMillis,
+                                    TimeUnit.MILLISECONDS)
+    4. 向集群管理器提交任务调度
+    val= client.requestTotalExecutors(numExecutorsTarget, localityAwareTasks, hostToLocalTaskCount)
+   
+    def stop(): Unit
+    功能：停止管理器
+    executor.shutdown()
+    executor.awaitTermination(10, TimeUnit.SECONDS)
+    
+    def reset(): Unit
+    功能： 重置管理器（当集群管理器无法追踪driver的时候）
+    synchronized {
+        addTime = 0L
+        numExecutorsTarget = initialNumExecutors
+        executorMonitor.reset()
+      }
+    
+    def maxNumExecutorsNeeded(): Int
+    功能： 最大执行器需要数量
+    val= {
+        // 获取最大任务数量
+        val numRunningOrPendingTasks = listener.totalPendingTasks +
+            listener.totalRunningTasks
+        math.ceil(numRunningOrPendingTasks * executorAllocationRatio /
+                  tasksPerExecutorForFullParallelism).toInt
+      }
+    
+    def totalRunningTasks(): Int = synchronized {listener.totalRunningTasks}
+    功能: 获取任务运行总量
+    
+    def schedule(): Unit
+    功能: 定期调用,调节待定任务数量和运行任务数量.首先,基于添加时间和当前需求调节申请的执行器.其次,如果移除时间已经过期,kill执行器.
+    val executorIdsToBeRemoved = executorMonitor.timedOutExecutors()
+    if (executorIdsToBeRemoved.nonEmpty) {
+      initializing = false
+    }
+    // 更新执行的数量
+    updateAndSyncNumExecutorsTarget(clock.nanoTime())
+    if (executorIdsToBeRemoved.nonEmpty) { // 移除过期的执行器
+      removeExecutors(executorIdsToBeRemoved)
+    }
+    
+    def addExecutors(maxNumExecutorsNeeded: Int): Int 
+    功能: 添加多个执行器,如果到达上界,则重置并开启下一轮添加
+    0. 进行重置
+     if (numExecutorsTarget >= maxNumExecutors) {
+      logDebug(s"Not adding executors because our current target total " +
+        s"is already $numExecutorsTarget (limit $maxNumExecutors)")
+      numExecutorsToAdd = 1
+      return 0
+    }
+    1. 确定目标执行器数量
+    val oldNumExecutorsTarget = numExecutorsTarget
+    numExecutorsTarget = math.max(numExecutorsTarget, executorMonitor.executorCount)
+    numExecutorsTarget += numExecutorsToAdd
+    numExecutorsTarget = math.min(numExecutorsTarget, maxNumExecutorsNeeded)
+    numExecutorsTarget = math.max(math.min(numExecutorsTarget, maxNumExecutors),
+                                  minNumExecutors)
+    2. 分配需要添加的执行器
+    val delta = numExecutorsTarget - oldNumExecutorsTarget
+    if (delta == 0) {
+        // 不需要添加,则设置相应的监听器事件
+      if (listener.pendingTasks == 0 && listener.pendingSpeculativeTasks > 0) {
+        numExecutorsTarget =
+          math.max(math.min(maxNumExecutorsNeeded + 1, maxNumExecutors), minNumExecutors)
+      } else {
+        numExecutorsToAdd = 1
+        return 0
+      }
+    }
+    3. 确认集群管理器是否可以识别执行器
+    val addRequestAcknowledged = try {
+      testing ||
+        client.requestTotalExecutors(numExecutorsTarget, localityAwareTasks, hostToLocalTaskCount)
+    } catch {
+      case NonFatal(e) =>
+        logInfo("Error reaching cluster manager.", e)
+        false
+    }
+    4. 确定最终需要的执行器
+    if (addRequestAcknowledged) {
+      val executorsString = "executor" + { if (delta > 1) "s" else "" }
+      logInfo(s"Requesting $delta new $executorsString because tasks are backlogged" +
+        s" (new desired total will be $numExecutorsTarget)")
+      numExecutorsToAdd = if (delta == numExecutorsToAdd) {
+        numExecutorsToAdd * 2
+      } else {
+        1
+      }
+      delta
+    } else {
+      logWarning(
+        s"Unable to reach the cluster manager to request $numExecutorsTarget
+        total executors!")
+      numExecutorsTarget = oldNumExecutorsTarget
+      0
+    }
+    
+    def removeExecutors(executors: Seq[String]): Seq[String]
+    功能: 移除给定执行器列表
+    synchronized {
+        1. 确定需要移除的执行器列表,确定剩余执行器数量
+        val executorIdsToBeRemoved = new ArrayBuffer[String]
+        val numExistingExecutors = executorMonitor.executorCount -
+        	executorMonitor.pendingRemovalCount
+        var newExecutorTotal = numExistingExecutors
+        2. 移除执行器数量当指定值
+        executors.foreach { executorIdToBeRemoved =>
+          if (newExecutorTotal - 1 < minNumExecutors) {
+            logDebug(s"Not removing idle executor 
+            $executorIdToBeRemoved because there are only " +
+              s"$newExecutorTotal executor(s) left (minimum number 
+              of executor limit $minNumExecutors)")
+          } else if (newExecutorTotal - 1 < numExecutorsTarget) {
+            logDebug(s"Not removing idle executor $executorIdToBeRemoved 
+            because there are only " +
+              s"$newExecutorTotal executor(s) left (number of executor 
+              target $numExecutorsTarget)")
+          } else {
+            executorIdsToBeRemoved += executorIdToBeRemoved
+            newExecutorTotal -= 1
+          }
+        }
+  		3. kill部分执行器
+        if (executorIdsToBeRemoved.isEmpty) {
+          return Seq.empty[String]
+        }
+        val executorsRemoved = if (testing) {
+          executorIdsToBeRemoved
+        } else {
+          client.killExecutors(executorIdsToBeRemoved, adjustTargetNumExecutors = false,
+            countFailures = false, force = false)
+        }
+        4. 更新执行器数量到指定
+        client.requestTotalExecutors(numExecutorsTarget, localityAwareTasks,
+                                     hostToLocalTaskCount)
+        5. 重置执行器总数
+        newExecutorTotal = numExistingExecutors
+        if (testing || executorsRemoved.nonEmpty) {
+          newExecutorTotal -= executorsRemoved.size
+          executorMonitor.executorsKilled(executorsRemoved)
+          logInfo(s"Executors ${executorsRemoved.mkString(",")} removed due to 
+          idle timeout." +
+            s"(new desired total will be $newExecutorTotal)")
+          executorsRemoved
+        } else {
+          logWarning(s"Unable to reach the cluster manager to kill executor/s " +
+            s"${executorIdsToBeRemoved.mkString(",")} or no executor eligible to kill!")
+          Seq.empty[String]
+        }
+    }
+    
+    def onSchedulerBacklogged(): Unit =
+    功能： 当调度器接收到待定任务时，如果不需要添加的情况下，添加时间到任务中
+    if (addTime == NOT_SET) {
+      logDebug(s"Starting timer to add executors because pending tasks " +
+        s"are building up (to expire in $schedulerBacklogTimeoutS seconds)")
+      addTime = clock.nanoTime() + TimeUnit.SECONDS.toNanos(schedulerBacklogTimeoutS)
+    }
+    
+    def onSchedulerQueueEmpty(): Unit
+    功能： 调度队列空处理
+    synchronized {
+        logDebug("Clearing timer to add executors because there are no more 
+        pending tasks")
+        addTime = NOT_SET
+        numExecutorsToAdd = 1
+      }
+    
+    def updateAndSyncNumExecutorsTarget(now: Long): Int
+    功能: 更新执行器目标值,同步结果到集群管理器中.
+    synchronized {
+        1. 获取最大需要的执行器数量
+        val maxNeeded = maxNumExecutorsNeeded
+        if (initializing) {
+            // 初始状态下,不会改变目标值
+          0
+        } else if (maxNeeded < numExecutorsTarget) {
+          // 最大需求值小于执行器目标数量,则申请新的执行器
+          val oldNumExecutorsTarget = numExecutorsTarget
+          numExecutorsTarget = math.max(maxNeeded, minNumExecutors)
+          numExecutorsToAdd = 1
+          if (numExecutorsTarget < oldNumExecutorsTarget) {
+            // 申请新的执行器
+            client.requestTotalExecutors(numExecutorsTarget, 
+                                         localityAwareTasks, hostToLocalTaskCount)
+            logDebug(s"Lowering target number of executors to 
+            $numExecutorsTarget (previously " +
+              s"$oldNumExecutorsTarget) because not all 
+              requested executors are actually needed")
+          }
+          // 返回获取的执行器数目
+          numExecutorsTarget - oldNumExecutorsTarget
+        } else if (addTime != NOT_SET && now >= addTime) {
+          val delta = addExecutors(maxNeeded)
+          logDebug(s"Starting timer to add more executors (to " +
+            s"expire in $sustainedSchedulerBacklogTimeoutS seconds)")
+          addTime = now + TimeUnit.SECONDS.toNanos(sustainedSchedulerBacklogTimeoutS)
+          delta
+        } else {
+          0
+        }
+    }
+}
+```
 
+```scala
+private case class StageAttempt(stageId: Int, stageAttemptId: Int) {
+    override def toString: String = s"Stage $stageId (Attempt $stageAttemptId)"
+}
+介绍: stage请求信息
+
+private object ExecutorAllocationManager {
+  val NOT_SET = Long.MaxValue // 未设置标记
+}
+介绍： 执行器分配管理器
+```
+
+```scala
+  private[spark] class ExecutorAllocationManagerSource extends Source {
+      介绍: 执行器分配资源管理
+      属性:
+      #name @sourceName = "ExecutorAllocationManager"	资源名称
+      #name @metricRegistry = new MetricRegistry()	度量注册器
+      操作集：
+      def registerGauge[T](name: String, value: => T, defaultValue: T): Unit
+      功能: 注册计量值
+      metricRegistry.register(MetricRegistry.name("executors", name), new Gauge[T] {
+        override def getValue: T = synchronized { Option(value).getOrElse(defaultValue) }
+      })
+      初始化操作:
+      registerGauge("numberExecutorsToAdd", numExecutorsToAdd, 0)
+      registerGauge("numberExecutorsPendingToRemove", executorMonitor.pendingRemovalCount, 0)
+      registerGauge("numberAllExecutors", executorMonitor.executorCount, 0)
+      registerGauge("numberTargetExecutors", numExecutorsTarget, 0)
+      registerGauge("numberMaxNeededExecutors", maxNumExecutorsNeeded(), 0)
+  }
+```
+
+```scala
+private[spark] class ExecutorAllocationListener extends SparkListener {
+    介绍： 执行器分配监听器
+    这是一个提示指定分配管理器在添加或删除执行器时的监听器，这个类故意时保守的（关于相关排序和监听事件的一致性）
+    属性:
+    #name @stageAttemptToNumTasks = new mutable.HashMap[StageAttempt, Int]
+    	stage请求任务数表
+    #name @stageAttemptToNumRunningTask = new mutable.HashMap[StageAttempt, Int]
+    	stage请求运行任务数表
+    #name @stageAttemptToTaskIndices = new mutable.HashMap[StageAttempt, mutable.HashSet[Int]]
+    	stage 请求任务索引表
+    #name @stageAttemptToNumSpeculativeTasks = new mutable.HashMap[StageAttempt, Int]
+    	stage推测任务请求表
+    #name @stageAttemptToSpeculativeTaskIndices =
+      new mutable.HashMap[StageAttempt, mutable.HashSet[Int]]
+    	stage推测任务索引表
+    #name @stageAttemptToExecutorPlacementHints =
+      new mutable.HashMap[StageAttempt, (Int, Map[String, Int])]
+    	执行器替换表
+	操作集:
+    def onStageSubmitted(stageSubmitted: SparkListenerStageSubmitted): Unit
+    功能: stage提交处理
+    
+    def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit 
+    功能: stage完成处理
+    
+    def onTaskStart(taskStart: SparkListenerTaskStart): Unit
+    功能: 任务完成处理
+    
+    def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit
+    功能: 任务结束处理
+    
+    def onSpeculativeTaskSubmitted(speculativeTask:
+                                   SparkListenerSpeculativeTaskSubmitted): Unit
+    功能: 推测任务提交的处理
+    
+    def pendingTasks(): Int
+    功能： 获取待定任务数量
+    val= stageAttemptToNumTasks.map { case (stageAttempt, numTasks) =>
+        numTasks - stageAttemptToTaskIndices.get(stageAttempt).map(_.size).getOrElse(0)
+      }.sum
+    
+    def pendingSpeculativeTasks(): Int 
+    功能: 获取待定推测任务
+    val= stageAttemptToNumSpeculativeTasks.map { case (stageAttempt, numTasks) =>
+        numTasks - 
+        stageAttemptToSpeculativeTaskIndices.get(stageAttempt).map(_.size).getOrElse(0)
+      }.sum
+    
+    def totalPendingTasks(): Int = pendingTasks + pendingSpeculativeTasks
+    功能:获取待定任务总量
+    
+    def totalRunningTasks(): Int
+    功能:获取运行任务数量
+    
+    def updateExecutorPlacementHints(): Unit 
+    功能:更新执行器位置提示信息
+    var localityAwareTasks = 0
+      val localityToCount = new mutable.HashMap[String, Int]()
+      stageAttemptToExecutorPlacementHints.values.foreach { 
+        case (numTasksPending, localities) =>
+        localityAwareTasks += numTasksPending
+        localities.foreach { case (hostname, count) =>
+          val updatedCount = localityToCount.getOrElse(hostname, 0) + count
+          localityToCount(hostname) = updatedCount
+        }
+      }
+      allocationManager.localityAwareTasks = localityAwareTasks
+      allocationManager.hostToLocalTaskCount = localityToCount.toMap
+}
 ```
 
 #### FutureAction
@@ -1302,7 +1705,486 @@ trait Partition extends Serializable {
 
 #### Partitioner
 
+```scala
+abstract class Partitioner extends Serializable {
+    介绍: 这个对象定义了一个kv RDD是如何按照key进行分区的.映射每个分区到一个分区RDD中.注意到,分区器必须是确定的,即同一个key必须返回同一个分区号
+    def numPartitions: Int
+    功能: 获取分区数量
+    def getPartition(key: Any): Int
+    功能: 获取指定key所属的分区编号
+}
+```
+
+```scala
+object Partitioner {
+    操作集:
+    def defaultPartitioner(rdd: RDD[_], others: RDD[_]*): Partitioner
+    功能: 获取默认分区器
+    选择一个分区对多个RDD进行类似cogroup的操作.如果设置了@spark.default.parallelism,会使用SparkContext的默认参数作为默认并行度,否则使用上游分区最大值作为默认并行度.可以的话,选择最大数量分区的RDD的分区器.如果这个分区器,如果这个分区器是合法的.或含有分区数量大于等于默认分区数量,就使用这个分区器.否则需要新建一个hash分区器,分区数为默认分区数量.
+    如果没有设置并行度参数@spark.default.parallelism,分区数量会和上游最大分区数量一致,这样不容易引发OOM.使用两个参数(rdd,others)强迫至少传入一个RDD.
+    参数:
+    	rdd	当前RDD
+    	others	其他RDD列表
+    1. 确定是否含有分区器(分区数是否为正)
+    val rdds = (Seq(rdd) ++ others)
+    val hasPartitioner = rdds.filter(_.partitioner.exists(_.numPartitions > 0))
+    2. 获取最大分区数量
+    val hasMaxPartitioner: Option[RDD[_]] = if (hasPartitioner.nonEmpty) {
+      Some(hasPartitioner.maxBy(_.partitions.length))
+    } else {
+      None
+    }
+    3. 获取默认最大分区数量(默认并行度)
+    val defaultNumPartitions = if
+    	(rdd.context.conf.contains("spark.default.parallelism")) {
+      rdd.context.defaultParallelism
+    } else {
+      rdds.map(_.partitions.length).max
+    }
+    4. 获取分区器
+    if (hasMaxPartitioner.nonEmpty && 
+        (isEligiblePartitioner(hasMaxPartitioner.get, rdds) ||
+        defaultNumPartitions <= hasMaxPartitioner.get.getNumPartitions)) {
+        // 可用的分区数超过默认参数,使用最大分区数量
+      hasMaxPartitioner.get.partitioner.get
+    } else {
+      // 其余情况使用默认参数的hash分区器
+      new HashPartitioner(defaultNumPartitions)
+    }
+    
+    def isEligiblePartitioner(
+     hasMaxPartitioner: RDD[_],
+     rdds: Seq[RDD[_]]): Boolean
+    功能： 判断是否是可以分区器
+    val= {
+        val maxPartitions = rdds.map(_.partitions.length).max
+        log10(maxPartitions) - log10(hasMaxPartitioner.getNumPartitions) < 1
+    }
+}
+```
+
+```scala
+class HashPartitioner(partitions: Int) extends Partitioner {
+    介绍: hash分区器
+    操作集:
+    def numPartitions: Int = partitions
+    功能: 获取分区数量
+    
+    def getPartition(key: Any): Int
+    功能: 获取分区编号
+    val= key match {
+        case null => 0
+        case _ => Utils.nonNegativeMod(key.hashCode, numPartitions)
+    }
+    
+    def equals(other: Any): Boolean
+    功能: 判断分区相等逻辑
+    val= other match {
+        case h: HashPartitioner =>
+          h.numPartitions == numPartitions
+        case _ =>
+          false
+      }
+    
+    def hashCode: Int = numPartitions
+    功能: 获取hash值
+}
+```
+
+```scala
+class RangePartitioner[K : Ordering : ClassTag, V](
+    partitions: Int,
+    rdd: RDD[_ <: Product2[K, V]],
+    private var ascending: Boolean = true,
+    val samplePointsPerPartitionHint: Int = 20)
+extends Partitioner {
+    介绍: 区域分区器,通过对记录粗略的排序实现分区的形成,范围由传入的数值决定
+        partitions	分区数量
+        rdd	RDD
+        ascending	是否升序排序
+        samplePointsPerPartitionHint	每个分区采样点数
+    属性:
+    #name @ordering = implicitly[Ordering[K]]	排序方式
+    #name @binarySearch: ((Array[K], K) => Int) = CollectionsUtils.makeBinarySearch[K]
+    	二分查找函数
+    #name @rangeBounds: Array[K]	区域界线
+    val= if (partitions <= 1) {
+      Array.empty
+    } else {
+        // 分区中采样指定数量的元素
+      val sampleSize = math.min(samplePointsPerPartitionHint.toDouble * partitions, 1e6)
+      // 计算每个分区的采样数量
+      val sampleSizePerPartition = math.ceil(3.0 * sampleSize / rdd.partitions.length).toInt
+      val (numItems, sketched) = RangePartitioner.sketch(rdd.map(_._1), sampleSizePerPartition)
+      if (numItems == 0L) {
+        Array.empty
+      } else {
+        val fraction = math.min(sampleSize / math.max(numItems, 1L), 1.0)
+        val candidates = ArrayBuffer.empty[(K, Float)]
+        val imbalancedPartitions = mutable.Set.empty[Int]
+        sketched.foreach { case (idx, n, sample) =>
+          if (fraction * n > sampleSizePerPartition) {
+            imbalancedPartitions += idx
+          } else {
+            // The weight is 1 over the sampling probability.
+            val weight = (n.toDouble / sample.length).toFloat
+            for (key <- sample) {
+              candidates += ((key, weight))
+            }
+          }
+        }
+        if (imbalancedPartitions.nonEmpty) {
+          val imbalanced = new PartitionPruningRDD(rdd.map(_._1), imbalancedPartitions.contains)
+          val seed = byteswap32(-rdd.id - 1)
+          val reSampled = imbalanced.sample(withReplacement = false, fraction, seed).collect()
+          val weight = (1.0 / fraction).toFloat
+          candidates ++= reSampled.map(x => (x, weight))
+        }
+        RangePartitioner.determineBounds(candidates, math.min(partitions, candidates.size))
+      }
+    }
+    
+    def getPartition(key: Any): Int
+    功能: 获取分区编号
+    val k = key.asInstanceOf[K]
+    var partition = 0
+    if (rangeBounds.length <= 128) {
+      while (partition < rangeBounds.length && ordering.gt(k, rangeBounds(partition))) {
+        partition += 1
+      }
+    } else {
+      partition = binarySearch(rangeBounds, k)
+      if (partition < 0) {
+        partition = -partition-1
+      }
+      if (partition > rangeBounds.length) {
+        partition = rangeBounds.length
+      }
+    }
+    if (ascending) {
+      partition
+    } else {
+      rangeBounds.length - partition
+    }
+    
+    @throws(classOf[IOException])
+    private def writeObject(out: ObjectOutputStream): Unit 
+    功能: 写出属性值
+    Utils.tryOrIOException {
+        val sfactory = SparkEnv.get.serializer
+        sfactory match {
+          case js: JavaSerializer => out.defaultWriteObject()
+          case _ =>
+            out.writeBoolean(ascending)
+            out.writeObject(ordering)
+            out.writeObject(binarySearch)
+
+            val ser = sfactory.newInstance()
+            Utils.serializeViaNestedStream(out, ser) { stream =>
+              stream.writeObject(scala.reflect.classTag[Array[K]])
+              stream.writeObject(rangeBounds)
+            }
+        }
+      }
+    
+    @throws(classOf[IOException])
+    private def readObject(in: ObjectInputStream): Unit 
+    功能: 读取属性值
+    Utils.tryOrIOException {
+        val sfactory = SparkEnv.get.serializer
+        sfactory match {
+          case js: JavaSerializer => in.defaultReadObject()
+          case _ =>
+            ascending = in.readBoolean()
+            ordering = in.readObject().asInstanceOf[Ordering[K]]
+            binarySearch = in.readObject().asInstanceOf[(Array[K], K) => Int]
+
+            val ser = sfactory.newInstance()
+            Utils.deserializeViaNestedStream(in, ser) { ds =>
+              implicit val classTag = ds.readObject[ClassTag[Array[K]]]()
+              rangeBounds = ds.readObject[Array[K]]()
+            }
+        }
+      }
+    
+    def hashCode(): Int
+    功能: 计算分区器hash值
+}
+```
+
+```scala
+private[spark] object RangePartitioner {
+    操作集：
+    def sketch[K : ClassTag](
+      rdd: RDD[K],
+      sampleSizePerPartition: Int): (Long, Array[(Int, Long, Array[K])])
+    功能: 通过每个分区的采样值描摹输入RDD
+    1. 获取RDD编号
+    val shift = rdd.id
+    2. 描摹每个分区（使用采样）
+    val sketched = rdd.mapPartitionsWithIndex { (idx, iter) =>
+      val seed = byteswap32(idx ^ (shift << 16))
+      val (sample, n) = SamplingUtils.reservoirSampleAndCount(
+        iter, sampleSizePerPartition, seed)
+      Iterator((idx, n, sample))
+    }.collect()
+    3. 获取采样总数并返回
+    val numItems = sketched.map(_._2).sum
+    val= (numItems, sketched)
+    
+    def determineBounds[K : Ordering : ClassTag](
+      candidates: ArrayBuffer[(K, Float)],
+      partitions: Int): Array[K]
+    功能： 计算范围分区的上界，使用带权的候选元素
+    输入参数：
+    	candidates	未排序的带权候选值
+    	partitions	分区数量
+    返回: 选择的上界
+    1. 对候选值进行排序
+    val ordering = implicitly[Ordering[K]]
+    val ordered = candidates.sortBy(_._1)
+    2. 求总权值，并求出每个分区的权值步长
+    val numCandidates = ordered.size
+    val sumWeights = ordered.map(_._2.toDouble).sum
+    val step = sumWeights / partitions
+    3. 设置初始化界限
+    val numCandidates = ordered.size
+    val sumWeights = ordered.map(_._2.toDouble).sum
+    val step = sumWeights / partitions
+    4. 设置其他界限
+    while ((i < numCandidates) && (j < partitions - 1)) {
+      val (key, weight) = ordered(i)
+      cumWeight += weight
+      if (cumWeight >= target) {
+        // Skip duplicate values.
+        if (previousBound.isEmpty || ordering.gt(key, previousBound.get)) {
+          bounds += key
+          target += step
+          j += 1
+          previousBound = Some(key)
+        }
+      }
+      i += 1
+    }
+    val= bounds.toArray
+}
+```
+
 #### SecurityManager
+
+```scala
+private[spark] class SecurityManager(
+    sparkConf: SparkConf,
+    val ioEncryptionKey: Option[Array[Byte]] = None,
+    authSecretFileConf: ConfigEntry[Option[String]] = AUTH_SECRET_FILE)
+extends Logging with SecretKeyHolder {
+    介绍: spark提供安全机制的类
+    这个类需要使用sparkEnv实例化,大多数属性需要从其中获取.也有一些情况,sparkEnv无法初始化,这种情况下需要直接初始化.这个类实现了所有安全相关的配置.请参考相关特征的文档.
+    属性:
+    #name @WILDCARD_ACL = "*"	通配访问控制符
+    #name @authOn = sparkConf.get(NETWORK_AUTH_ENABLED)	网络授权状态
+    #name @aclsOn = sparkConf.get(ACLS_ENABLE)	允许访问控制状态
+    #name @adminAcls: Set[String] = sparkConf.get(ADMIN_ACLS).toSet
+    	管理访问控制列表
+    #name @adminAclsGroups: Set[String] = sparkConf.get(ADMIN_ACLS_GROUPS).toSet
+    	管理控制列表组
+    #name @viewAcls: Set[String] = _
+    	视图访问控制列表
+    #name @viewAclsGroups: Set[String] = _
+    	视图访问控制列表组
+    #name @modifyAcls: Set[String] = _	修改控制列表
+    #name @modifyAclsGroups: Set[String] = _	修改控制列表组
+    #name @defaultAclUsers	默认访问用户
+    val= Set[String](System.getProperty("user.name", ""),
+    	Utils.getCurrentUserName())
+    #name @secretKey= _	密钥
+    #name @hadoopConf = SparkHadoopUtil.get.newConfiguration(sparkConf)	hadoop配置
+    #name @defaultSSLOptions	默认ssl配置
+    	val= SSLOptions.parse(sparkConf, hadoopConf, "spark.ssl", defaults = None)
+    操作集:
+    def getSSLOptions(module: String): SSLOptions
+    功能: 获取SSL配置
+    val= {
+    val opts =
+          SSLOptions.parse(sparkConf, hadoopConf, s"spark.ssl.$module",
+                           Some(defaultSSLOptions))
+        logDebug(s"Created SSL options for $module: $opts")
+        opts
+      }
+    
+    def setViewAcls(defaultUsers: Set[String], allowedUsers: Seq[String]): Unit 
+    功能: 设置视图控制列表,管理控制列表设置是前提条件
+    viewAcls = adminAcls ++ defaultUsers ++ allowedUsers
+    logInfo("Changing view acls to: " + viewAcls.mkString(","))
+    
+    def setViewAcls(defaultUser: String, allowedUsers: Seq[String]): Unit
+    功能: 设置视图控制列表
+    setViewAcls(Set[String](defaultUser), allowedUsers)
+    
+    def setViewAclsGroups(allowedUserGroups: Seq[String]): Unit
+    功能: 设置视图控制列表组
+    viewAclsGroups = adminAclsGroups ++ allowedUserGroups
+    
+    def getViewAcls: String
+    功能: 获取视图控制列表
+    val= if (viewAcls.contains(WILDCARD_ACL)) {
+      WILDCARD_ACL
+    } else {
+      viewAcls.mkString(",")
+    }
+    
+    def getViewAclsGroups: String 
+    功能: 获取视图控制列表组
+    val= if (viewAclsGroups.contains(WILDCARD_ACL)) {
+      WILDCARD_ACL
+    } else {
+      viewAclsGroups.mkString(",")
+    }
+    
+    def setModifyAcls(defaultUsers: Set[String], allowedUsers: Seq[String]): Unit
+    功能: 设置修改控制列表
+    modifyAcls = adminAcls ++ defaultUsers ++ allowedUsers
+    logInfo("Changing modify acls to: " + modifyAcls.mkString(","))
+    
+    def setModifyAclsGroups(allowedUserGroups: Seq[String]): Unit
+    功能: 设置修改控制列表组
+    modifyAclsGroups = adminAclsGroups ++ allowedUserGroups
+    logInfo("Changing modify acls groups to: " + modifyAclsGroups.mkString(","))
+    
+    def getModifyAcls: String
+    功能: 获取修改控制列表
+    val= if (modifyAcls.contains(WILDCARD_ACL)) {
+      WILDCARD_ACL
+    } else {
+      modifyAcls.mkString(",")
+    }
+    
+    def getModifyAclsGroups: String 
+    功能: 获取修改控制列表组
+    val= if (modifyAclsGroups.contains(WILDCARD_ACL)) {
+      WILDCARD_ACL
+    } else {
+      modifyAclsGroups.mkString(",")
+    }
+    
+    def setAdminAcls(adminUsers: Seq[String]): Unit
+    功能: 设置管理控制列表组
+    adminAcls = adminUsers.toSet
+    logInfo("Changing admin acls to: " + adminAcls.mkString(","))
+    
+    def setAdminAclsGroups(adminUserGroups: Seq[String]): Unit = 
+    功能: 设置管理控制列表组      
+    adminAclsGroups = adminUserGroups.toSet
+    logInfo("Changing admin acls groups to: " + adminAclsGroups.mkString(","))
+    
+    def setAcls(aclSetting: Boolean): Unit
+    功能: 设置网络授权状态
+    aclsOn = aclSetting
+    
+    def getIOEncryptionKey(): Option[Array[Byte]] = ioEncryptionKey
+    功能: 获取加密密钥
+    
+    def aclsEnabled(): Boolean = aclsOn
+    功能: 确认是否可以访问控制
+    
+    def checkAdminPermissions(user: String): Boolean
+    功能: 检查管理权限
+    val= isUserInACL(user, adminAcls, adminAclsGroups)
+    
+    def checkUIViewPermissions(user: String): Boolean
+    功能: 检查是否有UI视图权限
+    val= isUserInACL(user, viewAcls, viewAclsGroups)
+    
+    def checkModifyPermissions(user: String): Boolean
+    功能: 检查是否含有修改权限
+    val= isUserInACL(user, modifyAcls, modifyAclsGroups)
+    
+    def isAuthenticationEnabled(): Boolean = authOn
+    功能: 是否允许授权
+    
+    def isEncryptionEnabled(): Boolean
+    功能: 检查是否加密
+    val= sparkConf.get(Network.NETWORK_CRYPTO_ENABLED) ||
+    	sparkConf.get(SASL_ENCRYPTION_ENABLED)
+    
+    def getSaslUser(): String = "sparkSaslUser"
+    功能: 获取Sasl用户(使用Sasl连接)
+    
+    def getSecretKey(): String
+    功能: 获取密钥
+    val= if (isAuthenticationEnabled) {
+      val creds = UserGroupInformation.getCurrentUser().getCredentials()
+      Option(creds.getSecretKey(SECRET_LOOKUP_KEY))
+        .map { bytes => new String(bytes, UTF_8) }
+        .orElse(Option(secretKey))
+        .orElse(Option(sparkConf.getenv(ENV_AUTH_SECRET)))
+        .orElse(sparkConf.getOption(SPARK_AUTH_SECRET_CONF))
+        .orElse(secretKeyFromFile())
+        .getOrElse {
+          throw new IllegalArgumentException(
+            s"A secret key must be specified via the $SPARK_AUTH_SECRET_CONF config")
+        }
+    } else {
+      null
+    }
+    
+    def secretKeyFromFile(): Option[String]
+    功能: 获取文件中的密钥
+    val= sparkConf.get(authSecretFileConf).flatMap { secretFilePath =>
+      sparkConf.getOption(SparkLauncher.SPARK_MASTER).map {
+        case k8sRegex() =>
+          val secretFile = new File(secretFilePath)
+          require(secretFile.isFile, s"No file found containing the secret key
+          at $secretFilePath.")
+          val base64Key = Base64.getEncoder.encodeToString(Files.readAllBytes(
+              secretFile.toPath))
+          require(!base64Key.isEmpty, s"Secret key from file located at 
+          $secretFilePath is empty.")
+          base64Key
+        case _ =>
+          throw new IllegalArgumentException(
+            "Secret keys provided via files is only allowed in Kubernetes mode.")
+      }
+    }
+    
+    def getSaslUser(appId: String): String = getSaslUser()
+    功能: 获取sasl用户
+    
+    def getSecretKey(appId: String): String = getSecretKey()
+    功能: 获取密钥
+    
+    def isUserInACL(
+      user: String,
+      aclUsers: Set[String],
+      aclGroups: Set[String]): Boolean
+    功能: 确定指定用户@user 是否在指定访问控制表中@aclUsers
+    val= if (user == null ||
+        !aclsEnabled ||
+        aclUsers.contains(WILDCARD_ACL) ||
+        aclUsers.contains(user) ||
+        aclGroups.contains(WILDCARD_ACL)) {
+      true
+    } else {
+      val userGroups = Utils.getCurrentUserGroups(sparkConf, user)
+      logDebug(s"user $user is in groups ${userGroups.mkString(",")}")
+      aclGroups.exists(userGroups.contains(_))
+    }
+    
+    def initializeAuth(): Unit
+    功能: 初始化授权密钥,在yarn或者本地模式下,产生新的密钥,并将其存储在用户的数字证书中,其他模式下,断言配置中设定了密钥.
+}
+```
+
+```scala
+private[spark] object SecurityManager {
+    属性:
+    #name @k8sRegex = "k8s.*".r	k8s正则表达式
+    #name @SPARK_AUTH_CONF = NETWORK_AUTH_ENABLED.key	spark授权配置
+    #name @SPARK_AUTH_SECRET_CONF = AUTH_SECRET.key	spark授权配置
+    #name @ENV_AUTH_SECRET = "_SPARK_AUTH_SECRET"	环境授权密钥
+    #name @SECRET_LOOKUP_KEY = new Text("sparkCookie")	环境查找的key
+}
+```
 
 #### SerializableWritable
 
@@ -1334,16 +2216,743 @@ class SerializableWritable[T <: Writable](@transient var t: T) extends Serializa
         ow.readFields(in)
         // 赋值给t(t是不可以直接进行读写的)
         t = ow.get().asInstanceOf[T]
-      }
-    
+      }   
 }
 ```
 
 #### SparkConf
 
+```markdown
+介绍:
+	spark配置,按照kv的形式设置spark参数.大多数情况使用`new SparkConf()`创建SparkConf对象,会加载`spark.*`java系统下的系统属性.sparkConf配置优先于系统配置.
+	对于单元测试来说,,你可以调用`new Spark(false)`,从而不用加载外部配置,且获取相同的配置,无论系统配置如何.允许链式调用setter方法比如`new SparkConf().setMaster("local").setAppName("My app")`
+	注意: 一旦配置传递給spark,就不可以对其进行修改.spark不支持运行期修改配置.
+	参数:
+	loadDefaults	是否从java系统中获取配置
+```
+
+```scala
+class SparkConf(loadDefaults: Boolean) extends Cloneable with Logging with Serializable {
+    属性:
+    #name @settings = new ConcurrentHashMap[String, String]()	配置列表
+    #name @reader: ConfigReader	配置读取器
+    val= {
+        val _reader = new ConfigReader(new SparkConfigProvider(settings))
+        _reader.bindEnv((key: String) => Option(getenv(key)))
+        _reader
+      }
+    #name @avroNamespace = "avro.schema."	AVRO命名空间
+    操作集:
+    def loadFromSystemProperties(silent: Boolean): SparkConf
+    功能: 加载spark.*下面的属性配置
+    
+    def set(key: String, value: String): SparkConf
+    功能: 设置配置信息
+    
+    def set(key: String, value: String, silent: Boolean): SparkConf 
+    功能: 设置配置信息,可以指定是否后台执行,否则以日志的形式表现出来
+    
+    def set[T](entry: ConfigEntry[T], value: T): SparkConf 
+    功能: 设置配置信息
+    set(entry.key, entry.stringConverter(value))
+    val= this
+    
+    def set[T](entry: OptionalConfigEntry[T], value: T): SparkConf 
+    功能: 设置配置信息
+    
+    def setMaster(master: String): SparkConf = set("spark.master", master)
+    功能: 设置master
+    
+    def setAppName(name: String): SparkConf= set("spark.app.name", name)
+    功能: 设置应用名称
+    
+    def setJars(jars: Seq[String]): SparkConf
+    功能: 设置jar列表,分布于集群中
+    for (jar <- jars if (jar == null)) logWarning("null jar passed to 
+    SparkContext constructor")
+    set(JARS, jars.filter(_ != null))
+    
+    def setJars(jars: Array[String]): SparkConf= setJars(jars.toSeq)
+    功能: 设置jar列表,分布于集群中,java使用
+    
+    def setExecutorEnv(variable: String, value: String): SparkConf
+    功能: 设置执行器环境
+    
+    def setExecutorEnv(variables: Seq[(String, String)]): SparkConf 
+    功能: 设置执行器环境列表
+    
+    def setExecutorEnv(variables: Array[(String, String)]): SparkConf 
+    功能: 设置执行器环境
+    
+    def setSparkHome(home: String): SparkConf 
+    功能: 设置spark工作节点安装位置
+    
+    def setAll(settings: Iterable[(String, String)]): SparkConf 
+    功能: 多参数设置
+    
+    def setIfMissing(key: String, value: String): SparkConf 
+    功能: 缺失此项配置上设置
+    
+    def setIfMissing[T](entry: ConfigEntry[T], value: T): SparkConf
+    功能: 缺失此项配置上设置
+    
+    def setIfMissing[T](entry: OptionalConfigEntry[T], value: T): SparkConf 
+    功能: 缺失此项配置上设置
+    
+    def registerKryoClasses(classes: Array[Class[_]]): SparkConf
+    功能: 注册指定类@classess到kryo序列化器中调用多次
+    
+    def registerAvroSchemas(schemas: Schema*): SparkConf 
+    功能: 注册AVRO的schema,以便于序列化时减少网络IO
+    for (schema <- schemas) {
+      set(avroNamespace + SchemaNormalization.parsingFingerprint64(schema),
+          schema.toString)
+    }
+    val= this
+    
+    def getAvroSchema: Map[Long, String]
+    功能: 获取AVRO schema列表
+    val= getAll.filter { case (k, v) => k.startsWith(avroNamespace) }
+      .map { case (k, v) => (k.substring(avroNamespace.length).toLong, v) }
+      .toMap
+    
+    def remove(key: String): SparkConf
+    功能: 移除指定配置
+    
+    def remove(entry: ConfigEntry[_]): SparkConf
+    功能: 移除指定配置
+    
+    def get(key: String): String
+    功能: 获取指定配置,没有的时候抛出异常
+    
+    def get(key: String, defaultValue: String): String
+    功能: 获取指定配置,没有的时候为默认值
+    
+    def get[T](entry: ConfigEntry[T]): T
+    功能: 从@reader中检索指定配置参数@entry
+    val= entry.readFrom(reader)
+    
+    def getTimeAsSeconds(key: String): Long
+    功能: 获取时间,没有设置则抛出异常
+    
+    def getTimeAsSeconds(key: String, defaultValue: String): Long
+    功能: 获取时间,没有设置则为默认值
+    
+    def getTimeAsMs(key: String): Long
+    功能: 获取时间,单位ms,没有设置则抛出异常
+    
+    def getTimeAsMs(key: String, defaultValue: String): Long
+    功能: 获取时间,没有设置则为默认值
+    
+    def getSizeAsBytes(key: String): Long
+    功能: 获取大小,没有设置抛出异常(单位字节)
+    
+    def getSizeAsBytes(key: String, defaultValue: String): Long
+    功能: 获取大小,没有设置返回默认值(单位字节)
+    
+    def getSizeAsKb(key: String): Long
+    功能: 获取大小,没有设置抛出异常(单位KB)
+    
+    def getSizeAsKb(key: String, defaultValue: String): Long 
+    功能: 获取大小,没有设置返回默认值(单位KB)
+    
+    def getSizeAsMb(key: String): Long
+    功能: 获取大小,没有设置抛出异常(单位MB)
+    
+    def getSizeAsMb(key: String, defaultValue: String): Long
+    功能: 获取大小,没有设置返回默认值(单位MB)
+    
+    def getSizeAsGb(key: String): Long
+    功能: 获取大小,没有设置抛出异常(单位GB)
+    
+    def getSizeAsGb(key: String, defaultValue: String): Long
+    功能: 获取大小,没有设置返回默认值(单位GB)
+    
+    def getOption(key: String): Option[String]
+    功能: 获取指定key的可选配置
+    
+    def getWithSubstitution(key: String): Option[String] 
+    功能: 使用变量替换,获取key的value值
+    
+    def getAll: Array[(String, String)]
+    功能: 获取所有配置
+    
+    def getAllWithPrefix(prefix: String): Array[(String, String)] 
+    功能: 获取所有配置,并带有前缀
+    
+    def getInt(key: String, defaultValue: Int): Int
+    功能: 获取int值,失败则获取默认值
+    
+    def getLong(key: String, defaultValue: Long): Long 
+    功能: 获取long值,失败则获取默认值
+    
+    def getDouble(key: String, defaultValue: Double): Double
+    功能: 获取double值,失败则获取默认值
+    
+    def getBoolean(key: String, defaultValue: Boolean): Boolean
+    功能: 获取boolean值,失败则获取默认值
+    
+    def getExecutorEnv: Seq[(String, String)]
+    功能: 获取执行器环境变量
+    
+    def getAppId: String = get("spark.app.id")
+    功能: 获取应用ID
+    
+    def contains(key: String): Boolean
+    功能: 确认是否包含指定key
+    
+    def contains(entry: ConfigEntry[_]): Boolean = contains(entry.key)
+    功能: 确认是否包含指定@entry
+    
+    def clone: SparkConf
+    功能: 对象复制
+    
+    def getenv(name: String): String = System.getenv(name)
+    功能: 获取系统环境
+    
+    def catchIllegalValue[T](key: String)(getValue: => T): T
+    功能: 步骤非法值
+    输入参数:
+    	key	key值
+    	getValue	获取value函数
+    val= try {
+      getValue
+    } catch {
+      case e: NumberFormatException =>
+        throw new NumberFormatException(s"Illegal value for config key 
+        $key: ${e.getMessage}")
+            .initCause(e)
+      case e: IllegalArgumentException =>
+        throw new IllegalArgumentException(s"Illegal value for config key $key:
+        ${e.getMessage}", e)
+    }
+    
+    def toDebugString: String
+    功能: 显示debug信息
+    
+    def validateSettings(): Unit 
+    功能: 验证配置信息是否合法，非法则抛出异常
+}
+```
+
+```scala
+private[spark] object SparkConf extends Logging {
+    属性:
+    #name @deprecatedConfigs: Map[String, DeprecatedConfig]	弃用配置表
+    val= {
+        val configs = Seq(
+          DeprecatedConfig("spark.cache.class", "0.8",
+            "The spark.cache.class property is no longer being used! Specify storage levels using " +
+            "the RDD.persist() method instead."),
+          DeprecatedConfig("spark.yarn.user.classpath.first", "1.3",
+            "Please use spark.{driver,executor}.userClassPathFirst instead."),
+          DeprecatedConfig("spark.kryoserializer.buffer.mb", "1.4",
+            "Please use spark.kryoserializer.buffer instead. The default value for " +
+              "spark.kryoserializer.buffer.mb was previously specified as '0.064'. Fractional values " +
+              "are no longer accepted. To specify the equivalent now, one may use '64k'."),
+          DeprecatedConfig("spark.rpc", "2.0", "Not used anymore."),
+          DeprecatedConfig("spark.scheduler.executorTaskBlacklistTime", "2.1.0",
+            "Please use the new blacklisting options, spark.blacklist.*"),
+          DeprecatedConfig("spark.yarn.am.port", "2.0.0", "Not used anymore"),
+          DeprecatedConfig("spark.executor.port", "2.0.0", "Not used anymore"),
+          DeprecatedConfig("spark.shuffle.service.index.cache.entries", "2.3.0",
+            "Not used anymore. Please use spark.shuffle.service.index.cache.size"),
+          DeprecatedConfig("spark.yarn.credentials.file.retention.count", "2.4.0", "Not used anymore."),
+          DeprecatedConfig("spark.yarn.credentials.file.retention.days", "2.4.0", "Not used anymore."),
+          DeprecatedConfig("spark.yarn.services", "3.0.0", "Feature no longer available."),
+          DeprecatedConfig("spark.executor.plugins", "3.0.0",
+            "Feature replaced with new plugin API. See Monitoring documentation.")
+        )
+        Map(configs.map { cfg => (cfg.key -> cfg) } : _*)
+    }
+    #name @configsWithAlternatives #type @Map[String, Seq[AlternateConfig]]	替代式配置
+    val= Map[String, Seq[AlternateConfig]](
+        EXECUTOR_USER_CLASS_PATH_FIRST.key -> Seq(
+          AlternateConfig("spark.files.userClassPathFirst", "1.3")),
+        UPDATE_INTERVAL_S.key -> Seq(
+          AlternateConfig("spark.history.fs.update.interval.seconds", "1.4"),
+          AlternateConfig("spark.history.fs.updateInterval", "1.3"),
+          AlternateConfig("spark.history.updateInterval", "1.3")),
+        CLEANER_INTERVAL_S.key -> Seq(
+          AlternateConfig("spark.history.fs.cleaner.interval.seconds", "1.4")),
+        MAX_LOG_AGE_S.key -> Seq(
+          AlternateConfig("spark.history.fs.cleaner.maxAge.seconds", "1.4")),
+        "spark.yarn.am.waitTime" -> Seq(
+          AlternateConfig("spark.yarn.applicationMaster.waitTries", "1.3",
+            // Translate old value to a duration, with 10s wait time per try.
+            translation = s => s"${s.toLong * 10}s")),
+        REDUCER_MAX_SIZE_IN_FLIGHT.key -> Seq(
+          AlternateConfig("spark.reducer.maxMbInFlight", "1.4")),
+        KRYO_SERIALIZER_BUFFER_SIZE.key -> Seq(
+          AlternateConfig("spark.kryoserializer.buffer.mb", "1.4",
+            translation = s => s"${(s.toDouble * 1000).toInt}k")),
+        KRYO_SERIALIZER_MAX_BUFFER_SIZE.key -> Seq(
+          AlternateConfig("spark.kryoserializer.buffer.max.mb", "1.4")),
+        SHUFFLE_FILE_BUFFER_SIZE.key -> Seq(
+          AlternateConfig("spark.shuffle.file.buffer.kb", "1.4")),
+        EXECUTOR_LOGS_ROLLING_MAX_SIZE.key -> Seq(
+          AlternateConfig("spark.executor.logs.rolling.size.maxBytes", "1.4")),
+        IO_COMPRESSION_SNAPPY_BLOCKSIZE.key -> Seq(
+          AlternateConfig("spark.io.compression.snappy.block.size", "1.4")),
+        IO_COMPRESSION_LZ4_BLOCKSIZE.key -> Seq(
+          AlternateConfig("spark.io.compression.lz4.block.size", "1.4")),
+        RPC_NUM_RETRIES.key -> Seq(
+          AlternateConfig("spark.akka.num.retries", "1.4")),
+        RPC_RETRY_WAIT.key -> Seq(
+          AlternateConfig("spark.akka.retry.wait", "1.4")),
+        RPC_ASK_TIMEOUT.key -> Seq(
+          AlternateConfig("spark.akka.askTimeout", "1.4")),
+        RPC_LOOKUP_TIMEOUT.key -> Seq(
+          AlternateConfig("spark.akka.lookupTimeout", "1.4")),
+        "spark.streaming.fileStream.minRememberDuration" -> Seq(
+          AlternateConfig("spark.streaming.minRememberDuration", "1.5")),
+        "spark.yarn.max.executor.failures" -> Seq(
+          AlternateConfig("spark.yarn.max.worker.failures", "1.5")),
+        MEMORY_OFFHEAP_ENABLED.key -> Seq(
+          AlternateConfig("spark.unsafe.offHeap", "1.6")),
+        RPC_MESSAGE_MAX_SIZE.key -> Seq(
+          AlternateConfig("spark.akka.frameSize", "1.6")),
+        "spark.yarn.jars" -> Seq(
+          AlternateConfig("spark.yarn.jar", "2.0")),
+        MAX_REMOTE_BLOCK_SIZE_FETCH_TO_MEM.key -> Seq(
+          AlternateConfig("spark.reducer.maxReqSizeShuffleToMem", "2.3")),
+        LISTENER_BUS_EVENT_QUEUE_CAPACITY.key -> Seq(
+          AlternateConfig("spark.scheduler.listenerbus.eventqueue.size", "2.3")),
+        DRIVER_MEMORY_OVERHEAD.key -> Seq(
+          AlternateConfig("spark.yarn.driver.memoryOverhead", "2.3")),
+        EXECUTOR_MEMORY_OVERHEAD.key -> Seq(
+          AlternateConfig("spark.yarn.executor.memoryOverhead", "2.3")),
+        KEYTAB.key -> Seq(
+          AlternateConfig("spark.yarn.keytab", "3.0")),
+        PRINCIPAL.key -> Seq(
+          AlternateConfig("spark.yarn.principal", "3.0")),
+        KERBEROS_RELOGIN_PERIOD.key -> Seq(
+          AlternateConfig("spark.yarn.kerberos.relogin.period", "3.0")),
+        KERBEROS_FILESYSTEMS_TO_ACCESS.key -> Seq(
+          AlternateConfig("spark.yarn.access.namenodes", "2.2"),
+          AlternateConfig("spark.yarn.access.hadoopFileSystems", "3.0")),
+        "spark.kafka.consumer.cache.capacity" -> Seq(
+          AlternateConfig("spark.sql.kafkaConsumerCache.capacity", "3.0"))
+      )
+    
+    #name @allAlternatives: Map[String, (String, AlternateConfig)] 	所有替代配置
+    val= {
+        configsWithAlternatives.keys.flatMap { key =>
+          configsWithAlternatives(key).map { cfg => (cfg.key -> (key -> cfg)) }
+        }.toMap
+      }
+    
+    def isSparkPortConf(name: String): Boolean
+    功能： 是否为spark端口配置
+    
+    def isExecutorStartupConf(name: String): Boolean
+    功能： 确定配置是否需要传递到执行器上开始运行
+    val= {
+    (name.startsWith("spark.auth") && name != SecurityManager.SPARK_AUTH_SECRET_CONF)||
+    name.startsWith("spark.rpc") ||
+    name.startsWith("spark.network") ||
+    isSparkPortConf(name)
+ 	 }
+    
+    def getDeprecatedConfig(key: String, conf: JMap[String, String]): Option[String]
+    功能： 获取失效配置
+    
+    def logDeprecationWarning(key: String): Unit
+    功能: 展示失效警告信息
+    
+    内部类:
+    private case class DeprecatedConfig(
+      key: String,
+      version: String, // 版本号
+      deprecationMessage: String) // 失效信息
+    介绍: 容纳失效信息
+    
+    private case class AlternateConfig(
+      key: String,
+      version: String,
+      translation: String => String = null)
+    功能: 失效信息的替代配置
+}
+```
+
 #### SparkContext
 
 #### SparkEnv
+
+```markdown
+介绍:
+	允许所有运行时环境变量,用于允许spark实例(master/worker).包括序列化器,RPC环境,块管理器,map输出定位器,等等.spark代码通过全局变量发现sparkEnv,所以所有的线程获取的是一个sparkEnv,使用sparkEnv.get获取.
+```
+
+```scala
+@DeveloperApi
+class SparkEnv (
+    val executorId: String, // 执行器编号
+    private[spark] val rpcEnv: RpcEnv, // rpc环境
+    val serializer: Serializer, // 序列化器
+    val closureSerializer: Serializer, // 闭包序列化器
+    val serializerManager: SerializerManager, // 序列化管理器
+    val mapOutputTracker: MapOutputTracker, // 输出定位器
+    val shuffleManager: ShuffleManager, // shuffle管理器
+    val broadcastManager: BroadcastManager, // 广播变量管理器
+    val blockManager: BlockManager, // 块管理器
+    val securityManager: SecurityManager, // 安全管理器
+    val metricsSystem: MetricsSystem, // 度量系统
+    val memoryManager: MemoryManager, // 内存管理器
+    val outputCommitCoordinator: OutputCommitCoordinator, // 输出提交协调者
+    val conf: SparkConf)  // spark配置
+extends Logging {
+    属性:
+    #name @isStopped = false	停止状态
+    #name @pythonWorkers 	pythons 的worker列表
+    val= mutable.HashMap[(String, Map[String, String]), PythonWorkerFactory]()
+    #name @hadoopJobMetadata = new MapMaker().softValues().makeMap[String, Any]()
+    	hadoop job元数据
+    #name @driverTmpDir: Option[String] = None	driver临时目录
+    操作集:
+    def stop(): Unit
+    功能: 停止当前环境变量
+    if (!isStopped) {
+      isStopped = true
+      pythonWorkers.values.foreach(_.stop())
+      mapOutputTracker.stop()
+      shuffleManager.stop()
+      broadcastManager.stop()
+      blockManager.stop()
+      blockManager.master.stop()
+      metricsSystem.stop()
+      outputCommitCoordinator.stop()
+      rpcEnv.shutdown()
+      rpcEnv.awaitTermination()
+      driverTmpDir match {
+        // 如果只删除sc,但是driver进程仍然运行,则需要删除临时目录,否则会创建很多临时目录
+        case Some(path) =>
+          try {
+            Utils.deleteRecursively(new File(path))
+          } catch {
+            case e: Exception =>
+              logWarning(s"Exception while deleting Spark temp dir: $path", e)
+          }
+        case None => 
+      }
+    }
+    
+    def createPythonWorker(pythonExec: String, envVars: Map[String, String])
+    : java.net.Socket
+    功能: 创建python worker
+    
+    def destroyPythonWorker(pythonExec: String,
+      envVars: Map[String, String], worker: Socket): Unit
+    功能: 销毁python worker
+    
+    def releasePythonWorker(pythonExec: String,
+      envVars: Map[String, String], worker: Socket): Unit
+    功能: 释放python worker
+}
+```
+
+```scala
+object SparkEnv extends Logging {
+    属性
+    #name @env: SparkEnv = _ volatile	spark环境变量
+    #name @driverSystemName = "sparkDriver"	driver系统名称
+    #name @executorSystemName = "sparkExecutor"	执行器系统名称
+    操作集:
+    def set(e: SparkEnv): Unit = env=e
+    功能: 设置环境变量
+    
+    def get: SparkEnv = env
+    功能: 获取环境变量
+    
+    def createDriverEnv(
+      conf: SparkConf,
+      isLocal: Boolean,
+      listenerBus: LiveListenerBus,
+      numCores: Int,
+      mockOutputCommitCoordinator: Option[OutputCommitCoordinator] = None): SparkEnv
+    功能: 创建驱动器的环境变量
+    输入参数:
+    	conf	spark配置
+    	isLocal	是否为本地模式
+    	listenerBus	监听总线
+    	numCores	核心数量
+    	mockOutputCommitCoordinator	输出协作者
+    1. 驱动器参数断言
+    assert(conf.contains(DRIVER_HOST_ADDRESS),
+      s"${DRIVER_HOST_ADDRESS.key} is not set on the driver!")
+    assert(conf.contains(DRIVER_PORT), s"${DRIVER_PORT.key} is not set on the driver!")
+    2. 获取端口地址信息
+    val bindAddress = conf.get(DRIVER_BIND_ADDRESS)
+    val advertiseAddress = conf.get(DRIVER_HOST_ADDRESS)
+    val port = conf.get(DRIVER_PORT)
+    3. 获取加密key值
+    val ioEncryptionKey = if (conf.get(IO_ENCRYPTION_ENABLED)) {
+      Some(CryptoStreamUtils.createKey(conf))
+    } else {
+      None
+    }
+    val= create(
+      conf,
+      SparkContext.DRIVER_IDENTIFIER,
+      bindAddress,
+      advertiseAddress,
+      Option(port),
+      isLocal,
+      numCores,
+      ioEncryptionKey,
+      listenerBus = listenerBus,
+      mockOutputCommitCoordinator = mockOutputCommitCoordinator
+    )
+    
+    def createExecutorEnv(
+      conf: SparkConf,
+      executorId: String,
+      bindAddress: String,
+      hostname: String,
+      numCores: Int,
+      ioEncryptionKey: Option[Array[Byte]],
+      isLocal: Boolean): SparkEnv
+    功能: 创建执行器环境
+    val env = create(
+      conf,
+      executorId,
+      bindAddress,
+      hostname,
+      None,
+      isLocal,
+      numCores,
+      ioEncryptionKey
+    )
+    SparkEnv.set(env)
+    val= env
+    
+    def createExecutorEnv(
+      conf: SparkConf,
+      executorId: String,
+      hostname: String,
+      numCores: Int,
+      ioEncryptionKey: Option[Array[Byte]],
+      isLocal: Boolean): SparkEnv
+    功能: 创建执行器环境
+    val= createExecutorEnv(conf, executorId, hostname,
+      hostname, numCores, ioEncryptionKey, isLocal)
+    
+    def instantiateClass[T](className: String): T = {
+      功能: 获取实例化类
+      val cls = Utils.classForName(className)
+      try {
+        cls.getConstructor(classOf[SparkConf], java.lang.Boolean.TYPE)
+          .newInstance(conf, java.lang.Boolean.valueOf(isDriver))
+          .asInstanceOf[T]
+      } catch {
+        case _: NoSuchMethodException =>
+          try {
+            cls.getConstructor(classOf[SparkConf]).newInstance(conf).asInstanceOf[T]
+          } catch {
+            case _: NoSuchMethodException =>
+              cls.getConstructor().newInstance().asInstanceOf[T]
+          }
+      }
+    }
+    
+    def instantiateClassFromConf[T](propertyName: ConfigEntry[String]): T = {
+      功能: 从配置中获取实例化类
+      instantiateClass[T](conf.get(propertyName))
+    }
+    
+    def create(
+      conf: SparkConf,
+      executorId: String,
+      bindAddress: String,
+      advertiseAddress: String,
+      port: Option[Int],
+      isLocal: Boolean,
+      numUsableCores: Int,
+      ioEncryptionKey: Option[Array[Byte]],
+      listenerBus: LiveListenerBus = null,
+      mockOutputCommitCoordinator: Option[OutputCommitCoordinator] = None): SparkEnv
+    功能: 创建一个环境变量给(驱动器/执行器)
+    1. 驱动器特殊处理
+    val isDriver = executorId == SparkContext.DRIVER_IDENTIFIER
+    if (isDriver) {// 驱动器添加监听事件
+      assert(listenerBus != null, "Attempted to create driver SparkEnv with null listener bus!")
+    }
+    2. 配置安全管理器
+    val authSecretFileConf = if (isDriver) AUTH_SECRET_FILE_DRIVER else AUTH_SECRET_FILE_EXECUTOR
+    val securityManager = new SecurityManager(conf, ioEncryptionKey, authSecretFileConf)
+    if (isDriver) { // 驱动器需要初始化授权信息
+      securityManager.initializeAuth()
+    }
+    ioEncryptionKey.foreach { _ =>
+      if (!securityManager.isEncryptionEnabled()) {
+        logWarning("I/O encryption enabled without RPC encryption: keys will be visible on the " +
+          "wire.")
+      }
+    }
+    3. 设置RPC信息
+    val systemName = if (isDriver) driverSystemName else executorSystemName
+    val rpcEnv = RpcEnv.create(systemName, bindAddress, advertiseAddress, port.getOrElse(-1), conf,
+      securityManager, numUsableCores, !isDriver)
+    if (isDriver) {
+      conf.set(DRIVER_PORT, rpcEnv.address.port)
+    }
+    4. 设置序列化器/序列化管理器信息
+    val serializer = instantiateClassFromConf[Serializer](SERIALIZER)
+    val serializerManager = new SerializerManager(serializer, conf, ioEncryptionKey)
+    val closureSerializer = new JavaSerializer(conf)
+    5. 设置广播变量管理器
+    val broadcastManager = new BroadcastManager(isDriver, conf, securityManager)
+    6. 获取输出定位器
+    val mapOutputTracker = if (isDriver) {
+      new MapOutputTrackerMaster(conf, broadcastManager, isLocal)
+    } else {
+      new MapOutputTrackerWorker(conf)
+    }
+    //设置定位器的定位点信息
+    mapOutputTracker.trackerEndpoint = registerOrLookupEndpoint(
+        MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(
+        rpcEnv, mapOutputTracker.asInstanceOf[MapOutputTrackerMaster], conf))
+	7. 设置shuffle管理器
+    val shortShuffleMgrNames = Map(
+      "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
+      "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.
+                                 SortShuffleManager].getName)
+    val shuffleMgrName = conf.get(config.SHUFFLE_MANAGER)
+    val shuffleMgrClass =
+      shortShuffleMgrNames.getOrElse(shuffleMgrName.
+                                     toLowerCase(Locale.ROOT), shuffleMgrName)
+    val shuffleManager = instantiateClass[ShuffleManager](shuffleMgrClass)
+    val externalShuffleClient = if (conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
+      val transConf = SparkTransportConf.fromSparkConf(conf, "shuffle", numUsableCores)
+      Some(new ExternalBlockStoreClient(transConf, securityManager,
+        securityManager.isAuthenticationEnabled(),
+                                        conf.get(config.SHUFFLE_REGISTRATION_TIMEOUT)))
+    } else {
+      None
+    }
+    8. 设置内存管理器
+    val memoryManager: MemoryManager = UnifiedMemoryManager(conf, numUsableCores)
+    9. 设置块管理器
+    val blockManagerPort = if (isDriver) {
+      conf.get(DRIVER_BLOCK_MANAGER_PORT)
+    } else {
+      conf.get(BLOCK_MANAGER_PORT)
+    }
+    val blockManagerInfo = new concurrent.TrieMap[BlockManagerId, BlockManagerInfo]()
+    val blockManagerMaster = new BlockManagerMaster(
+      registerOrLookupEndpoint(
+        BlockManagerMaster.DRIVER_ENDPOINT_NAME,
+        new BlockManagerMasterEndpoint(
+          rpcEnv,
+          isLocal,
+          conf,
+          listenerBus,
+          if (conf.get(config.SHUFFLE_SERVICE_FETCH_RDD_ENABLED)) {
+            externalShuffleClient
+          } else {
+            None
+          }, blockManagerInfo)),
+      registerOrLookupEndpoint(
+        BlockManagerMaster.DRIVER_HEARTBEAT_ENDPOINT_NAME,
+        new BlockManagerMasterHeartbeatEndpoint(rpcEnv, isLocal, blockManagerInfo)),
+      conf,
+      isDriver)
+    val blockTransferService =
+      new NettyBlockTransferService(conf, securityManager, bindAddress, advertiseAddress,
+        blockManagerPort, numUsableCores, blockManagerMaster.driverEndpoint)
+    val blockManager = new BlockManager(
+      executorId,
+      rpcEnv,
+      blockManagerMaster,
+      serializerManager,
+      conf,
+      memoryManager,
+      mapOutputTracker,
+      shuffleManager,
+      blockTransferService,
+      securityManager,
+      externalShuffleClient)
+    10. 设置度量系统
+    val metricsSystem = if (isDriver) {
+      MetricsSystem.createMetricsSystem(MetricsSystemInstances.DRIVER, 
+                                        conf, securityManager)
+    } else {
+      conf.set(EXECUTOR_ID, executorId)
+      val ms = MetricsSystem.createMetricsSystem(MetricsSystemInstances.EXECUTOR, conf,
+        securityManager)
+      ms.start(conf.get(METRICS_STATIC_SOURCES_ENABLED))
+      ms
+    }
+    11. 设置输出提交协作者
+    val outputCommitCoordinator = mockOutputCommitCoordinator.getOrElse {
+      new OutputCommitCoordinator(conf, isDriver)
+    }
+    val outputCommitCoordinatorRef = registerOrLookupEndpoint("OutputCommitCoordinator",
+      new OutputCommitCoordinatorEndpoint(rpcEnv, outputCommitCoordinator))
+    outputCommitCoordinator.coordinatorRef = Some(outputCommitCoordinatorRef)
+    12. 获取实例
+    val envInstance = new SparkEnv(
+      executorId,
+      rpcEnv,
+      serializer,
+      closureSerializer,
+      serializerManager,
+      mapOutputTracker,
+      shuffleManager,
+      broadcastManager,
+      blockManager,
+      securityManager,
+      metricsSystem,
+      memoryManager,
+      outputCommitCoordinator,
+      conf)
+    12. 设置驱动器临时目录
+    if (isDriver) {
+      val sparkFilesDir = Utils.createTempDir(Utils.getLocalDir(conf)
+                                              , "userFiles").getAbsolutePath
+      envInstance.driverTmpDir = Some(sparkFilesDir)
+    }
+    val= envInstance
+    
+    def environmentDetails(
+      conf: SparkConf,
+      hadoopConf: Configuration,
+      schedulingMode: String,
+      addedJars: Seq[String],
+      addedFiles: Seq[String]): Map[String, Seq[(String, String)]]
+    功能: 返回一个map,表示JVM信息,spark属性,系统属性和类路径的信息.key表示类别,value按kv对形式展示.主要用于spark监听器环境的更新.
+    1. 获取spark属性
+    val schedulerMode =
+      if (!conf.contains(SCHEDULER_MODE)) {
+        Seq((SCHEDULER_MODE.key, schedulingMode))
+      } else {
+        Seq.empty[(String, String)]
+      }
+    val sparkProperties = (conf.getAll ++ schedulerMode).sorted
+    2. 获取系统属性
+    val systemProperties = Utils.getSystemProperties.toSeq
+    val otherProperties = systemProperties.filter { case (k, _) =>
+      k != "java.class.path" && !k.startsWith("spark.")
+    }.sorted
+    3. 获取类路径属性
+     val classPathEntries = javaClassPath
+      .split(File.pathSeparator)
+      .filterNot(_.isEmpty)
+      .map((_, "System Classpath"))
+    val addedJarsAndFiles = (addedJars ++ addedFiles).map((_, "Added By User"))
+    val classPaths = (addedJarsAndFiles ++ classPathEntries).sorted
+    4. 添加hadoop属性
+    val hadoopProperties = hadoopConf.asScala
+      .map(entry => (entry.getKey, entry.getValue)).toSeq.sorted
+    Map[String, Seq[(String, String)]](
+      "JVM Information" -> jvmInformation,
+      "Spark Properties" -> sparkProperties,
+      "Hadoop Properties" -> hadoopProperties,
+      "System Properties" -> otherProperties,
+      "Classpath Entries" -> classPaths)
+}
+```
 
 #### SparkException
 
@@ -2159,6 +3768,131 @@ private[spark] object TaskState extends Enumeration {
 ```
 
 #### TestUtils
+
+```scala
+private[spark] object TestUtils {
+    介绍:测试通用类
+    属性:
+    #name @SOURCE = JavaFileObject.Kind.SOURCE	
+    操作集:
+    def createJarWithClasses(
+      classNames: Seq[String],
+      toStringValue: String = "",
+      classNamesWithBase: Seq[(String, String)] = Seq.empty,
+      classpathUrls: Seq[URL] = Seq.empty): URL
+    功能: 创建指定名称的jar包
+    
+    def createJarWithFiles(files: Map[String, String], dir: File = null): URL 
+    功能: 创建包含多个文件的jar包
+    
+    def createJar(
+      files: Seq[File],
+      jarFile: File,
+      directoryPrefix: Option[String] = None,
+      mainClass: Option[String] = None): URL 
+    功能: 创建包含指定文件集@files 的jar包,位于指定目录@directoryPrefix下或者在jar包根目录下
+    
+    def createURI(name: String) 
+    功能: 创建同一地址标识符
+    val=  URI.create(s"string:///${name.replace(".", "/")}${SOURCE.extension}")
+    
+    def createCompiledClass(
+      className: String,
+      destDir: File,
+      sourceFile: JavaSourceFromString,
+      classpathUrls: Seq[URL]): File 
+    功能: 创建使用source文件编译的类,类文件置于@destDir 下
+    
+    def createCompiledClass(
+      className: String,
+      destDir: File,
+      toStringValue: String = "",
+      baseClass: String = null,
+      classpathUrls: Seq[URL] = Seq.empty): File 
+    功能: 创建指定名称的类文件,类文件置于@destDir下
+    
+    def assertSpilled(sc: SparkContext, identifier: String)(body: => Unit): Unit 
+    功能: 溢写断言
+    
+    def assertNotSpilled(sc: SparkContext, identifier: String)(body: => Unit): Unit
+    功能: 断言job没有溢写
+    
+    def assertExceptionMsg(exception: Throwable, msg: String, ignoreCase: Boolean = false): Unit
+    功能: 断言异常信息
+    
+    def testCommandAvailable(command: String): Boolean 
+    功能: 测试指令是否正常执行
+    val= {
+        val attempt = Try(Process(command).run(ProcessLogger(_ => ())).exitValue())
+        attempt.isSuccess && attempt.get == 0
+      }
+    
+    def httpResponseCode(
+      url: URL,
+      method: String = "GET",
+      headers: Seq[(String, String)] = Nil): Int
+    功能： 获取HTTP/HTTPS响应码
+    
+    def withHttpConnection[T](
+      url: URL,
+      method: String = "GET",
+      headers: Seq[(String, String)] = Nil)
+      (fn: HttpURLConnection => T): T
+    功能： 获取HTTP连接结果
+    
+    def withListener[L <: SparkListener](sc: SparkContext, listener: L) (body: L => Unit): Unit
+    功能： 监听代码块@body，代码运行完毕之后，方法会等待所有事件到监听总线上。然后才会移除事件。
+    
+    def configTestLog4j(level: String): Unit
+    功能：配置log4j属性
+    
+    def recursiveList(f: File): Array[File]
+    功能：递归展示文件
+    
+    def createTempJsonFile(dir: File, prefix: String, jsonValue: JValue): String
+    功能： 创建临时json文件
+    
+    def createTempScriptWithExpectedOutput(dir: File, prefix: String, output: String): String
+    功能： 创建临时shell脚本
+    
+    def waitUntilExecutorsUp(
+      sc: SparkContext,
+      numExecutors: Int,
+      timeout: Long): Unit 
+    功能: 等待直到达到指定的执行器数量@numExecutors
+}
+```
+
+```scala
+private class SpillListener extends SparkListener {
+    介绍: 溢写监听器
+    属性:
+    #name @stageIdToTaskMetrics = new mutable.HashMap[Int, ArrayBuffer[TaskMetrics]]
+    	stage中任务度量器映射表(一对多)
+    #name @spilledStageIds = new mutable.HashSet[Int]	溢写stage列表
+    操作集:
+    def numSpilledStages: Int= synchronized {spilledStageIds.size}
+    功能: 获取溢写stage数量
+    
+    def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit
+    功能: 任务结束处理
+    synchronized {
+        stageIdToTaskMetrics.getOrElseUpdate(
+          taskEnd.stageId, new ArrayBuffer[TaskMetrics]) += taskEnd.taskMetrics
+      }
+    
+    def onStageCompleted(stageComplete: SparkListenerStageCompleted): Unit
+    功能: stage完成处理
+    synchronized {
+        val stageId = stageComplete.stageInfo.stageId
+        val metrics = stageIdToTaskMetrics.remove(stageId).toSeq.flatten
+        val spilled = metrics.map(_.memoryBytesSpilled).sum > 0
+        if (spilled) {
+          spilledStageIds += stageId
+        }
+      }
+}
+```
 
 #### 基础拓展
 
