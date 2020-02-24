@@ -3535,3 +3535,586 @@ extends Schedulable with Logging {
 }
 ```
 
+#### ReplayListenerBus
+
+```scala
+private[spark] class ReplayListenerBus extends SparkListenerBus with Logging {
+    介绍: spark监听总线,用于对序列化事件数据重新演绎
+    操作集:
+    def replay(
+      logData: InputStream,
+      sourceName: String,
+      maybeTruncated: Boolean = false,
+      eventsFilter: ReplayEventsFilter = SELECT_ALL_FILTER): Boolean
+    功能: 重演指定输入流顺序中的所有事件,流式数据需要包含每行包含一个json编码的监听器@SparkListenerEvent.方法可以多次调用,但是监听器一旦经过错误之后就会被移除.
+    输入参数:
+    	logData	包含事件日志数据的输入流
+    	sourceName	文件名称(事件数据读取位置)
+    	maybeTruncated	是否日志数据可以被删除
+    	eventsFilter	事件过滤器(选取json事件的过滤函数)
+    val= {
+        val lines = Source.fromInputStream(logData)(Codec.UTF8).getLines()
+        replay(lines, sourceName, maybeTruncated, eventsFilter)
+      }
+    
+    def replay(
+      lines: Iterator[String],
+      sourceName: String,
+      maybeTruncated: Boolean,
+      eventsFilter: ReplayEventsFilter): Boolean
+    功能: 重载@replay方法,使用迭代器而不使用输入流,可以被@ApplicationHistoryProvider实现
+    
+    def isIgnorableException(e: Throwable): Boolean =e.isInstanceOf[HaltReplayException]
+    功能: 确认是否被忽略
+    1. 设置初始参数
+    var currentLine: String = null // 当前行内容
+    var lineNumber: Int = 0 // 行编号
+    val unrecognizedEvents = new scala.collection.mutable.HashSet[String]//未识别事件列表
+    val unrecognizedProperties =new scala.collection.mutable.HashSet[String]//为识别属性列表
+    2. 获取行内容集合
+    val lineEntries = lines
+        .zipWithIndex
+        .filter { case (line, _) => eventsFilter(line) }
+    3. 处理行文本内容
+    while (lineEntries.hasNext) {
+        try {
+          val entry = lineEntries.next()
+          currentLine = entry._1
+          lineNumber = entry._2 + 1
+		// 发送json数据到所有的监听器上
+          postToAll(JsonProtocol.sparkEventFromJson(parse(currentLine)))
+        } catch {
+          case e: ClassNotFoundException =>
+            if (!unrecognizedEvents.contains(e.getMessage)) {
+              logWarning(s"Drop unrecognized event: ${e.getMessage}")
+              unrecognizedEvents.add(e.getMessage)
+            }
+            logDebug(s"Drop incompatible event log: $currentLine")
+          case e: UnrecognizedPropertyException =>
+            if (!unrecognizedProperties.contains(e.getMessage)) {
+              logWarning(s"Drop unrecognized property: ${e.getMessage}")
+              unrecognizedProperties.add(e.getMessage)
+            }
+            logDebug(s"Drop incompatible event log: $currentLine")
+          case jpe: JsonParseException =>
+            if (!maybeTruncated || lineEntries.hasNext) {
+              throw jpe
+            } else {
+              logWarning(s"Got JsonParseException from log file $sourceName" +
+                s" at line $lineNumber, the file might not have finished
+                writing cleanly.")
+            }
+        }
+      }
+}
+```
+
+```scala
+private[spark] class HaltReplayException extends RuntimeException
+介绍: 停止重新演绎异常
+
+private[spark] object ReplayListenerBus {
+    介绍: 重演监听器
+    type ReplayEventsFilter = (String) => Boolean
+    介绍: 重演过滤函数
+    
+    #name @SELECT_ALL_FILTER: ReplayEventsFilter = { (eventString: String) => true }
+    	所有过滤器形成额的重演事件
+}
+```
+
+#### ResultStage
+
+```scala
+private[spark] class ResultStage(
+    id: Int,
+    rdd: RDD[_],
+    val func: (TaskContext, Iterator[_]) => _,
+    val partitions: Array[Int],
+    parents: List[Stage],
+    firstJobId: Int,
+    callSite: CallSite)
+extends Stage(id, rdd, partitions.length, parents, firstJobId, callSite) {
+    介绍： 结果stage，在RDD的溢写分区上使用函数，用于计算动作的结果。@ResultStage 捕捉函数@func去执行，这个函数会应用到每个分区中。和每个分区ID列表中。一些stage可能不会跑完RDD的所有分区，比如@first(),@lookup()
+    构造器参数:
+        id	stage编号
+        rdd	RDD
+        func	分区计算函数
+        partitions	分区列表
+        parents	父stage列表
+        firstJobId	第一个job编号
+        callSite	用户调用
+    属性:
+    #name @_activeJob: Option[ActiveJob] = None	激活job
+    操作集:
+    def activeJob: Option[ActiveJob] = _activeJob
+    功能: 获取激活job
+    
+    def setActiveJob(job: ActiveJob): Unit= _activeJob = Option(job)
+    功能: 设置激活job
+    
+    def removeActiveJob(): Unit = _activeJob = None
+    功能: 移除激活job
+    
+    def findMissingPartitions(): Seq[Int]
+    功能: 获取遗失的分区
+    
+    def toString: String = "ResultStage " + id
+    功能: 信息显示
+}
+```
+
+#### ResultTask
+
+```markdown
+介绍:
+	发送输出给driver应用的任务,参考@Task 获取更多
+	构造器参数
+        stageId	stage编号
+        stageAttemptId	stage请求编号
+        taskBinary	
+        	序列化RDD的广播变量版本和分区应用函数类型为RDD[T], (TaskContext, Iterator[T]) => U
+        partition	分区
+        locs	本地调度任务最佳执行位置
+        outputId	本job的task索引
+        localProperties	驱动器端用户本地线程属性
+        serializedTaskMetrics	序列化任务度量器
+        jobId	jobID
+        appId	应用ID
+        appAttemptId	应用请求ID
+        isBarrier	是否屏蔽执行
+```
+
+```scala
+private[spark] class ResultTask[T, U](
+    stageId: Int,
+    stageAttemptId: Int,
+    taskBinary: Broadcast[Array[Byte]],
+    partition: Partition,
+    locs: Seq[TaskLocation],
+    val outputId: Int,
+    localProperties: Properties,
+    serializedTaskMetrics: Array[Byte],
+    jobId: Option[Int] = None,
+    appId: Option[String] = None,
+    appAttemptId: Option[String] = None,
+    isBarrier: Boolean = false)
+extends Task[U](stageId, stageAttemptId, partition.index, localProperties, serializedTaskMetrics,
+    jobId, appId, appAttemptId, isBarrier)
+with Serializable {
+    属性: 
+    #name @preferredLocs: Seq[TaskLocation]	任务最佳执行位置列表
+    操作集:
+    def runTask(context: TaskContext): U
+    功能： 运行任务@context 返回任务执行结果
+    1. 使用广播变量反序列化RDD和分区处理函数
+    val threadMXBean = ManagementFactory.getThreadMXBean
+    val deserializeStartTimeNs = System.nanoTime()
+    val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime
+    } else 0L
+    val ser = SparkEnv.get.closureSerializer.newInstance()
+    val (rdd, func) = ser.deserialize[(RDD[T], (TaskContext, Iterator[T]) => U)](
+      ByteBuffer.wrap(taskBinary.value), Thread.currentThread.getContextClassLoader)
+    _executorDeserializeTimeNs = System.nanoTime() - deserializeStartTimeNs
+    _executorDeserializeCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
+    } else 0L
+    2. 对RDD的分区进行处理
+    val= func(context, rdd.iterator(partition, context))
+    
+    def preferredLocations: Seq[TaskLocation] = preferredLocs
+    功能： 获取任务最佳执行位置（只能执行在driver侧）
+    
+    def toString: String = "ResultTask(" + stageId + ", " + partitionId + ")"
+    功能: 显示信息
+}
+```
+
+#### Schedulable
+
+```scala
+private[spark] trait Schedulable {
+    介绍: 可调度实例接口,含有两个类型的调度实例(调度池@Pool和任务集管理器@TaskSetManagers)
+    属性:
+    #name @parent: Pool	父调度池
+    操作集：
+    def schedulableQueue: ConcurrentLinkedQueue[Schedulable]
+    功能: 获取调度队列
+    
+    def schedulingMode: SchedulingMode
+    功能: 获取调度模式
+    
+    def weight: Int
+    功能: 获取权重
+    
+    def minShare: Int
+    功能: 获取最小分享量
+    
+    def runningTasks: Int
+    功能: 获取运行任务数量
+    
+    def priority: Int
+    功能: 获取优先级
+    
+    def stageId: Int
+    功能: 获取stageId
+    
+    def name: String
+    功能: 获取调度器名称
+    
+    def addSchedulable(schedulable: Schedulable): Unit
+    功能: 添加可调度实例@schedulable
+    
+    def removeSchedulable(schedulable: Schedulable): Unit
+    功能: 移除可调度实例
+    
+    def getSchedulableByName(name: String): Schedulable
+    功能: 按照名称获取调度实例
+    
+    def executorLost(executorId: String, host: String, reason: ExecutorLossReason): Unit
+    功能: 处理指定执行器丢失情景
+    
+    def checkSpeculatableTasks(minTimeToSpeculation: Int): Boolean
+    功能: 检查推测任务
+    
+    def getSortedTaskSetQueue: ArrayBuffer[TaskSetManager]
+    功能: 获取排序完成的任务集队列
+}
+```
+
+#### SchedulableBuilder
+
+```scala
+private[spark] trait SchedulableBuilder {
+    介绍: 构建调度树的接口
+    buildPools	构建树的结点
+    addTaskSetManager	构建叶子结点
+    操作集:
+    def rootPool: Pool
+    功能: 获取树根调度池
+    
+    def buildPools(): Unit
+    功能: 构建树的结点
+    
+    def addTaskSetManager(manager: Schedulable, properties: Properties): Unit
+    功能: 构建树的叶子节点
+}
+
+private[spark] class FIFOSchedulableBuilder(val rootPool: Pool)
+extends SchedulableBuilder with Logging {
+    介绍: FIFO调度的构建
+    参数:
+    	rootPool	调度树根结点
+    操作集:
+    def buildPools(): Unit={} 
+    功能: 构建树的节点
+    
+    def addTaskSetManager(manager: Schedulable, properties: Properties): Unit 
+    功能: 构建叶子结点
+    rootPool.addSchedulable(manager)
+}
+```
+
+```scala
+private[spark] class FairSchedulableBuilder(val rootPool: Pool, conf: SparkConf)
+extends SchedulableBuilder with Logging {
+    介绍: 公平调度器构建器
+    参数:
+    	rootPool	根结点
+    属性:
+    #name @schedulerAllocFile = conf.get(SCHEDULER_ALLOCATION_FILE)	调度器分配文件
+    #name @DEFAULT_SCHEDULER_FILE = "fairscheduler.xml" 默认调度文件
+    #name @FAIR_SCHEDULER_PROPERTIES = SparkContext.SPARK_SCHEDULER_POOL
+    	公平调度器属性
+    #name @DEFAULT_POOL_NAME = "default"	默认调度池名称
+    #name @MINIMUM_SHARES_PROPERTY = "minShare"	最小共享属性
+    #name @SCHEDULING_MODE_PROPERTY = "schedulingMode"	调度模式属性
+    #name @WEIGHT_PROPERTY = "weight"	权重属性
+    #name @POOL_NAME_PROPERTY = "@name"	调度池名称属性
+    #name @POOLS_PROPERTY = "pool"	调度池属性
+    #name @DEFAULT_SCHEDULING_MODE = SchedulingMode.FIFO	调度模式属性
+    #name @DEFAULT_MINIMUM_SHARE = 0	默认最小共享数量
+    #name @DEFAULT_WEIGHT = 1	默认权重
+    操作集:
+    def buildPools(): Unit
+    功能: 构建调度池
+    1. 设置调度文件对应的内存数据结构
+    var fileData: Option[(InputStream, String)] = None
+    2. 填充数据结构
+    fileData = schedulerAllocFile.map { f =>
+        // 找到对应的调度文件
+        val fis = new FileInputStream(f)
+        logInfo(s"Creating Fair Scheduler pools from $f")
+        Some((fis, f))
+      }.getOrElse {
+        // 没有找到,需要读取默认调度文件
+        val is = Utils.getSparkClassLoader.getResourceAsStream(DEFAULT_SCHEDULER_FILE)
+        if (is != null) {
+          logInfo(s"Creating Fair Scheduler pools from default file:
+          $DEFAULT_SCHEDULER_FILE")
+          Some((is, DEFAULT_SCHEDULER_FILE))
+        } else {
+          logWarning("Fair Scheduler configuration file not found so jobs will be
+          scheduled in " +
+            s"FIFO order. To use fair scheduling, configure pools in
+            $DEFAULT_SCHEDULER_FILE or " +
+            s"set ${SCHEDULER_ALLOCATION_FILE.key} to a file that contains the
+            configuration.")
+          None
+        }
+      }
+    3. 对于每个文件,构建公平调度器
+    val= fileData.foreach { case (is, fileName) => buildFairSchedulerPool(is, fileName) }
+    4. 创建默认调度池
+    buildDefaultPool()
+    
+    def buildDefaultPool(): Unit
+    功能: 构建默认调度池(默认调度池名称的调度池)
+    if (rootPool.getSchedulableByName(DEFAULT_POOL_NAME) == null) {
+      val pool = new Pool(DEFAULT_POOL_NAME, DEFAULT_SCHEDULING_MODE,
+        DEFAULT_MINIMUM_SHARE, DEFAULT_WEIGHT)
+      rootPool.addSchedulable(pool)
+      logInfo("Created default pool: %s, schedulingMode: %s, minShare: %d, 
+      weight: %d".format(
+        DEFAULT_POOL_NAME, DEFAULT_SCHEDULING_MODE, DEFAULT_MINIMUM_SHARE,
+          DEFAULT_WEIGHT))
+    }
+    
+    def buildFairSchedulerPool(is: InputStream, fileName: String): Unit
+    功能: 构建指定文件的公平调度池
+    1. 使用xml加载输入流
+    val xml = XML.load(is)
+    2. 获取xml中的每个节点,添加到调度池中
+    for (poolNode <- (xml \\ POOLS_PROPERTY)) {
+      val poolName = (poolNode \ POOL_NAME_PROPERTY).text
+      val schedulingMode = getSchedulingModeValue(poolNode, poolName,
+        DEFAULT_SCHEDULING_MODE, fileName)
+      val minShare = getIntValue(poolNode, poolName, MINIMUM_SHARES_PROPERTY,
+        DEFAULT_MINIMUM_SHARE, fileName)
+      val weight = getIntValue(poolNode, poolName, WEIGHT_PROPERTY,
+        DEFAULT_WEIGHT, fileName)
+      rootPool.addSchedulable(new Pool(poolName, schedulingMode, minShare, weight))
+      logInfo("Created pool: %s, schedulingMode: %s, minShare: %d, weight: %d".format(
+        poolName, schedulingMode, minShare, weight))
+    }
+    
+    def getSchedulingModeValue(
+      poolNode: Node,
+      poolName: String,
+      defaultValue: SchedulingMode,
+      fileName: String): SchedulingMode
+    功能: 获取调度模式的值
+    1. 获取xml调度模式下的调度名称
+    val xmlSchedulingMode =
+      (poolNode \ SCHEDULING_MODE_PROPERTY).text.trim.toUpperCase(Locale.ROOT)
+    val warningMessage = s"Unsupported schedulingMode: $xmlSchedulingMode found in " +
+      s"Fair Scheduler configuration file: $fileName, using " +
+      s"the default schedulingMode: $defaultValue for pool: $poolName"
+    2. 确定是否为xml调度名称,不是则返回默认值
+    val= if (SchedulingMode.withName(xmlSchedulingMode) != SchedulingMode.NONE) {
+        SchedulingMode.withName(xmlSchedulingMode)
+      } else {
+        logWarning(warningMessage)
+        defaultValue
+      }
+    
+    def getIntValue(
+      poolNode: Node,
+      poolName: String,
+      propertyName: String,
+      defaultValue: Int,
+      fileName: String): Int
+    功能: 获取int值
+    val data = (poolNode \ propertyName).text.trim
+    try {
+      data.toInt
+    } catch {
+      case e: NumberFormatException =>
+        logWarning(s"Error while loading fair scheduler configuration from $fileName: " +
+          s"$propertyName is blank or invalid: $data, using the default $propertyName: 
+          " +
+          s"$defaultValue for pool: $poolName")
+        defaultValue
+    }
+    
+    def addTaskSetManager(manager: Schedulable, properties: Properties): Unit
+    功能: 添加任务集管理器
+    1. 获取调度池名称
+    val poolName = if (properties != null) {
+        properties.getProperty(FAIR_SCHEDULER_PROPERTIES, DEFAULT_POOL_NAME)
+      } else {
+        DEFAULT_POOL_NAME
+      }
+    2. 获取父级调度池
+    var parentPool = rootPool.getSchedulableByName(poolName)
+    3. 将本调度实体加入到父级调度之后
+    if (parentPool == null) {
+      parentPool = new Pool(poolName, DEFAULT_SCHEDULING_MODE,
+        DEFAULT_MINIMUM_SHARE, DEFAULT_WEIGHT)
+      rootPool.addSchedulable(parentPool)
+      logWarning(s"A job was submitted with scheduler pool $poolName, which has not been " +
+        "configured. This can happen when the file that pools are read from isn't set, or " +
+        s"when that file doesn't contain $poolName. Created $poolName with default " +
+        s"configuration (schedulingMode: $DEFAULT_SCHEDULING_MODE, " +
+        s"minShare: $DEFAULT_MINIMUM_SHARE, weight: $DEFAULT_WEIGHT)")
+    }
+    parentPool.addSchedulable(manager)
+}
+```
+
+#### SchedulerBackend
+
+```markdown
+介绍:
+	调度器后台,调度系统允许在一个@TaskSchedulerImpl 下面使用不同的插件,假定类似mesos模型,应用可以获取资源(因为机器变得可以获取且可以在上面允许任务)
+```
+
+```scala
+private[spark] trait SchedulerBackend {
+    属性:
+    #name @appId = "spark-application-" + System.currentTimeMillis	应用ID
+    操作集:
+    def start(): Unit
+    功能: 启动后端
+    
+    def stop(): Unit
+    功能: 停止后端
+    
+    def defaultParallelism(): Int
+    功能: 获取默认并行度
+    
+    def reviveOffers(): Unit
+    功能: 恢复后端状态
+    
+    def killTask(
+      taskId: Long,
+      executorId: String,
+      interruptThread: Boolean,
+      reason: String): Unit =
+    throw new UnsupportedOperationException
+    功能: 中断指定任务(不支持)
+    
+    def isReady(): Boolean = true
+    功能: 确定是否准备好
+    
+    def applicationId(): String = appId
+    功能: 获取应用ID
+    
+    def applicationAttemptId(): Option[String] = None
+    功能: 获取应用请求编号
+    
+    def getDriverLogUrls: Option[Map[String, String]] = None
+    功能: 获取driver日志的地址映射表
+    
+    def getDriverAttributes: Option[Map[String, String]] = None
+    功能: 获取driver的属性映射表
+    
+    def maxNumConcurrentTasks(): Int
+    功能: 获取最大并发任务数量
+}
+```
+
+#### SchedulingAlgorithm
+
+```scala
+private[spark] trait SchedulingAlgorithm {
+    介绍: 调度算法
+    FIFO	任务集管理器之间使用
+    FS	调度池之间/调度池与任务集管理器之间使用公平调度
+    def comparator(s1: Schedulable, s2: Schedulable): Boolean
+    功能: 比较调度实例的大小
+}
+```
+
+```scala
+private[spark] class FIFOSchedulingAlgorithm extends SchedulingAlgorithm {
+    介绍: FIFO调度器
+    def comparator(s1: Schedulable, s2: Schedulable): Boolean
+    功能: 比较调度实例的大小
+    1. 获取优先级并比较
+    val priority1 = s1.priority
+    val priority2 = s2.priority
+    var res = math.signum(priority1 - priority2) // 正为1,负数为-1,0为0
+ 	2. 第二关键字比较
+    if (res == 0) {
+      val stageId1 = s1.stageId
+      val stageId2 = s2.stageId
+      res = math.signum(stageId1 - stageId2)
+    }
+    val= res < 0
+}
+```
+
+```scala
+private[spark] class FairSchedulingAlgorithm extends SchedulingAlgorithm {
+    def comparator(s1: Schedulable, s2: Schedulable): Boolean
+    功能: 比较两个调度实例的大小(多关键字排序)
+    满足需求第一@runningTasks1 < minShare1;
+    需求占比第二@runningTasks1.toDouble / math.max(minShare1, 1.0)
+    权重比第三@runningTasks1.toDouble / s1.weight.toDouble
+    名称最末@name
+    1. 计算两个实例需要比较的参数
+    val minShare1 = s1.minShare
+    val minShare2 = s2.minShare
+    val runningTasks1 = s1.runningTasks
+    val runningTasks2 = s2.runningTasks
+    val s1Needy = runningTasks1 < minShare1
+    val s2Needy = runningTasks2 < minShare2
+    val minShareRatio1 = runningTasks1.toDouble / math.max(minShare1, 1.0)
+    val minShareRatio2 = runningTasks2.toDouble / math.max(minShare2, 1.0)
+    val taskToWeightRatio1 = runningTasks1.toDouble / s1.weight.toDouble
+    val taskToWeightRatio2 = runningTasks2.toDouble / s2.weight.toDouble
+    2. 计算比较值
+    var compare = 0
+    if (s1Needy && !s2Needy) {
+      return true
+    } else if (!s1Needy && s2Needy) {
+      return false
+    } else if (s1Needy && s2Needy) {
+      compare = minShareRatio1.compareTo(minShareRatio2)
+    } else {
+      compare = taskToWeightRatio1.compareTo(taskToWeightRatio2)
+    }
+    3. 获取结果
+    val= if (compare < 0) {
+      true
+    } else if (compare > 0) {
+      false
+    } else {
+      s1.name < s2.name
+    }
+}
+```
+
+#### SchedulingMode
+
+```scala
+object SchedulingMode extends Enumeration {
+	介绍: 调度模式	
+    type SchedulingMode = Value
+    val FAIR, FIFO, NONE = Value
+}
+```
+
+#### ShuffleMapStage
+
+```scala
+private[spark] class ShuffleMapStage(
+    
+    id: Int,
+    rdd: RDD[_],
+    numTasks: Int,
+    parents: List[Stage],
+    firstJobId: Int,
+    callSite: CallSite,
+    val shuffleDep: ShuffleDependency[_, _, _],
+    mapOutputTrackerMaster: MapOutputTrackerMaster)
+extends Stage(id, rdd, numTasks, parents, firstJobId, callSite) {
+    介绍: 
+    属性:
+    #name @_mapStageJobs: List[ActiveJob] = Nil	mapstage job列表
+    #name @pendingPartitions = new HashSet[Int]	待定分区列表
+}
+```
+
