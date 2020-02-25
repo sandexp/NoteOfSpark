@@ -4115,6 +4115,1006 @@ extends Stage(id, rdd, numTasks, parents, firstJobId, callSite) {
     属性:
     #name @_mapStageJobs: List[ActiveJob] = Nil	mapstage job列表
     #name @pendingPartitions = new HashSet[Int]	待定分区列表
+    操作集:
+    def toString: String = "ShuffleMapStage " + id
+    功能: 信息显示
+    
+    def mapStageJobs: Seq[ActiveJob] = _mapStageJobs
+    功能: 获取激活任务列表
+    
+    def removeActiveJob(job: ActiveJob): Unit
+    功能: 从激活列表中移除指定job@job
+    _mapStageJobs = _mapStageJobs.filter(_ != job)
+    
+    def numAvailableOutputs: Int
+    功能: 获取可以获取的map 输出数量
+    val= mapOutputTrackerMaster.getNumAvailableOutputs(shuffleDep.shuffleId)
+    
+    def isAvailable: Boolean = numAvailableOutputs == numPartitions
+    功能: 确定当前map stage是否处于准备状态,所有分区都有shuffle输出
+    
+    def findMissingPartitions(): Seq[Int]
+    功能: 寻找丢失掉的分区列表
+    val= mapOutputTrackerMaster
+      .findMissingPartitions(shuffleDep.shuffleId)
+      .getOrElse(0 until numPartitions)
+    
 }
+```
+
+#### ShuffleMapTask
+
+```scala
+介绍:
+	一个@ShuffleMapTask 将RDD元素分配到多个桶中(基于分区器),参考@org.apache.spark.scheduler.Task
+获取更多信息.
+	构造器参数:
+        stageId	stage编号
+        stageAttemptId	stage请求号
+        taskBinary	任务信息(RDD,ShuffleDependency)
+        partition	RDD分区数量
+        locs	本地调度的最佳位置列表
+        localProperties	驱动器侧本地属性
+        serializedTaskMetrics	序列化的任务度量器
+        jobId	jobID
+        appId	应用ID
+        appAttemptId	应用请求ID
+        isBarrier	是否屏蔽
+```
+
+```scala
+private[spark] class ShuffleMapTask(
+    stageId: Int,
+    stageAttemptId: Int,
+    taskBinary: Broadcast[Array[Byte]],
+    partition: Partition,
+    @transient private var locs: Seq[TaskLocation],
+    localProperties: Properties,
+    serializedTaskMetrics: Array[Byte],
+    jobId: Option[Int] = None,
+    appId: Option[String] = None,
+    appAttemptId: Option[String] = None,
+    isBarrier: Boolean = false)
+  extends Task[MapStatus](stageId, stageAttemptId, partition.index, localProperties,
+    serializedTaskMetrics, jobId, appId, appAttemptId, isBarrier)
+with Logging {
+    属性:
+    #name @preferredLocs: Seq[TaskLocation]	最佳任务位置列表
+    val= if (locs == null) Nil else locs.toSet.toSeq
+    
+    操作集:
+    def preferredLocations: Seq[TaskLocation] = preferredLocs
+    功能: 获取最佳位置列表
+    
+    def toString: String = "ShuffleMapTask(%d, %d)".format(stageId, partitionId)
+    功能: 信息显示
+    
+    def runTask(context: TaskContext): MapStatus
+    功能: 运行任务,返回MapStatus
+    1. 使用广播变量反序列化RDD
+    val threadMXBean = ManagementFactory.getThreadMXBean
+    val deserializeStartTimeNs = System.nanoTime()
+    val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime
+    } else 0L
+    val ser = SparkEnv.get.closureSerializer.newInstance()
+    val rddAndDep = ser.deserialize[(RDD[_], ShuffleDependency[_, _, _])](
+      ByteBuffer.wrap(taskBinary.value), Thread.currentThread.getContextClassLoader)
+    _executorDeserializeTimeNs = System.nanoTime() - deserializeStartTimeNs
+    _executorDeserializeCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
+    } else 0L
+    2. 获取mapId
+    val rdd = rddAndDep._1
+    val dep = rddAndDep._2.
+    val mapId = if (SparkEnv.get.conf.get(config.SHUFFLE_USE_OLD_FETCH_PROTOCOL)) {
+      partitionId
+    } else context.taskAttemptId()
+    val= dep.shuffleWriterProcessor.write(rdd, dep, mapId, context, partition)
+}
+```
+
+#### SparkListenerEvent
+
+```scala
+@DeveloperApi
+@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS, include = JsonTypeInfo.As.PROPERTY, property = "Event")
+trait SparkListenerEvent {
+    介绍: spark监听器事件
+    def logEvent: Boolean = true
+    功能: 是否输出日志到事件日志中   
+}
+
+@DeveloperApi
+case class SparkListenerStageSubmitted(stageInfo: StageInfo, properties: Properties = null) extends SparkListenerEvent
+介绍: spark监听器stage提交事件
+
+@DeveloperApi
+case class SparkListenerStageCompleted(stageInfo: StageInfo) extends SparkListenerEvent
+介绍: stage完成事件
+
+@DeveloperApi
+case class SparkListenerTaskStart(stageId: Int, stageAttemptId: Int, taskInfo: TaskInfo)
+  extends SparkListenerEvent
+介绍: 任务开始事件
+
+@DeveloperApi
+case class SparkListenerTaskGettingResult(taskInfo: TaskInfo) extends SparkListenerEvent
+介绍: 获取任务结果事件
+
+@DeveloperApi
+case class SparkListenerSpeculativeTaskSubmitted(
+    stageId: Int,
+    stageAttemptId: Int = 0)
+  extends SparkListenerEvent
+介绍: 提交推测任务事件
+
+@DeveloperApi
+case class SparkListenerTaskEnd(
+    stageId: Int,
+    stageAttemptId: Int,
+    taskType: String,
+    reason: TaskEndReason,
+    taskInfo: TaskInfo,
+    taskExecutorMetrics: ExecutorMetrics,
+    @Nullable taskMetrics: TaskMetrics)
+  extends SparkListenerEvent
+介绍: 任务结束事件
+
+@DeveloperApi
+case class SparkListenerJobStart(
+    jobId: Int,
+    time: Long,
+    stageInfos: Seq[StageInfo],
+    properties: Properties = null)
+extends SparkListenerEvent {
+    介绍: job开始事件
+    属性:
+    #name @stageIds: Seq[Int] = stageInfos.map(_.stageId)	stage列表
+}
+
+@DeveloperApi
+case class SparkListenerJobEnd(
+    jobId: Int,
+    time: Long,
+    jobResult: JobResult)
+extends SparkListenerEvent
+介绍: 任务结束事件
+
+@DeveloperApi
+case class SparkListenerEnvironmentUpdate(environmentDetails: Map[String, Seq[(String, String)]]) extends SparkListenerEvent
+介绍: 更新环境变量事件
+
+@DeveloperApi
+case class SparkListenerBlockManagerAdded(
+    time: Long,
+    blockManagerId: BlockManagerId,
+    maxMem: Long,
+    maxOnHeapMem: Option[Long] = None,
+    maxOffHeapMem: Option[Long] = None) extends SparkListenerEvent {
+}
+介绍: 添加块管理器事件
+
+@DeveloperApi
+case class SparkListenerBlockManagerRemoved(time: Long, blockManagerId: BlockManagerId)
+  extends SparkListenerEvent
+介绍: 移除块管理器事件
+
+@DeveloperApi
+case class SparkListenerUnpersistRDD(rddId: Int) extends SparkListenerEvent
+介绍: RDD去持久化事件
+
+@DeveloperApi
+case class SparkListenerExecutorAdded(time: Long, executorId: String, executorInfo: ExecutorInfo)
+  extends SparkListenerEvent
+介绍: 添加执行器事件
+
+@DeveloperApi
+case class SparkListenerExecutorBlacklisted(
+    time: Long,
+    executorId: String,
+    taskFailures: Int)
+  extends SparkListenerEvent
+介绍: 黑名单执行器监听器事件
+
+@DeveloperApi
+case class SparkListenerNodeBlacklistedForStage(
+    time: Long,
+    hostId: String,
+    executorFailures: Int,
+    stageId: Int,
+    stageAttemptId: Int)
+  extends SparkListenerEvent
+介绍: 节点stage黑名单监听事件
+
+@DeveloperApi
+case class SparkListenerExecutorUnblacklisted(time: Long, executorId: String)
+  extends SparkListenerEvent
+介绍: 解除执行器黑名单监听事件
+
+@DeveloperApi
+case class SparkListenerNodeBlacklisted(
+    time: Long,
+    hostId: String,
+    executorFailures: Int)
+  extends SparkListenerEvent
+介绍: 节点添加到黑名单事件
+
+@DeveloperApi
+case class SparkListenerNodeUnblacklisted(time: Long, hostId: String)
+  extends SparkListenerEvent
+介绍: 节点解除黑名单事件
+
+@DeveloperApi
+case class SparkListenerBlockUpdated(blockUpdatedInfo: BlockUpdatedInfo) extends SparkListenerEvent
+介绍: 数据块更新事件
+
+@DeveloperApi
+case class SparkListenerExecutorMetricsUpdate(
+    execId: String,
+    accumUpdates: Seq[(Long, Int, Int, Seq[AccumulableInfo])],
+    executorUpdates: Map[(Int, Int), ExecutorMetrics] = Map.empty)
+extends SparkListenerEvent
+介绍: 更新执行器度量信息事件
+
+@DeveloperApi
+case class SparkListenerStageExecutorMetrics(
+    execId: String,
+    stageId: Int,
+    stageAttemptId: Int,
+    executorMetrics: ExecutorMetrics)
+extends SparkListenerEvent
+介绍: 执行器度量监听器
+
+@DeveloperApi
+case class SparkListenerApplicationStart(
+    appName: String,
+    appId: Option[String],
+    time: Long,
+    sparkUser: String,
+    appAttemptId: Option[String],
+    driverLogs: Option[Map[String, String]] = None,
+    driverAttributes: Option[Map[String, String]] = None) extends SparkListenerEvent
+介绍: 应用开始监听事件
+
+@DeveloperApi
+case class SparkListenerApplicationEnd(time: Long) extends SparkListenerEvent
+介绍: 应用结束事件
+
+@DeveloperApi
+case class SparkListenerLogStart(sparkVersion: String) extends SparkListenerEvent
+介绍: 事件日志启动事件
+
+private[spark] trait SparkListenerInterface {
+    介绍: 监听器接口
+    操作集:
+    def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit
+    功能: stage完成处理
+    
+    def onStageSubmitted(stageSubmitted: SparkListenerStageSubmitted): Unit
+    功能: stage提交处理
+    
+    def onTaskStart(taskStart: SparkListenerTaskStart): Unit
+    功能: 任务启动处理
+    
+    def onTaskGettingResult(taskGettingResult: SparkListenerTaskGettingResult): Unit
+    功能: 获取任务执行结果处理
+    
+    def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit
+    功能: 任务结束处理
+    
+    def onJobStart(jobStart: SparkListenerJobStart): Unit
+    功能: 任务开始处理
+    
+    def onJobEnd(jobEnd: SparkListenerJobEnd): Unit
+    功能: 任务结束处理
+    
+    def onEnvironmentUpdate(environmentUpdate: SparkListenerEnvironmentUpdate): Unit
+    功能: 更新环境变量处理
+    
+    def onBlockManagerAdded(blockManagerAdded: SparkListenerBlockManagerAdded): Unit
+    功能: 添加块管理器处理
+    
+    def onBlockManagerRemoved(blockManagerRemoved: SparkListenerBlockManagerRemoved): Unit
+    功能: 移除块管理器处理
+    
+    def onUnpersistRDD(unpersistRDD: SparkListenerUnpersistRDD): Unit
+    功能: 去除RDD的持久化功能
+    
+    def onApplicationStart(applicationStart: SparkListenerApplicationStart): Unit
+    功能: 启动应用处理
+    
+    def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit
+    功能: 应用结束处理
+    
+    def onExecutorMetricsUpdate(executorMetricsUpdate:
+                                SparkListenerExecutorMetricsUpdate): Unit
+    功能: 执行器度量信息更新处理
+    
+    def onStageExecutorMetrics(executorMetrics: SparkListenerStageExecutorMetrics): Unit
+    功能: stage度量信息更新处理
+    
+    def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit
+    功能: 添加执行器
+    
+    def onExecutorRemoved(executorRemoved: SparkListenerExecutorRemoved): Unit
+    功能: 移除执行器
+    
+    def onExecutorBlacklisted(executorBlacklisted: SparkListenerExecutorBlacklisted): Unit
+    功能: 设置执行器黑名单
+    
+    def onExecutorBlacklistedForStage(
+      executorBlacklistedForStage: SparkListenerExecutorBlacklistedForStage): Unit
+    功能: 设置stage上执行器黑名单
+    
+    def onNodeBlacklistedForStage(nodeBlacklistedForStage: SparkListenerNodeBlacklistedForStage): Unit
+    功能: 设置节点上stage的黑名单信息
+    
+    def onExecutorUnblacklisted(executorUnblacklisted: SparkListenerExecutorUnblacklisted): Unit
+    功能: 解除执行器的黑名单状态
+    
+    def onNodeBlacklisted(nodeBlacklisted: SparkListenerNodeBlacklisted): Unit
+    功能: 解除节点的黑名单状态
+    
+    def onBlockUpdated(blockUpdated: SparkListenerBlockUpdated): Unit
+    功能: 数据块更新
+    
+    def onNodeUnblacklisted(nodeUnblacklisted: SparkListenerNodeUnblacklisted): Unit
+    功能: 解除节点的黑名单状态
+    
+    def onSpeculativeTaskSubmitted(speculativeTask: SparkListenerSpeculativeTaskSubmitted): Unit
+    功能: 处理推测任务提交
+    
+    def onOtherEvent(event: SparkListenerEvent): Unit
+    功能: 处理其他事件
+}
+```
+
+```scala
+@DeveloperApi
+abstract class SparkListener extends SparkListenerInterface {
+    介绍: 监听接口的默认实现
+    override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit = { }
+
+  override def onStageSubmitted(stageSubmitted: SparkListenerStageSubmitted): Unit = { }
+
+  override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = { }
+
+  override def onTaskGettingResult(taskGettingResult: SparkListenerTaskGettingResult): Unit = { }
+
+  override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = { }
+
+  override def onJobStart(jobStart: SparkListenerJobStart): Unit = { }
+
+  override def onJobEnd(jobEnd: SparkListenerJobEnd): Unit = { }
+
+  override def onEnvironmentUpdate(environmentUpdate: SparkListenerEnvironmentUpdate): Unit = { }
+
+  override def onBlockManagerAdded(blockManagerAdded: SparkListenerBlockManagerAdded): Unit = { }
+
+  override def onBlockManagerRemoved(
+      blockManagerRemoved: SparkListenerBlockManagerRemoved): Unit = { }
+
+  override def onUnpersistRDD(unpersistRDD: SparkListenerUnpersistRDD): Unit = { }
+
+  override def onApplicationStart(applicationStart: SparkListenerApplicationStart): Unit = { }
+
+  override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit = { }
+
+  override def onExecutorMetricsUpdate(
+      executorMetricsUpdate: SparkListenerExecutorMetricsUpdate): Unit = { }
+
+  override def onStageExecutorMetrics(
+      executorMetrics: SparkListenerStageExecutorMetrics): Unit = { }
+
+  override def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit = { }
+
+  override def onExecutorRemoved(executorRemoved: SparkListenerExecutorRemoved): Unit = { }
+
+  override def onExecutorBlacklisted(
+      executorBlacklisted: SparkListenerExecutorBlacklisted): Unit = { }
+
+  def onExecutorBlacklistedForStage(
+      executorBlacklistedForStage: SparkListenerExecutorBlacklistedForStage): Unit = { }
+
+  def onNodeBlacklistedForStage(
+      nodeBlacklistedForStage: SparkListenerNodeBlacklistedForStage): Unit = { }
+
+  override def onExecutorUnblacklisted(
+      executorUnblacklisted: SparkListenerExecutorUnblacklisted): Unit = { }
+
+  override def onNodeBlacklisted(
+      nodeBlacklisted: SparkListenerNodeBlacklisted): Unit = { }
+
+  override def onNodeUnblacklisted(
+      nodeUnblacklisted: SparkListenerNodeUnblacklisted): Unit = { }
+
+  override def onBlockUpdated(blockUpdated: SparkListenerBlockUpdated): Unit = { }
+
+  override def onSpeculativeTaskSubmitted(
+      speculativeTask: SparkListenerSpeculativeTaskSubmitted): Unit = { }
+
+  override def onOtherEvent(event: SparkListenerEvent): Unit = { }
+}
+```
+
+```scala
+private[spark] trait SparkListenerBus
+extends ListenerBus[SparkListenerInterface, SparkListenerEvent] {
+ 	介绍: spark监听总线
+    操作集:
+    def doPostEvent(
+      listener: SparkListenerInterface,
+      event: SparkListenerEvent): Unit
+    功能: 发送事件(使用模式匹配分别事件类型)
+    event match {
+      case stageSubmitted: SparkListenerStageSubmitted =>
+        listener.onStageSubmitted(stageSubmitted)
+      case stageCompleted: SparkListenerStageCompleted =>
+        listener.onStageCompleted(stageCompleted)
+      case jobStart: SparkListenerJobStart =>
+        listener.onJobStart(jobStart)
+      case jobEnd: SparkListenerJobEnd =>
+        listener.onJobEnd(jobEnd)
+      case taskStart: SparkListenerTaskStart =>
+        listener.onTaskStart(taskStart)
+      case taskGettingResult: SparkListenerTaskGettingResult =>
+        listener.onTaskGettingResult(taskGettingResult)
+      case taskEnd: SparkListenerTaskEnd =>
+        listener.onTaskEnd(taskEnd)
+      case environmentUpdate: SparkListenerEnvironmentUpdate =>
+        listener.onEnvironmentUpdate(environmentUpdate)
+      case blockManagerAdded: SparkListenerBlockManagerAdded =>
+        listener.onBlockManagerAdded(blockManagerAdded)
+      case blockManagerRemoved: SparkListenerBlockManagerRemoved =>
+        listener.onBlockManagerRemoved(blockManagerRemoved)
+      case unpersistRDD: SparkListenerUnpersistRDD =>
+        listener.onUnpersistRDD(unpersistRDD)
+      case applicationStart: SparkListenerApplicationStart =>
+        listener.onApplicationStart(applicationStart)
+      case applicationEnd: SparkListenerApplicationEnd =>
+        listener.onApplicationEnd(applicationEnd)
+      case metricsUpdate: SparkListenerExecutorMetricsUpdate =>
+        listener.onExecutorMetricsUpdate(metricsUpdate)
+      case stageExecutorMetrics: SparkListenerStageExecutorMetrics =>
+        listener.onStageExecutorMetrics(stageExecutorMetrics)
+      case executorAdded: SparkListenerExecutorAdded =>
+        listener.onExecutorAdded(executorAdded)
+      case executorRemoved: SparkListenerExecutorRemoved =>
+        listener.onExecutorRemoved(executorRemoved)
+      case executorBlacklistedForStage: SparkListenerExecutorBlacklistedForStage =>
+        listener.onExecutorBlacklistedForStage(executorBlacklistedForStage)
+      case nodeBlacklistedForStage: SparkListenerNodeBlacklistedForStage =>
+        listener.onNodeBlacklistedForStage(nodeBlacklistedForStage)
+      case executorBlacklisted: SparkListenerExecutorBlacklisted =>
+        listener.onExecutorBlacklisted(executorBlacklisted)
+      case executorUnblacklisted: SparkListenerExecutorUnblacklisted =>
+        listener.onExecutorUnblacklisted(executorUnblacklisted)
+      case nodeBlacklisted: SparkListenerNodeBlacklisted =>
+        listener.onNodeBlacklisted(nodeBlacklisted)
+      case nodeUnblacklisted: SparkListenerNodeUnblacklisted =>
+        listener.onNodeUnblacklisted(nodeUnblacklisted)
+      case blockUpdated: SparkListenerBlockUpdated =>
+        listener.onBlockUpdated(blockUpdated)
+      case speculativeTaskSubmitted: SparkListenerSpeculativeTaskSubmitted =>
+        listener.onSpeculativeTaskSubmitted(speculativeTaskSubmitted)
+      case _ => listener.onOtherEvent(event)
+    }
+}
+```
+
+#### SplitInfo
+
+```scala
+@DeveloperApi
+class SplitInfo(
+    val inputFormatClazz: Class[_],
+    val hostLocation: String,
+    val path: String,
+    val length: Long,
+    val underlyingSplit: Any) {
+    介绍: 分配信息
+    构造器参数:
+        inputFormatClazz	输入类型
+        hostLocation	主机地址
+        path	地址
+        length	分片长度
+        underlyingSplit	底层数据
+    操作集:
+    def toString(): String
+    功能: 信息显示
+    val= 
+    "SplitInfo " + super.toString + " .. inputFormatClazz " + inputFormatClazz +
+      ", hostLocation : " + hostLocation + ", path : " + path +
+      ", length : " + length + ", underlyingSplit " + underlyingSplit
+    
+    def hashCode(): Int
+    功能: 求取hash值
+    var hashCode = inputFormatClazz.hashCode
+    hashCode = hashCode * 31 + hostLocation.hashCode
+    hashCode = hashCode * 31 + path.hashCode
+    hashCode = hashCode * 31 + (length & 0x7fffffff).toInt
+    val= hashCode
+    
+    def equals(other: Any): Boolean
+    功能: 确定两个实例是否相等
+}
+```
+
+```scala
+object SplitInfo {
+    操作集:
+    def toSplitInfo(inputFormatClazz: Class[_], path: String,
+                  mapredSplit: org.apache.hadoop.mapred.InputSplit): Seq[SplitInfo]
+    功能: 获取分片信息列表
+    val retval = new ArrayBuffer[SplitInfo]()
+    val length = mapredSplit.getLength
+    for (host <- mapredSplit.getLocations) {
+      retval += new SplitInfo(inputFormatClazz, host, path, length, mapredSplit)
+    }
+    val= retval
+    
+    def toSplitInfo(inputFormatClazz: Class[_], path: String,
+                  mapreduceSplit: org.apache.hadoop.mapreduce.InputSplit): Seq[SplitInfo]
+    功能: 获取分配信息列表
+    val retval = new ArrayBuffer[SplitInfo]()
+    val length = mapreduceSplit.getLength
+    for (host <- mapreduceSplit.getLocations) {
+      retval += new SplitInfo(inputFormatClazz, host, path, length, mapreduceSplit)
+    }
+    val= retval
+}
+```
+
+#### stage
+
+```markdown
+介绍:
+	stage是一系列并行的任务,用于计算同一个功能,作为spark job的一部分.所有的任务都需要有相同的shuffle依赖.每个任务的DAG使用调度器运行,DAGScheduler按照拓扑关系运行这些stage.
+	每个stage既可以时shuffle map 的stage(任务结果为其他stage的输入).在这种情况下,任务直接计算spark动作(count(),save())--> 通过运行RDD函数，对于shuffle map的stage，可以定位每个输出所在的节点信息。
+	每个stage都有第一个job编号@firstJobId，表示job首次提交这个stage。使用FIFO调度时，允许之前的job优先计算，或者是优先失败快速恢复。
+	最后，在默认恢复模式下，单个stage可能被多次重复执行。在这种情况下，stage对象会定位多个@StageInfo信息，将其送给监听器，或者WEB UI。最新的可以使用@latestInfo
+	构造器参数:
+	id	stage编号
+	rdd	stage所运行的RDD
+	numTasks	stage的任务数量
+	parents	父stage列表
+	firstJobId	stage的首个jobID
+	callSite	用户调用
+```
+
+```scala
+private[scheduler] abstract class Stage(
+    val id: Int,
+    val rdd: RDD[_],
+    val numTasks: Int,
+    val parents: List[Stage],
+    val firstJobId: Int,
+    val callSite: CallSite)
+extends Logging {
+    属性:
+    #name @numPartitions = rdd.partitions.length	分区数量
+    #name @jobIds = new HashSet[Int]	stage所属的jobID列表
+    #name @nextAttemptId: Int = 0	这个stage下次请求编号
+    #name @name: String = callSite.shortForm	stage名称
+    #name @details: String = callSite.longForm	stage细节描述
+    #name @_latestInfo: StageInfo = StageInfo.fromStage(this, nextAttemptId)
+    最新stage信息
+    #name @failedAttemptIds = new HashSet[Int]	失败的stage请求id列表
+    操作集:
+    def clearFailures() : Unit = failedAttemptIds.clear()
+    功能: 清除失败请求
+    
+    def latestInfo: StageInfo = _latestInfo
+    功能: 获取最新的stage信息
+    
+    final def hashCode(): Int = id
+    功能: 计算hash值
+    
+    final def equals(other: Any): Boolean
+    功能: 确定两个stage是否相等
+    val= other match {
+        case stage: Stage => stage != null && stage.id == id
+        case _ => false
+      }
+    
+    def findMissingPartitions(): Seq[Int]
+    功能: 获取丢失的分区列表
+    
+    def isIndeterminate: Boolean 
+    功能: 确定信息是否不确定
+    val= rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE
+    
+    def makeNewStageAttempt(
+      numPartitionsToCompute: Int,
+      taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty): Unit
+    功能: 创建新的stage请求(为当前stage)
+    val metrics = new TaskMetrics
+    metrics.register(rdd.sparkContext)
+    _latestInfo = StageInfo.fromStage(
+      this, nextAttemptId, Some(numPartitionsToCompute), 
+        metrics, taskLocalityPreferences)
+    	nextAttemptId += 1
+}
+```
+
+#### StageInfo
+
+```scala
+@DeveloperApi
+class StageInfo(
+    val stageId: Int,	// stage 编号
+    private val attemptId: Int, // stage请求编号
+    val name: String, // stage名称
+    val numTasks: Int, // 任务数量
+    val rddInfos: Seq[RDDInfo], // rdd信息
+    val parentIds: Seq[Int], // 父stage列表
+    val details: String, // stage描述
+    val taskMetrics: TaskMetrics = null, // 任务度量器
+    // 任务位置列表
+    private[spark] val taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty,
+    private[spark] val shuffleDepId: Option[Int] = None) // shuffle 依赖编号
+{
+    介绍: stage信息
+    属性:
+    #name @submissionTime: Option[Long] = None	提交时间(DAGScheduler-->TaskScheduler时间)
+    #name @completionTime: Option[Long] = None	完成时间(所有任务完成,或者stage取消)
+    #name @failureReason: Option[String] = None	失败原因
+    #name @accumulables = HashMap[Long, AccumulableInfo]()	度量信息表
+    操作集:
+    def attemptNumber(): Int = attemptId
+    功能: 获取请求编号
+    
+    def stageFailed(reason: String): Unit
+    功能: 处理stage失败
+    failureReason = Some(reason)
+    completionTime = Some(System.currentTimeMillis)
+    
+    def getStatusString: String
+    功能: 获取状态信息
+    if (completionTime.isDefined) {
+      if (failureReason.isDefined) {
+        "failed"
+      } else {
+        "succeeded"
+      }
+    } else {
+      "running"
+    }
+    
+}
+```
+
+```scala
+private[spark] object StageInfo {
+    属性:
+    #name @INVALID_STAGE_ID = -1	非法stageID
+    #name @INVALID_ATTEMPT_ID = -1	非法请求ID
+    操作集:
+    def fromStage(
+      stage: Stage,
+      attemptId: Int,
+      numTasks: Option[Int] = None,
+      taskMetrics: TaskMetrics = null,
+      taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty
+    ): StageInfo
+    功能: 由一个stage构造一个@StageInfo,每个stage与一个或者多个RDD相关,使用shuffle依赖标记stage界限.因此,所有本stageRDD的祖先RDD需要与这个stage相联系.
+    1. 获取祖先RDD信息
+    val ancestorRddInfos = stage.rdd.getNarrowAncestors.map(RDDInfo.fromRdd)
+    val rddInfos = Seq(RDDInfo.fromRdd(stage.rdd)) ++ ancestorRddInfos
+    val shuffleDepId = stage match {
+      case sms: ShuffleMapStage => Option(sms.shuffleDep).map(_.shuffleId)
+      case _ => None
+    }
+    val= new StageInfo(
+      stage.id,
+      attemptId,
+      stage.name,
+      numTasks.getOrElse(stage.numTasks),
+      rddInfos,
+      stage.parents.map(_.id),
+      stage.details,
+      taskMetrics,
+      taskLocalityPreferences,
+      shuffleDepId)
+}
+```
+
+#### StatsReportListener
+
+```scala
+@DeveloperApi
+class StatsReportListener extends SparkListener with Logging {
+    属性:
+    #name @taskInfoMetrics = mutable.Buffer[(TaskInfo, TaskMetrics)]()	任务信息度量器
+    操作集:
+    def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit 
+    功能: 任务结束处理
+    1. 获取任务信息
+    val info = taskEnd.taskInfo
+    2. 更新度量信息
+    val metrics = taskEnd.taskMetrics
+    if (info != null && metrics != null) {
+      taskInfoMetrics += ((info, metrics))
+    }
+    
+    def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit
+    功能: 处理stage完成
+    1. 处理shuffle写出
+    showBytesDistribution("shuffle bytes written:",
+      (_, metric) => metric.shuffleWriteMetrics.bytesWritten, taskInfoMetrics)
+    2. 处理获取等待时间,IO信息
+    showMillisDistribution("fetch wait time:",
+      (_, metric) => metric.shuffleReadMetrics.fetchWaitTime, taskInfoMetrics)
+    showBytesDistribution("remote bytes read:",
+      (_, metric) => metric.shuffleReadMetrics.remoteBytesRead, taskInfoMetrics)
+    showBytesDistribution("task result size:",
+      (_, metric) => metric.resultSize, taskInfoMetrics)
+    3. 处理运行时宕机
+    val runtimePcts = taskInfoMetrics.map { case (info, metrics) =>
+      RuntimePercentage(info.duration, metrics)
+    }
+    showDistribution("executor (non-fetch) time pct: ",
+      Distribution(runtimePcts.map(_.executorPct * 100)), "%2.0f %%")
+    showDistribution("fetch wait time pct: ",
+      Distribution(runtimePcts.flatMap(_.fetchPct.map(_ * 100))), "%2.0f %%")
+    showDistribution("other time pct: ", Distribution(runtimePcts.map(_.other * 100)), "%2.0f %%")
+    taskInfoMetrics.clear()
+    
+    def getStatusDetail(info: StageInfo): String
+    功能: 获取状态描述信息
+    val failureReason = info.failureReason.map("(" + _ + ")").getOrElse("")
+    val timeTaken = info.submissionTime.map(
+      x => info.completionTime.getOrElse(System.currentTimeMillis()) - x
+    ).getOrElse("-")
+	val= s"Stage(${info.stageId}, ${info.attemptNumber}); Name: '${info.name}'; " +
+      s"Status: ${info.getStatusString}$failureReason; numTasks: ${info.numTasks}; " +
+      s"Took: $timeTaken msec"    
+}
+```
+
+```scala
+private case class RuntimePercentage(executorPct: Double, fetchPct: Option[Double], other: Double)
+结束: 运行时状态信息(执行百分比)
+
+private object RuntimePercentage {
+    操作集:
+    def apply(totalTime: Long, metrics: TaskMetrics): RuntimePercentage 
+    功能: 获取实例
+    val denom = totalTime.toDouble
+    val fetchTime = Some(metrics.shuffleReadMetrics.fetchWaitTime)
+    val fetch = fetchTime.map(_ / denom)
+    val exec = (metrics.executorRunTime - fetchTime.getOrElse(0L)) / denom
+    val other = 1.0 - (exec + fetch.getOrElse(0d))
+    val= RuntimePercentage(exec, fetch, other)
+}
+```
+
+```scala
+private[spark] object StatsReportListener extends Logging {
+    介绍: 状态汇报监听器
+    属性:
+    #name @probabilities = percentiles.map(_ / 100.0) 百分比列表
+    #name @percentiles = Array[Int](0, 5, 10, 25, 50, 75, 90, 95, 100)	百分数(分子)
+    #name @seconds = 1000L			秒
+    #name @minutes = seconds * 60 	分
+    #name @hours = minutes * 60		时
+    操作集:
+    def extractDoubleDistribution(
+        taskInfoMetrics: Seq[(TaskInfo, TaskMetrics)],
+        getMetric: (TaskInfo, TaskMetrics) => Double): Option[Distribution]
+    功能: 抓取分布情况
+    val= Distribution(taskInfoMetrics.map { case (info, metric) => 
+        getMetric(info, metric) })
+    
+    def extractLongDistribution(
+        taskInfoMetrics: Seq[(TaskInfo, TaskMetrics)],
+        getMetric: (TaskInfo, TaskMetrics) => Long): Option[Distribution]
+    功能: 同上
+    val= xtractDoubleDistribution(
+      taskInfoMetrics,
+      (info, metric) => { getMetric(info, metric).toDouble })
+    
+    def showDistribution(
+      heading: String,
+      format: String,
+      getMetric: (TaskInfo, TaskMetrics) => Double,
+      taskInfoMetrics: Seq[(TaskInfo, TaskMetrics)]): Unit
+    功能: 显示分布信息
+    showDistribution(heading, extractDoubleDistribution(
+        taskInfoMetrics, getMetric), format)
+    
+    def showBytesDistribution(
+      heading: String,
+      getMetric: (TaskInfo, TaskMetrics) => Long,
+      taskInfoMetrics: Seq[(TaskInfo, TaskMetrics)]): Unit
+    功能: 显示分布
+    showBytesDistribution(heading, extractLongDistribution(taskInfoMetrics, getMetric))
+    
+    def showBytesDistribution(heading: String, dOpt: Option[Distribution]): Unit
+    功能: 显示分布
+    dOpt.foreach { dist => showBytesDistribution(heading, dist) }
+    
+    def showBytesDistribution(heading: String, dist: Distribution): Unit
+    功能: 显示分布
+    showDistribution(heading, dist, (d => Utils.bytesToString(d.toLong)):
+                     Double => String)
+    
+    def showMillisDistribution(heading: String, dOpt: Option[Distribution]): Unit
+    功能: 显示分布
+    showDistribution(heading, dOpt,
+      (d => StatsReportListener.millisToString(d.toLong)): Double => String)
+    
+    def showMillisDistribution(
+      heading: String,
+      getMetric: (TaskInfo, TaskMetrics) => Long,
+      taskInfoMetrics: Seq[(TaskInfo, TaskMetrics)]): Unit
+    功能: 显示分布
+    showMillisDistribution(heading, extractLongDistribution(taskInfoMetrics, getMetric))
+    
+    def millisToString(ms: Long): String
+    功能: 毫秒字符串显示
+    val (size, units) =
+      if (ms > hours) {
+        (ms.toDouble / hours, "hours")
+      } else if (ms > minutes) {
+        (ms.toDouble / minutes, "min")
+      } else if (ms > seconds) {
+        (ms.toDouble / seconds, "s")
+      } else {
+        (ms.toDouble, "ms")
+      }
+    val= "%.1f %s".format(size, units)
+}
+```
+
+#### Task
+
+####  TaskDescription
+
+#### TaskInfo
+
+```scala
+@DeveloperApi
+class TaskInfo(
+    val taskId: Long, // 任务ID
+    val index: Int, // 任务集中任务的索引
+    val attemptNumber: Int, // 请求数量
+    val launchTime: Long, // 运行时间
+    val executorId: String, // 执行器Id
+    val host: String, // 主机名称
+    val taskLocality: TaskLocality.TaskLocality, // 任务位置
+    val speculative: Boolean) { // 是否为推测任务
+    属性:
+    #name @gettingResultTime: Long = 0	获取结果的时间
+    #name @_accumulables: Seq[AccumulableInfo] = Nil	累加属性列表
+    #name @finishTime: Long = 0	结束时间
+    #name @failed = false	任务是否失效
+    #name @killed = false	任务是否kill
+    操作集:
+    def accumulables: Seq[AccumulableInfo] = _accumulables
+    功能: 获取累加属性列表
+    
+    def setAccumulables(newAccumulables: Seq[AccumulableInfo]): Unit
+    功能: 设置累加信息
+    _accumulables = newAccumulables
+    
+    def markGettingResult(time: Long): Unit
+    功能: 标记获取结果
+    gettingResultTime = time
+    
+    def markFinished(state: TaskState, time: Long): Unit
+    功能: 标记任务完成
+    assert(time > 0)
+    finishTime = time
+    if (state == TaskState.FAILED) {
+      failed = true
+    } else if (state == TaskState.KILLED) {
+      killed = true
+    }
+    
+    def gettingResult: Boolean = gettingResultTime != 0
+    功能: 确认是否获取过结果
+    
+    def finished: Boolean = finishTime != 0
+    功能: 确认是否完成
+    
+    def successful: Boolean = finished && !failed && !killed
+    功能: 确认是否成功执行
+    
+    def running: Boolean = !finished
+    功能: 确认运行状态
+    
+    def status: String
+    功能: 获取状态信息
+    val= if (running) {
+      if (gettingResult) {
+        "GET RESULT"
+      } else {
+        "RUNNING"
+      }
+    } else if (failed) {
+      "FAILED"
+    } else if (killed) {
+      "KILLED"
+    } else if (successful) {
+      "SUCCESS"
+    } else {
+      "UNKNOWN"
+    }
+    
+    def id: String = s"$index.$attemptNumber"
+    功能: 获取任务ID
+    
+    def duration: Long
+    功能: 获取持续时间
+    val= if (!finished) {
+      throw new UnsupportedOperationException("duration() called on unfinished task")
+    } else {
+      finishTime - launchTime
+    }
+    
+    def timeRunning(currentTime: Long): Long = currentTime - launchTime
+    功能: 获取运行时间
+}
+```
+
+#### TaskLocality
+
+```scala
+@DeveloperApi
+object TaskLocality extends Enumeration {
+    #name @PROCESS_LOCAL, NODE_LOCAL, NO_PREF, RACK_LOCAL, ANY = Value
+    本地进程需要在管理器@TaskSetManager中使用Only标记
+    type TaskLocality = Value	任务位置
+    操作集:
+    def isAllowed(constraint: TaskLocality, condition: TaskLocality): Boolean 
+    功能: 确认@constraint 是否允许称为一个位置
+    val= condition <= constraint
+}
+```
+
+#### TaskLocation
+
+#### TaskResult
+
+#### TaskResultGetter
+
+#### TaskScheduler
+
+#### TaskSchedulerImpl
+
+#### TaskSet
+
+```scala
+private[spark] class TaskSet(
+    val tasks: Array[Task[_]], // 任务列表
+    val stageId: Int, // stage编号
+    val stageAttemptId: Int, // stage请求编号
+    val priority: Int, // 优先级
+    val properties: Properties) { // 属性值
+    介绍: 提交的底层任务调度器@TaskScheduler 的任务，代表指定stage的确实分区信息
+    #name @id: String = stageId + "." + stageAttemptId	stage唯一标识符
+    操作集:
+    def toString: String = "TaskSet " + id
+    功能: 信息显示
+}
+```
+
+#### TaskSetBlacklist
+
+#### TaskSetManager
+
+#### WorkerOffer
+
+```scala
+private[spark]
+case class WorkerOffer(
+    executorId: String,
+    host: String,
+    cores: Int,
+    address: Option[String] = None,
+    resources: Map[String, Buffer[String]] = Map.empty)
+介绍: 代表释放执行器上的资源
 ```
 
