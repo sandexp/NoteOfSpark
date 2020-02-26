@@ -4970,7 +4970,310 @@ private[spark] object StatsReportListener extends Logging {
 
 #### Task
 
+```markdown
+介绍:
+	执行单元,spark中含有两种类型
+	1. shuffle Map 任务@ShuffleMapTask
+	2. 结果任务@TaskResult
+	spark job包含一个或者多个stage,非常大的stage会包含多个@ResultTask,之前的stage包含有@ShuffleMapTask.一个结果任务@ResultTask 执行任务,并将结果发送到驱动器中.
+	@ShuffleMapTask执行任务,并将任务输出分发到多个桶中(基于任务分区器)
+	构造器参数:
+	stageId	stage编号
+	stageAttemptId	stage请求编号
+	partitionId	分区编号
+	localProperties	本地属性
+	serializedTaskMetrics	序列化任务度量器
+	jobId	job编号
+	appId	app编号
+	appAttemptId	app请求编号
+	isBarrier	是否为屏蔽任务
+```
+
+```scala
+private[spark] abstract class  Task[T](
+    val stageId: Int,
+    val stageAttemptId: Int,
+    val partitionId: Int,
+    @transient var localProperties: Properties = new Properties,
+    serializedTaskMetrics: Array[Byte] =    SparkEnv.get.closureSerializer.newInstance().serialize(TaskMetrics.registered).array(),
+    val jobId: Option[Int] = None,
+    val appId: Option[String] = None,
+    val appAttemptId: Option[String] = None,
+    val isBarrier: Boolean = false) extends Serializable {
+    属性:
+    #name @metrics	#type @TaskMetrics lazy @transient	任务度量器
+    #name @taskMemoryManager: TaskMemoryManager = _	任务内存管理器
+    #name @epoch: Long = -1	端点
+    #name @context: TaskContext = _	transient 任务上下文
+    #name @taskThread: Thread = _	任务线程
+    #name @_reasonIfKilled: String = null	任务中断原因
+    #name @_executorDeserializeTimeNs: Long = 0	任务反序列化时间
+    #name @_executorDeserializeCpuTime: Long = 0	任务反序列化CPU时间
+    操作集:
+    def executorDeserializeTimeNs: Long = _executorDeserializeTimeNs
+    def executorDeserializeCpuTime: Long = _executorDeserializeCpuTime
+    功能: 获取执行器反序列化时间/CPU时间
+    
+    def reasonIfKilled: Option[String] = Option(_reasonIfKilled)
+    功能: 获取任务中断原因
+    
+    def collectAccumulatorUpdates(taskFailed: Boolean = false): Seq[AccumulatorV2[_, _]] 
+    功能: 收集任务中最新的累加器值
+    if (context != null) {
+      context.taskMetrics.nonZeroInternalAccums() ++
+        context.taskMetrics.externalAccums.filter(a => !taskFailed || a.countFailedValues)
+    } else {
+      Seq.empty
+    }
+    
+    def kill(interruptThread: Boolean, reason: String): Unit
+    功能: 中断任务,并指定中断原因.需要上层spark程序或者用户程序妥善的处理中断标记位@interruptThread
+    require(reason != null)
+    _reasonIfKilled = reason
+    if (context != null) {
+      context.markInterrupted(reason)
+    }
+    if (interruptThread && taskThread != null) {
+      taskThread.interrupt()
+    }
+    
+    def runTask(context: TaskContext): T
+    功能: 运行任务,获取任务执行结果
+    
+    def preferredLocations: Seq[TaskLocation] = Nil
+    功能: 获取任务最佳执行位置
+    
+    def setTaskMemoryManager(taskMemoryManager: TaskMemoryManager): Unit
+    功能: 设置任务内存管理器
+    this.taskMemoryManager = taskMemoryManager
+    
+    final def run(
+      taskAttemptId: Long,
+      attemptNumber: Int,
+      metricsSystem: MetricsSystem,
+      resources: Map[String, ResourceInformation]): T 
+    功能: 使用执行器,调用这个任务
+    输入参数:
+        taskAttemptId	任务请求编号
+        attemptNumber	请求数量
+        metricsSystem	度量系统
+        resources	资源列表
+    1. 注册任务
+    SparkEnv.get.blockManager.registerTask(taskAttemptId)
+    2. 获取任务上下文@context
+    val taskContext = new TaskContextImpl(
+      stageId,
+      stageAttemptId, // stageAttemptId and stageAttemptNumber are semantically equal
+      partitionId,
+      taskAttemptId,
+      attemptNumber,
+      taskMemoryManager,
+      localProperties,
+      metricsSystem,
+      metrics,
+      resources)
+    context = if (isBarrier) {
+      new BarrierTaskContext(taskContext)
+    } else {
+      taskContext
+    }
+    3. 获取调用上下文
+    InputFileBlockHolder.initialize()
+    TaskContext.setTaskContext(context)
+    taskThread = Thread.currentThread()
+	// 处理任务中断
+    if (_reasonIfKilled != null) {
+      kill(interruptThread = false, _reasonIfKilled)
+    }
+    new CallerContext(
+      "TASK",
+      SparkEnv.get.conf.get(APP_CALLER_CONTEXT),
+      appId,
+      appAttemptId,
+      jobId,
+      Option(stageId),
+      Option(stageAttemptId),
+      Option(taskAttemptId),
+      Option(attemptNumber)).setCurrentContext()
+    4. 运行任务
+	try {
+      runTask(context)
+    } catch {
+      case e: Throwable =>
+        try {
+          context.markTaskFailed(e)
+        } catch {
+          case t: Throwable =>
+            e.addSuppressed(t)
+        }
+        context.markTaskCompleted(Some(e))
+        throw e
+    } finally {
+      try {
+        context.markTaskCompleted(None)
+      } finally {
+        try {
+          Utils.tryLogNonFatalError {      SparkEnv.get.blockManager.memoryStore.releaseUnrollMemoryForThisTask(MemoryMode.ON_HEAP)
+            SparkEnv.get.blockManager.memoryStore.releaseUnrollMemoryForThisTask(
+              MemoryMode.OFF_HEAP)
+            val memoryManager = SparkEnv.get.memoryManager
+            memoryManager.synchronized { memoryManager.notifyAll() }
+          }
+        } finally {
+          TaskContext.unset()
+          InputFileBlockHolder.unset()
+        }
+      }
+    }
+}
+```
+
 ####  TaskDescription
+
+```markdown
+介绍:
+	任务描述，传递到执行器上，用于执行，通常使用@TaskSetManager.resourceOffe 创建。
+	任务描述与任务相关，序列化时需要注意下述两点。
+	1. 任务描述由执行器接受，执行器需要首先受到jar包和文件列表，并将其添加到类路径中，且设置属性，这些工作需要在反序列Task前进行处理。这就是为什么@Properties 包含在@TaskDescription 内，尽管它们也在反序列化任务中。
+	2. 由于任务描述是发送到执行器，用于执行每个任务执行，因此有效的序列化很重要。所以序列化时需要自己提供序列化方法@TaskDescription.encode和 @TaskDescription.decode。 使得序列化结果更小。
+```
+
+```scala
+private[spark] class TaskDescription(
+    val taskId: Long,
+    val attemptNumber: Int,
+    val executorId: String,
+    val name: String,
+    val index: Int,   
+    val partitionId: Int,
+    val addedFiles: Map[String, Long],
+    val addedJars: Map[String, Long],
+    val properties: Properties,
+    val resources: immutable.Map[String, ResourceInformation],
+    val serializedTask: ByteBuffer) {
+    构造器参数:
+        taskId	任务编号
+        attemptNumber	请求数量
+        executorId	执行器ID
+        name	任务名称
+        index	索引
+        partitionId	分区ID
+        addedFiles	文件列表
+        addedJars	jar包列表
+        properties	属性
+        resources	资源列表
+        serializedTask	序列化任务
+    操作集:
+    def toString: String = "TaskDescription(TID=%d, index=%d)".format(taskId, index)
+    功能: 信息显示
+}
+```
+
+```scala
+private[spark] object TaskDescription {
+    操作集:
+    def serializeStringLongMap(map: Map[String, Long], dataOut: DataOutputStream): Unit
+    功能: 序列化map
+    dataOut.writeInt(map.size)
+    map.foreach { case (key, value) =>
+      dataOut.writeUTF(key)
+      dataOut.writeLong(value)
+    }
+    
+    def serializeResources(map: immutable.Map[String, ResourceInformation],
+      dataOut: DataOutputStream): Unit
+    功能: 序列化资源列表
+    dataOut.writeInt(map.size)
+    map.foreach { case (key, value) =>
+      dataOut.writeUTF(key)
+      dataOut.writeUTF(value.name)
+      dataOut.writeInt(value.addresses.size)
+      value.addresses.foreach(dataOut.writeUTF(_))
+    }
+    
+    def deserializeStringLongMap(dataIn: DataInputStream): HashMap[String, Long]
+    功能: 反序列化Map
+    val map = new HashMap[String, Long]()
+    val mapSize = dataIn.readInt()
+    var i = 0
+    while (i < mapSize) {
+      map(dataIn.readUTF()) = dataIn.readLong()
+      i += 1
+    }
+    val= map
+    
+    def deserializeResources(dataIn: DataInputStream):
+      immutable.Map[String, ResourceInformation]
+    功能: 反序列化资源列表
+    val map = new HashMap[String, ResourceInformation]()
+    val mapSize = dataIn.readInt()
+    var i = 0
+    while (i < mapSize) {
+      val resType = dataIn.readUTF()
+      val name = dataIn.readUTF()
+      val numIdentifier = dataIn.readInt()
+      val identifiers = new ArrayBuffer[String](numIdentifier)
+      var j = 0
+      while (j < numIdentifier) {
+        identifiers += dataIn.readUTF()
+        j += 1
+      }
+      map(resType) = new ResourceInformation(name, identifiers.toArray)
+      i += 1
+    }
+    val= map.toMap
+    
+    def decode(byteBuffer: ByteBuffer): TaskDescription
+    功能: 解码(数据缓冲区数据 --> 任务描述)
+    val dataIn = new DataInputStream(new ByteBufferInputStream(byteBuffer))
+    val taskId = dataIn.readLong()
+    val attemptNumber = dataIn.readInt()
+    val executorId = dataIn.readUTF()
+    val name = dataIn.readUTF()
+    val index = dataIn.readInt()
+    val partitionId = dataIn.readInt()
+    val taskFiles = deserializeStringLongMap(dataIn)
+    val taskJars = deserializeStringLongMap(dataIn)
+    val properties = new Properties()
+    val numProperties = dataIn.readInt()
+    for (i <- 0 until numProperties) {
+      val key = dataIn.readUTF()
+      val valueLength = dataIn.readInt()
+      val valueBytes = new Array[Byte](valueLength)
+      dataIn.readFully(valueBytes)
+      properties.setProperty(key, new String(valueBytes, StandardCharsets.UTF_8))
+    }
+    val resources = deserializeResources(dataIn)
+    val serializedTask = byteBuffer.slice()
+    new TaskDescription(taskId, attemptNumber, executorId, name, index, partitionId, taskFiles,taskJars, properties, resources, serializedTask)
+    
+    def encode(taskDescription: TaskDescription): ByteBuffer
+    功能: 对任务描述进行加密
+    val bytesOut = new ByteBufferOutputStream(4096)
+    val dataOut = new DataOutputStream(bytesOut)
+    // 写出任务描述信息
+    dataOut.writeLong(taskDescription.taskId)
+    dataOut.writeInt(taskDescription.attemptNumber)
+    dataOut.writeUTF(taskDescription.executorId)
+    dataOut.writeUTF(taskDescription.name)
+    dataOut.writeInt(taskDescription.index)
+    dataOut.writeInt(taskDescription.partitionId)
+    serializeStringLongMap(taskDescription.addedFiles, dataOut)
+    serializeStringLongMap(taskDescription.addedJars, dataOut)
+    dataOut.writeInt(taskDescription.properties.size())
+    taskDescription.properties.asScala.foreach { case (key, value) =>
+      dataOut.writeUTF(key)
+      val bytes = value.getBytes(StandardCharsets.UTF_8)
+      dataOut.writeInt(bytes.length)
+      dataOut.write(bytes)
+    }
+    serializeResources(taskDescription.resources, dataOut)
+    Utils.writeByteBuffer(taskDescription.serializedTask, bytesOut)
+    dataOut.close()
+    bytesOut.close()
+    bytesOut.toByteBuffer
+}
+```
 
 #### TaskInfo
 
@@ -5076,11 +5379,331 @@ object TaskLocality extends Enumeration {
 
 #### TaskLocation
 
+```scala
+private[spark] sealed trait TaskLocation {
+    介绍: 任务运行的位置,既可以时主机,也可以是主机+执行器编号组成的键值对.在后者情况下,会运行指定执行器的任务,但是次优位置会是同一个主机上的执行器.
+    def host: String
+}
+
+private [spark]
+case class ExecutorCacheTaskLocation(override val host: String, executorId: String)
+  extends TaskLocation {
+  override def toString: String = s"${TaskLocation.executorLocationTag}${host}_$executorId"
+}
+介绍: 执行器缓存任务位置,包含主机和执行器ID的位置信息
+
+private [spark] case class HostTaskLocation(override val host: String) extends TaskLocation {
+  override def toString: String = host
+}
+介绍: 执行器位置
+
+private [spark] case class HDFSCacheTaskLocation(override val host: String) extends TaskLocation {
+  override def toString: String = TaskLocation.inMemoryLocationTag + host
+}
+介绍: HDFS主机位置
+```
+
+```scala
+private[spark] object TaskLocation {
+    属性:
+    #name @inMemoryLocationTag = "hdfs_cache_"	内存位置标签
+    	参考RFC 952 和 RFC 1123获取更多信息
+    #name @executorLocationTag = "executor_"	执行器位置前缀
+    操作集:
+    def apply(host: String, executorId: String): TaskLocation 
+    功能: 获取主机执行器式任务位置
+    val= new ExecutorCacheTaskLocation(host, executorId)
+    
+    def apply(str: String): TaskLocation 
+    功能: 根据输入串确定最佳运行位置
+    val hstr = str.stripPrefix(inMemoryLocationTag)
+    if (hstr.equals(str)) {
+      if (str.startsWith(executorLocationTag)) {
+        val hostAndExecutorId = str.stripPrefix(executorLocationTag)
+        val splits = hostAndExecutorId.split("_", 2)
+        require(splits.length == 2, "Illegal executor location format: " + str)
+        val Array(host, executorId) = splits
+        new ExecutorCacheTaskLocation(host, executorId)
+      } else {
+        new HostTaskLocation(str)
+      }
+    } else {
+      new HDFSCacheTaskLocation(hstr)
+    }
+}
+```
+
 #### TaskResult
+
+```scala
+private[spark] sealed trait TaskResult[T]
+介绍: 任务结果
+
+private[spark] case class IndirectTaskResult[T](blockId: BlockId, size: Int)
+  extends TaskResult[T] with Serializable
+介绍: 间接任务结果(存储到worker的块管理器中)
+
+private[spark] class DirectTaskResult[T](
+    var valueBytes: ByteBuffer,
+    var accumUpdates: Seq[AccumulatorV2[_, _]],
+    var metricPeaks: Array[Long])
+extends TaskResult[T] with Externalizable {
+    介绍: 直接任务结果
+    构造器参数:
+        valueBytes	数据值
+        accumUpdates	更新度量器
+        metricPeaks	度量参数列表
+    属性:
+    #name @valueObjectDeserialized = false	值对象是否反序列化
+    #name @valueObject: T = _	值对象
+    操作集:
+    def writeExternal(out: ObjectOutput): Unit
+    功能: 外部写出
+    Utils.tryOrIOException {
+        out.writeInt(valueBytes.remaining)
+        Utils.writeByteBuffer(valueBytes, out)
+        out.writeInt(accumUpdates.size)
+        accumUpdates.foreach(out.writeObject)
+        out.writeInt(metricPeaks.length)
+        metricPeaks.foreach(out.writeLong)
+      }
+    
+    def readExternal(in: ObjectInput): Unit
+    功能: 读取外部数据
+    Utils.tryOrIOException {
+        val blen = in.readInt()
+        val byteVal = new Array[Byte](blen)
+        in.readFully(byteVal)
+        valueBytes = ByteBuffer.wrap(byteVal)
+
+        val numUpdates = in.readInt
+        if (numUpdates == 0) {
+          accumUpdates = Seq.empty
+        } else {
+          val _accumUpdates = new ArrayBuffer[AccumulatorV2[_, _]]
+          for (i <- 0 until numUpdates) {
+            _accumUpdates += in.readObject.asInstanceOf[AccumulatorV2[_, _]]
+          }
+          accumUpdates = _accumUpdates
+        }
+
+        val numMetrics = in.readInt
+        if (numMetrics == 0) {
+          metricPeaks = Array.empty
+        } else {
+          metricPeaks = new Array[Long](numMetrics)
+          (0 until numMetrics).foreach { i =>
+            metricPeaks(i) = in.readLong
+          }
+        }
+        valueObjectDeserialized = false
+    }
+    
+    def value(resultSer: SerializerInstance = null): T 
+    功能: 获取反序列化@valueBytes 值
+    首次执行,由@valueBytes 反序列化得到 @valueObject,之后就直接获取@valueObject
+    val= if (valueObjectDeserialized) {
+      valueObject
+    } else {
+      val ser =if(resultSer == null) SparkEnv.get.serializer.newInstance() else resultSer
+      valueObject = ser.deserialize(valueBytes)
+      valueObjectDeserialized = true
+      valueObject
+    }
+}
+```
 
 #### TaskResultGetter
 
+```scala
+private[spark] class TaskResultGetter(sparkEnv: SparkEnv, scheduler: TaskSchedulerImpl)
+extends Logging {
+    介绍: 任务结果获取器,运行一个反序列化的线程池,远端获取任务执行结果
+    属性:
+    #name @THREADS = sparkEnv.conf.getInt("spark.resultGetter.threads", 4) 线程数量
+    #name @getTaskResultExecutor: ExecutorService 获取任务执行器（测试使用）
+    val= ThreadUtils.newDaemonFixedThreadPool(THREADS, "task-result-getter")
+    #name @serializer #type @ThreadLocal[SerializerInstance]	序列化器(测试使用)
+    val= new ThreadLocal[SerializerInstance] {
+        override def initialValue(): SerializerInstance = {
+          sparkEnv.closureSerializer.newInstance()
+        }
+      }
+    #name @taskResultSerializer #type @ThreadLocal[SerializerInstance] 任务结果序列化器(测试)
+    val= new ThreadLocal[SerializerInstance] {
+        override def initialValue(): SerializerInstance = {
+          sparkEnv.serializer.newInstance()
+        }	
+      }
+    操作集:
+    def stop(): Unit = getTaskResultExecutor.shutdownNow()
+    功能: 停止结果获取器
+    
+    def enqueuePartitionCompletionNotification(stageId: Int, partitionId: Int): Unit 
+    功能: 该方法异步调用@TaskSchedulerImpl.handlePartitionCompleted,不会需要DAG调度器直接使用@TaskSchedulerImpl.handlePartitionCompleted,因为这个方法是同步的,可能使得调度器丧失生成能力.
+    getTaskResultExecutor.execute(() => Utils.logUncaughtExceptions {
+      scheduler.handlePartitionCompleted(stageId, partitionId)
+    })
+    
+    def enqueueFailedTask(taskSetManager: TaskSetManager, tid: Long, taskState: TaskState,serializedData: ByteBuffer): Unit
+    功能: 入队失败任务
+    serializedData: ByteBuffer): Unit = {
+    var reason : TaskFailedReason = UnknownReason
+    try {
+          getTaskResultExecutor.execute(() => Utils.logUncaughtExceptions {
+            val loader = Utils.getContextOrSparkClassLoader
+            try {
+              if (serializedData != null && serializedData.limit() > 0) {
+                reason = serializer.get().deserialize[TaskFailedReason](
+                  serializedData, loader)
+              }
+            } catch {
+              case _: ClassNotFoundException =>
+                logError(
+                  "Could not deserialize TaskEndReason: ClassNotFound 
+                  with classloader " + loader)
+              case _: Exception => // No-op
+            } finally {
+              scheduler.handleFailedTask(taskSetManager, tid, taskState, reason)
+            }
+          })
+        } catch {
+          case e: RejectedExecutionException if sparkEnv.isStopped =>
+        }
+    }
+    
+    def enqueueSuccessfulTask(
+      taskSetManager: TaskSetManager,
+      tid: Long,
+      serializedData: ByteBuffer): Unit 
+    功能: 入队成功执行任务信息
+    getTaskResultExecutor.execute(new Runnable {
+      override def run(): Unit = Utils.logUncaughtExceptions {
+        try {
+            1. 获取任务执行结果
+          val (result, size) = 
+            serializer.get().deserialize[TaskResult[_]]	(serializedData) match {
+            case directResult: DirectTaskResult[_] =>
+              if (!taskSetManager.canFetchMoreResults(serializedData.limit())) {
+                scheduler.handleFailedTask(
+                    taskSetManager, tid, TaskState.KILLED, TaskKilled(
+                  "Tasks result size has exceeded maxResultSize"))
+                return
+              }
+              directResult.value(taskResultSerializer.get())
+              (directResult, serializedData.limit())
+            case IndirectTaskResult(blockId, size) =>
+              if (!taskSetManager.canFetchMoreResults(size)) {
+                sparkEnv.blockManager.master.removeBlock(blockId)
+                scheduler.handleFailedTask(taskSetManager, tid, TaskState.KILLED, TaskKilled("Tasks result size has exceeded maxResultSize"))
+                return
+              }
+              logDebug("Fetching indirect task result for TID %s".format(tid))
+              scheduler.handleTaskGettingResult(taskSetManager, tid)
+              val serializedTaskResult = sparkEnv.blockManager.getRemoteBytes(blockId)
+              if (serializedTaskResult.isEmpty) {
+                scheduler.handleFailedTask(
+                  taskSetManager, tid, TaskState.FINISHED, TaskResultLost)
+                return
+              }
+              val deserializedResult = serializer.get().deserialize[DirectTaskResult[_]](
+                serializedTaskResult.get.toByteBuffer)
+              // force deserialization of referenced value
+              deserializedResult.value(taskResultSerializer.get())
+              sparkEnv.blockManager.master.removeBlock(blockId)
+              (deserializedResult, size)
+          }
+            2. 处理累加器更新
+          result.accumUpdates = result.accumUpdates.map { a =>
+            if (a.name == Some(InternalAccumulator.RESULT_SIZE)) {
+              val acc = a.asInstanceOf[LongAccumulator]
+              assert(acc.sum == 0L, "task result size should not have 
+              been set on the executors")
+              acc.setValue(size.toLong)
+              acc
+            } else {
+              a
+            }
+          }
+            3. 处理为任务成功执行
+          scheduler.handleSuccessfulTask(taskSetManager, tid, result)
+        } catch {
+          case cnf: ClassNotFoundException =>
+            val loader = Thread.currentThread.getContextClassLoader
+            taskSetManager.abort("ClassNotFound with classloader: " + loader)
+          case NonFatal(ex) =>
+            logError("Exception while getting task result", ex)
+            taskSetManager.abort("Exception while getting task result: %s".format(ex))
+        }
+      }
+    })  
+}
+```
+
 #### TaskScheduler
+
+```markdown
+介绍: 
+	底层任务调度器接口,使用@TaskSchedulerImpl 实现,这个接口允许阻塞多个不同的任务调度器.每个任务调度器调度单个@SparkContext 的任务.这些调度器获取一个任务集合,这个任务集合对于每个stage提交@DAGScheduler.调度器需要发送任务到达集群,并运行它们,如果失败需要进行重试(容错性).通过DAG任务调度器@DAGScheduler 返回事件.
+```
+
+```scala
+private[spark] trait TaskScheduler {
+    #name @appId = "spark-application-" + System.currentTimeMillis	应用编号
+    操作集:
+    def rootPool: Pool
+    功能: 获取根调度池
+    
+    def schedulingMode: SchedulingMode
+    功能: 获取调度模式
+    
+    def start(): Unit
+    功能: 开启调度器
+    
+    def postStartHook(): Unit = { }
+    功能: 系统成功初始化之后调用,yarn使用这个启动基于最近位置的资源分配.等待子注册器
+    
+    def stop(): Unit
+    功能: 停止集群的任务调度器
+    
+    def submitTasks(taskSet: TaskSet): Unit
+    功能: 提交运行任务集
+	
+    def cancelTasks(stageId: Int, interruptThread: Boolean): Unit
+    功能: 放弃指定stage的任务
+    
+    def killTaskAttempt(taskId: Long, interruptThread: Boolean, reason: String): Boolean
+    功能: 中断指定任务
+    
+    def killAllTaskAttempts(stageId: Int, interruptThread: Boolean, reason: String): Unit
+    功能: 清除所有任务请求
+    
+    def notifyPartitionCompletion(stageId: Int, partitionId: Int): Unit
+    功能: 提示分区执行完成
+    
+    def setDAGScheduler(dagScheduler: DAGScheduler): Unit
+    功能: 设置DAG调度器
+    
+    def executorHeartbeatReceived(
+      execId: String,
+      accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
+      blockManagerId: BlockManagerId,
+      executorUpdates: Map[(Int, Int), ExecutorMetrics]): Boolean
+    功能: 执行器接受心跳
+    
+    def applicationId(): String = appId
+    功能: 获取应用编号
+    
+    def executorLost(executorId: String, reason: ExecutorLossReason): Unit
+    功能: 执行器丢失处理
+    
+    def workerRemoved(workerId: String, host: String, message: String): Unit
+    功能: 移除worker
+    
+    def applicationAttemptId(): Option[String]
+    功能: 获取应用请求编号
+}
+```
 
 #### TaskSchedulerImpl
 
@@ -5103,7 +5726,44 @@ private[spark] class TaskSet(
 
 #### TaskSetBlacklist
 
+```markdown
+介绍:
+	使用任务集处理黑名单中的执行器和节点.包括任务-->执行器和任务--> 节点键值对.也可以完成整个任务集的黑名单执行器和节点.
+	也会存储任务失败的高效信息,用于应用层级的黑名单处置,使用@BlacklistTracker 处理.注意到黑名单追踪器@BlacklistTracker不知道任务的失败,直到任务集全部成功完成.
+```
+
+```scala
+private[scheduler] class TaskSetBlacklist(
+    private val listenerBus: LiveListenerBus,
+    val conf: SparkConf,
+    val stageId: Int,
+    val stageAttemptId: Int,
+    val clock: Clock) extends Logging {
+ 	输入参数:
+        listenBus	监听总线
+        conf	spark配置
+        stageId	stage编号
+        stageAttemptId	stage请求编号
+        clock	时钟
+    属性:
+    #name @MAX_TASK_ATTEMPTS_PER_EXECUTOR	单个执行器最大请求数量
+    val= conf.get(config.MAX_TASK_ATTEMPTS_PER_EXECUTOR)
+    #name @MAX_TASK_ATTEMPTS_PER_NODE	单个节点最大请求数量
+    val= conf.get(config.MAX_TASK_ATTEMPTS_PER_NODE)
+    #name @MAX_FAILURES_PER_EXEC_STAGE	单个执行stage最大失败次数
+    val= conf.get(config.MAX_FAILURES_PER_EXEC_STAGE)
+    #name @MAX_FAILED_EXEC_PER_NODE_STAGE	带个节点stage最大失败次数
+    val=conf.get(config.MAX_FAILED_EXEC_PER_NODE_STAGE)
+}
+```
+
+
+
 #### TaskSetManager
+
+```scala
+
+```
 
 #### WorkerOffer
 
