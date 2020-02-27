@@ -5707,6 +5707,781 @@ private[spark] trait TaskScheduler {
 
 #### TaskSchedulerImpl
 
+```markdown
+介绍:
+	通过对调度器后端的操作,调度集群的多个类型任务,可以使用本地调度客户端创建.处理通用逻辑(例如,job的调度顺序,推测任务的执行等等).客户端需要调用初始化@initialize() 和开始@start() 通过提交任务方法提交任务.
+ 	威胁: 调度器后端@SchedulerBackend 和任务提交客户端可以多线程调用这个类.所以需要公用API锁去维护这个状态,此外,调度器后端在它发送事件的时候同步自身,然后获取这里的锁.所以需要确定获取自身锁的时候,没有获取调度器后端的锁.这个类可能被如下几种线程调用
+ 	1. DAGScheduler	事件环
+ 	2. RPC处理线程,响应执行器的状态更新
+ 	3. 周期性复活粒度集群后端,用于延时调度
+ 	4. 任务结果获取线程
+```
+
+```scala
+private[spark] class TaskSchedulerImpl(
+    val sc: SparkContext,
+    val maxTaskFailures: Int,
+    isLocal: Boolean = false)
+extends TaskScheduler with Logging {
+    属性:
+    #name @conf = sc.conf	spark配置
+    #name @blacklistTrackerOpt = maybeCreateBlacklistTracker(sc)	黑名单定位属性
+    #name @SPECULATION_INTERVAL_MS = conf.get(SPECULATION_INTERVAL)	推测任务检查周期
+    #name @MIN_TIME_TO_SPECULATION = 100	最小推测时间
+    #name @speculationScheduler	推测调度器
+    val= ThreadUtils.newDaemonSingleThreadScheduledExecutor("task-scheduler-speculation")
+    #name @STARVATION_TIMEOUT_MS	互斥等待上限(防止死锁)
+    conf.getTimeAsMs("spark.starvation.timeout", "15s")
+    #name @CPUS_PER_TASK = conf.get(config.CPUS_PER_TASK)	每个任务的CPU数量
+    #name @resourcesReqsPerTask	每个任务的资源需求列表
+    #name @taskSetsByStageIdAndAttempt	任务集-->stage编号映射表
+    val= new HashMap[Int, HashMap[Int, TaskSetManager]]
+    #name @taskIdToTaskSetManager	任务ID与任务集管理器映射关系
+    val= new ConcurrentHashMap[Long, TaskSetManager]
+    #name @taskIdToExecutorId = new HashMap[Long, String]	任务ID与执行器ID映射表
+    #name @hasReceivedTask = false	是否接受任务标志
+    #name @hasLaunchedTask = false	是否启动任务标志
+    #name @nextTaskId = new AtomicLong(0)	下一个任务编号
+    #name @executorIdToRunningTaskIds = new HashMap[String, HashSet[Long]]
+    	执行器--> 执行器运行的任务列表映射关系
+    #name @hostToExecutors = new HashMap[String, HashSet[String]]	
+    	主机 --> 执行器列表映射关系
+    #name @hostsByRack = new HashMap[String, HashSet[String]]
+    	机架 --> 主机映射关系
+    #name @executorIdToHost = new HashMap[String, String]
+    	执行器ID --> 主机映射关系
+    #name @abortTimer = new Timer(true)	计数器(抛弃的时候使用)
+    #name @clock = new SystemClock	系统时钟
+    #name @unschedulableTaskSetToExpiryTime = new HashMap[TaskSetManager, Lon]
+    	未调度的任务集 --> 到期时间映射表
+    #name @dagScheduler: DAGScheduler = null	DAG调度器
+    #name @backend: SchedulerBackend = null	调度器后端
+    #name @mapOutputTracker	MAP输出定位器
+    val= SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+    #name @schedulableBuilder: SchedulableBuilder = null	调度构建器
+    #name @schedulingModeConf = conf.get(SCHEDULER_MODE)	调度模式配置(默认FIFO)
+    #name @schedulingMode #type @SchedulingMode	调度模式
+    val= try {
+      SchedulingMode.withName(schedulingModeConf.toUpperCase(Locale.ROOT))
+    } catch {
+      case e: java.util.NoSuchElementException =>
+        throw new SparkException(s"Unrecognized $SCHEDULER_MODE_PROPERTY:
+        $schedulingModeConf")
+    }
+    #name @rootPool: Pool = new Pool("", schedulingMode, 0, 0)	根调度池
+    #name @taskResultGetter = new TaskResultGetter(sc.env, this)	任务结果获取器
+    #name @barrierSyncTimeout = conf.get(config.BARRIER_SYNC_TIMEOUT)	屏蔽同步超时时间
+    操作集:
+    def runningTasksByExecutors: Map[String, Int] 
+    功能: 获取执行器-->运行任务映射表
+    val= synchronized {
+        executorIdToRunningTaskIds.toMap.mapValues(_.size)
+      }
+    
+    def maybeInitBarrierCoordinator(): Unit
+    功能: 进行可能的屏蔽协调器RPC端点的初始化工作
+    if (barrierCoordinator == null) {
+      // 创建屏蔽协调者
+      barrierCoordinator = new BarrierCoordinator(barrierSyncTimeout, sc.listenerBus,
+        sc.env.rpcEnv)
+      // 向spark环境中注册当前屏蔽协调者
+      sc.env.rpcEnv.setupEndpoint("barrierSync", barrierCoordinator)
+      logInfo("Registered BarrierCoordinator endpoint")
+    }
+    
+    def setDAGScheduler(dagScheduler: DAGScheduler): Unit 
+    功能: 设置DAG调度器
+    this.dagScheduler = dagScheduler
+    
+    def newTaskId(): Long = nextTaskId.getAndIncrement()
+    功能: 获取下一个任务ID
+    
+    def initialize(backend: SchedulerBackend): Unit
+    功能: 初始化任务调度器@TaskScheduler
+    1. 设置调度器后端
+    this.backend = backend
+    2. 获取调度构建器(FIFO/FAIR)
+    schedulableBuilder = {
+      schedulingMode match {
+        case SchedulingMode.FIFO =>
+          new FIFOSchedulableBuilder(rootPool)
+        case SchedulingMode.FAIR =>
+          new FairSchedulableBuilder(rootPool, conf)
+        case _ =>
+          throw new IllegalArgumentException(s"Unsupported $SCHEDULER_MODE_PROPERTY: " +
+          s"$schedulingMode")
+      }
+    }
+    3. 创建调度池
+    schedulableBuilder.buildPools()
+    
+    def start(): Unit
+    功能: 启动任务调度器
+    1. 启动调度器后端
+    backend.start()
+    2. 处理远端推测执行的情况(延时调度)
+    if (!isLocal && conf.get(SPECULATION_ENABLED)) {
+      logInfo("Starting speculative execution thread")
+      speculationScheduler.scheduleWithFixedDelay(
+        () => Utils.tryOrStopSparkContext(sc) { checkSpeculatableTasks() },
+        SPECULATION_INTERVAL_MS, SPECULATION_INTERVAL_MS, TimeUnit.MILLISECONDS)
+    }
+    
+    def postStartHook(): Unit
+    功能: 系统初始化完毕,等待从节点注册
+    waitBackendReady()
+    
+    def submitTasks(taskSet: TaskSet): Unit
+    功能: 提交任务
+    1. 获取任务集
+    val tasks = taskSet.tasks
+    logInfo("Adding task set " + taskSet.id + " with " + tasks.length + " tasks")
+    2. 提交任务
+    this.synchronized {
+      val manager = createTaskSetManager(taskSet, maxTaskFailures)
+      val stage = taskSet.stageId
+      // 获取当前stage的任务集
+      val stageTaskSets =
+        taskSetsByStageIdAndAttempt.getOrElseUpdate(
+            stage, new HashMap[Int, TaskSetManager]))
+      // 设置任务集中的任务为僵尸任务,提交完毕之后会被kill
+      stageTaskSets.foreach { case (_, ts) =>
+        ts.isZombie = true
+      }
+      // 设置任务集管理器
+      stageTaskSets(taskSet.stageAttemptId) = manager
+      // 添加任务管理器
+      schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
+`	  // 处理远端未接受任务处理,如果没有运行任务则会打印出日志
+      if (!isLocal && !hasReceivedTask) {
+        starvationTimer.scheduleAtFixedRate(new TimerTask() {
+          override def run(): Unit = {
+            if (!hasLaunchedTask) {
+              logWarning("Initial job has not accepted any resources; " +
+                "check your cluster UI to ensure that workers are registered " +
+                "and have sufficient resources")
+            } else {
+              this.cancel()
+            }
+          }
+        }, STARVATION_TIMEOUT_MS, STARVATION_TIMEOUT_MS)
+      }
+      hasReceivedTask = true
+    }
+    3. 后端发送恢复提供(offer)请求
+    backend.reviveOffers()
+    
+    def createTaskSetManager(
+      taskSet: TaskSet,
+      maxTaskFailures: Int): TaskSetManager
+    功能: 创建任务集管理器
+    val= new TaskSetManager(this, taskSet, maxTaskFailures, blacklistTrackerOpt)
+    
+    def cancelTasks(stageId: Int, interruptThread: Boolean): Unit
+    功能: 放弃指定stage下的所有任务@stageId
+    1. 中断stage下的所有任务
+    killAllTaskAttempts(stageId, interruptThread, reason = "Stage cancelled")
+    2. 放弃当前stage的所有请求
+    val= taskSetsByStageIdAndAttempt.get(stageId).foreach { attempts =>
+      attempts.foreach { case (_, tsm) =>
+        tsm.abort("Stage %s cancelled".format(stageId))
+        logInfo("Stage %d was cancelled".format(stageId))
+      }
+    }
+    
+    def killTaskAttempt(
+      taskId: Long,
+      interruptThread: Boolean,
+      reason: String): Boolean
+    功能: kill任务请求
+    val=  synchronized {
+    logInfo(s"Killing task $taskId: $reason")
+    val execId = taskIdToExecutorId.get(taskId)
+        if (execId.isDefined) {
+          backend.killTask(taskId, execId.get, interruptThread, reason)
+          true
+        } else {
+          logWarning(s"Could not kill task $taskId because no task 
+          with that ID was found.")
+          false
+        }
+      }
+    
+    def killAllTaskAttempts(
+      stageId: Int,
+      interruptThread: Boolean,
+      reason: String): Unit 
+    功能: 中断执行stage下的所有任务
+    synchronized {
+        logInfo(s"Killing all running tasks in stage $stageId: $reason")
+        taskSetsByStageIdAndAttempt.get(stageId).foreach { attempts =>
+          attempts.foreach { case (_, tsm) =>
+            tsm.runningTasksSet.foreach { tid =>
+              taskIdToExecutorId.get(tid).foreach { execId =>
+                backend.killTask(tid, execId, interruptThread, reason)
+              }
+            }
+          }
+        }
+      }
+    
+    def notifyPartitionCompletion(stageId: Int, partitionId: Int): Unit
+    功能: 提示指定分区@partitionId执行完毕
+    val= taskResultGetter.enqueuePartitionCompletionNotification(stageId, partitionId)
+    
+    def taskSetFinished(manager: TaskSetManager): Unit
+    功能: 调用表示指定任务集管理器@manager 中的所有任务执行完成,所以与@TaskSetManager 相关的状态需要被清除
+    synchronized {
+       	//从当前stage任务集中去掉@manager执行完的任务，如果当前stage中没有任务了，
+        // 直接移除这个stage的记录
+        taskSetsByStageIdAndAttempt.get(manager.taskSet.stageId).foreach { 
+          taskSetsForStage =>
+          taskSetsForStage -= manager.taskSet.stageAttemptId
+          if (taskSetsForStage.isEmpty) {
+            taskSetsByStageIdAndAttempt -= manager.taskSet.stageId
+          }
+        }
+        // 移除当前任务集管理器
+        manager.parent.removeSchedulable(manager)
+        logInfo(s"Removed TaskSet ${manager.taskSet.id}, whose tasks have all completed,
+        from pool" +
+        s" ${manager.parent.name}")
+    }
+    
+    def resourceOfferSingleTaskSet(
+      taskSet: TaskSetManager,
+      maxLocality: TaskLocality,
+      shuffledOffers: Seq[WorkerOffer],
+      availableCpus: Array[Int],
+      availableResources: Array[Map[String, Buffer[String]]],
+      tasks: IndexedSeq[ArrayBuffer[TaskDescription]],
+      addressesWithDescs: ArrayBuffer[(String, TaskDescription)]) : Boolean 
+    功能: 获取单个任务集的资源空间
+    1. 设置当前任务运行状态
+    var launchedTask = false
+    2. 为每个任务(不处于黑名单节点或者执行器上的)分配资源
+    for (i <- 0 until shuffledOffers.size) {
+      // 获取执行器ID,主机名称(不含黑名单列表中的)
+      val execId = shuffledOffers(i).executorId
+      val host = shuffledOffers(i).host
+      if (availableCpus(i) >= CPUS_PER_TASK &&
+        resourcesMeetTaskRequirements(availableResources(i))) {
+        // 分配任务资源
+        try {
+          for (task <- taskSet.resourceOffer(
+              execId, host, maxLocality, availableResources(i))) {
+            tasks(i) += task // 分配任务+1
+            val tid = task.taskId 
+            // 注册当前任务到各个映射表中
+            taskIdToTaskSetManager.put(tid, taskSet)
+            taskIdToExecutorId(tid) = execId
+            executorIdToRunningTaskIds(execId).add(tid)
+            // 更新CPU剩余量
+            availableCpus(i) -= CPUS_PER_TASK
+            assert(availableCpus(i) >= 0)
+            task.resources.foreach { case (rName, rInfo) =>
+              availableResources(i).getOrElse(rName,
+                throw new SparkException(s"Try to acquire resource 
+                $rName that doesn't exist."))
+                .remove(0, rInfo.addresses.size)
+            }
+            // 处理任务处于屏蔽状态下的情况
+            if (taskSet.isBarrier) {
+              addressesWithDescs += (shuffledOffers(i).address.get -> task)
+            }
+            launchedTask = true
+          }
+        } catch {
+          case e: TaskNotSerializableException =>
+            logError(s"Resource offer failed, task set ${taskSet.name} 
+            was not serializable")
+            return launchedTask
+        }
+      }
+    }
+    
+    def resourcesMeetTaskRequirements(resources: Map[String, Buffer[String]]): Boolean
+    功能: 检查任务运行的资源要求
+    val resourcesFree = resources.map(r => r._1 -> r._2.length)
+    ResourceUtils.resourcesMeetRequirements(resourcesFree, resourcesReqsPerTask)
+    
+    def createUnschedulableTaskSetAbortTimer(
+      taskSet: TaskSetManager,
+      taskIndex: Int): TimerTask
+    功能: 创建不可调度的任务集定时器,弃用任务集时使用
+    val= new TimerTask() {
+      override def run(): Unit = TaskSchedulerImpl.this.synchronized {
+        if (unschedulableTaskSetToExpiryTime.contains(taskSet) &&
+            unschedulableTaskSetToExpiryTime(taskSet) <= clock.getTimeMillis()) {
+          logInfo("Cannot schedule any task because of complete blacklisting. " +
+            s"Wait time for scheduling expired. Aborting $taskSet.")
+          taskSet.abortSinceCompletelyBlacklisted(taskIndex)
+        } else {
+          this.cancel()
+        }
+      }
+    }
+    
+    def shuffleOffers(offers: IndexedSeq[WorkerOffer]): IndexedSeq[WorkerOffer] 
+    功能: 获取用于shuffle的空闲资源
+    val= Random.shuffle(offers)
+    
+    def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer): Unit 
+    功能: 状态更新
+    1. 设置失败任务统计数据结构
+    var failedExecutor: Option[String] = None
+    var reason: Option[ExecutorLossReason] = None
+    2. 
+    synchronized {
+      try {
+        Option(taskIdToTaskSetManager.get(tid)) match {
+          case Some(taskSet) =>
+           	// 处理任务丢失，将其视作失败任务处理
+            if (state == TaskState.LOST) {
+              val execId = taskIdToExecutorId.getOrElse(
+                  tid, throw new IllegalStateException(
+                "taskIdToTaskSetManager.contains(tid) 
+                <=> taskIdToExecutorId.contains(tid)"))
+              if (executorIdToRunningTaskIds.contains(execId)) {
+                reason = Some(
+                  SlaveLost(s"Task $tid was lost, so marking the 
+                  executor as lost as well."))
+                removeExecutor(execId, reason.get)
+                failedExecutor = Some(execId)
+              }
+            }
+           // 处理执行完成任务,获取任务执行的结果
+            if (TaskState.isFinished(state)) {
+              cleanupTaskState(tid)
+              taskSet.removeRunningTask(tid)
+              if (state == TaskState.FINISHED) { // 任务成功
+                taskResultGetter.enqueueSuccessfulTask(taskSet, tid, serializedData)
+              } else if (Set(TaskState.FAILED, TaskState.KILLED,
+                             TaskState.LOST).contains(state)) { // 任务失败
+                taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
+              }
+            }
+          case None =>
+            logError(
+              ("Ignoring update with state %s for TID %s 
+              because its task set is gone (this is " +
+              "likely the result of receiving duplicate task finished
+              status updates) or its " +
+              "executor has been marked as failed.")
+                .format(state, tid))
+        }
+      } catch {
+        case e: Exception => logError("Exception in statusUpdate", e)
+      }
+    }
+    // 更新DAG调度器,不使用锁,可能会导致死锁
+    if (failedExecutor.isDefined) {
+      assert(reason.isDefined)
+      dagScheduler.executorLost(failedExecutor.get, reason.get)
+      backend.reviveOffers()
+    }
+    
+    def executorHeartbeatReceived(
+      execId: String,
+      accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
+      blockManagerId: BlockManagerId,
+      executorUpdates: mutable.Map[(Int, Int), ExecutorMetrics]): Boolean
+    功能: 执行器心跳接受
+    1. 获取更新累加器四元组 (taskId, stageId, stageAttemptId, accumUpdates)
+    val accumUpdatesWithTaskIds: Array[(Long, Int, Int, Seq[AccumulableInfo])] = {
+      accumUpdates.flatMap { case (id, updates) =>
+        val accInfos = updates.map(acc => acc.toInfo(Some(acc.value), None))
+        Option(taskIdToTaskSetManager.get(id)).map { taskSetMgr =>
+          (id, taskSetMgr.stageId, taskSetMgr.taskSet.stageAttemptId, accInfos)
+        }
+      }
+    }
+    2. 执行器调度器接受心跳信息
+    dagScheduler.executorHeartbeatReceived(
+        execId, accumUpdatesWithTaskIds, blockManagerId,executorUpdates)
+    
+    def handleTaskGettingResult(taskSetManager: TaskSetManager, tid: Long): Unit
+    功能: 处理任务获取结果
+    taskSetManager.handleTaskGettingResult(tid)
+    
+    def handleSuccessfulTask(
+      taskSetManager: TaskSetManager,
+      tid: Long,
+      taskResult: DirectTaskResult[_]): Unit
+    功能: 处理执行成功的任务
+    synchronized {
+        taskSetManager.handleSuccessfulTask(tid, taskResult)
+      }
+    
+    def handleFailedTask(
+      taskSetManager: TaskSetManager,
+      tid: Long,
+      taskState: TaskState,
+      reason: TaskFailedReason): Unit
+    功能: 处理失败的任务
+    synchronized {
+        taskSetManager.handleFailedTask(tid, taskState, reason)
+        // 恢复成功申请且没有被设置为僵尸任务的任务
+        if (!taskSetManager.isZombie && !taskSetManager.someAttemptSucceeded(tid)) {
+          backend.reviveOffers()
+    	}
+    }
+    
+    def handlePartitionCompleted(stageId: Int, partitionId: Int)
+    功能: 处理指定分区完成情况
+    synchronized {
+    taskSetsByStageIdAndAttempt.get(stageId).foreach(
+        _.values.filter(!_.isZombie).foreach { tsm =>
+          tsm.markPartitionCompleted(partitionId)
+        })
+      }
+    
+    def error(message: String): Unit
+    功能: 错误信息处理
+    
+    def stop(): Unit
+    功能: 停止任务调度器
+    1. 停止推测调度器
+    speculationScheduler.shutdown()
+    2. 停止调度器后台
+    if (backend != null) {
+      backend.stop()
+    }
+    3. 获取任务结果获取器
+    if (taskResultGetter != null) {
+      taskResultGetter.stop()
+    }
+    4. 获取屏蔽协调者
+    if (barrierCoordinator != null) {
+      barrierCoordinator.stop()
+    }
+    5. 重置计时器
+    starvationTimer.cancel()
+    abortTimer.cancel()
+    
+    def defaultParallelism(): Int = backend.defaultParallelism()
+    功能: 获取默认并行度
+    
+    def checkSpeculatableTasks(): Unit
+    功能: 检查推测任务
+    var shouldRevive = false
+    synchronized {
+      shouldRevive = rootPool.checkSpeculatableTasks(MIN_TIME_TO_SPECULATION)
+    }
+    if (shouldRevive) {
+      backend.reviveOffers()
+    }
+    
+    def executorLost(executorId: String, reason: ExecutorLossReason): Unit
+    功能: 标记指定执行器@executorId 丢失
+    1. 设置记录失败执行器的数据结构
+    var failedExecutor: Option[String] = None
+    2. 标记执行器丢失 
+    synchronized {
+      if (executorIdToRunningTaskIds.contains(executorId)) {
+        val hostPort = executorIdToHost(executorId)
+        logExecutorLoss(executorId, hostPort, reason)
+        removeExecutor(executorId, reason)
+        failedExecutor = Some(executorId)
+      } else {
+        executorIdToHost.get(executorId) match {
+          case Some(hostPort) =>
+            logExecutorLoss(executorId, hostPort, reason)
+            removeExecutor(executorId, reason)
+          case None =>
+            logError(s"Lost an executor $executorId (already removed): $reason")
+        }
+      }
+    }
+    3. DAG调度器标记执行器丢失
+    if (failedExecutor.isDefined) {
+      dagScheduler.executorLost(failedExecutor.get, reason)
+      backend.reviveOffers()
+    }
+    
+    def workerRemoved(workerId: String, host: String, message: String): Unit
+    功能: 移除指定worker
+    logInfo(s"Handle removed worker $workerId: $message")
+    dagScheduler.workerRemoved(workerId, host, message)
+    
+    def logExecutorLoss(
+      executorId: String,
+      hostPort: String,
+      reason: ExecutorLossReason): Unit
+    功能: 记录执行器丢失
+    reason match {
+        case LossReasonPending => // 原因待定
+          logDebug(s"Executor $executorId on $hostPort lost, but reason not yet known.")
+        case ExecutorKilled => // 中断
+          logInfo(s"Executor $executorId on $hostPort killed by driver.")
+        case _ =>
+          logError(s"Lost executor $executorId on $hostPort: $reason")
+      }
+    
+    def cleanupTaskState(tid: Long): Unit
+    功能: 清除任务状态
+    taskIdToTaskSetManager.remove(tid)
+    taskIdToExecutorId.remove(tid).foreach { executorId =>
+      executorIdToRunningTaskIds.get(executorId).foreach { _.remove(tid) }
+    }
+    
+    def removeExecutor(executorId: String, reason: ExecutorLossReason): Unit
+    功能: 移除指定执行器
+    1. 从运行任务映射表中移除指定执行器的条目
+    executorIdToRunningTaskIds.remove(executorId).foreach { taskIds =>
+      logDebug("Cleaning up TaskScheduler state for tasks " +
+        s"${taskIds.mkString("[", ",", "]")} on failed executor $executorId")
+      taskIds.foreach(cleanupTaskState)
+    }
+    2. 从执行器所属主机上移除执行器条目,若是为空,则从机架上移除这个节点
+    val host = executorIdToHost(executorId)
+    val execs = hostToExecutors.getOrElse(host, new HashSet)
+    execs -= executorId
+    if (execs.isEmpty) {
+      hostToExecutors -= host
+      for (rack <- getRackForHost(host); hosts <- hostsByRack.get(rack)) {
+        hosts -= host
+        if (hosts.isEmpty) {
+          hostsByRack -= rack
+        }
+      }
+    }
+    3. 汇报执行器丢失
+    if (reason != LossReasonPending) {
+      executorIdToHost -= executorId
+      rootPool.executorLost(executorId, host, reason)
+    }
+    4. 从黑名单追踪器上移除这个执行器
+    blacklistTrackerOpt.foreach(_.handleRemovedExecutor(executorId))
+    
+    def executorAdded(execId: String, host: String): Unit
+    功能: 添加执行器
+    dagScheduler.executorAdded(execId, host)
+    
+    def getExecutorsAliveOnHost(host: String): Option[Set[String]] 
+    功能: 获取主机上存活的执行器
+    val= synchronized {
+        hostToExecutors.get(host).map(_.toSet)
+      }
+    
+    def hasExecutorsAliveOnHost(host: String): Boolean
+    功能: 确定主机上是否有存活的执行器
+    synchronized {
+        hostToExecutors.contains(host)
+      }
+    
+    def hasHostAliveOnRack(rack: String): Boolean
+    功能: 确定机架上是否存在存活的主机
+    val= synchronized {
+        hostsByRack.contains(rack)
+      }
+    
+    def isExecutorAlive(execId: String): Boolean 
+    功能: 确定当前执行器是否存活
+    val= synchronized { executorIdToRunningTaskIds.contains(execId) }
+    
+    def isExecutorBusy(execId: String): Boolean
+    功能: 确定当前执行器是否处于繁忙状态
+    val= synchronized {
+        executorIdToRunningTaskIds.get(execId).exists(_.nonEmpty)
+      }
+    
+    def applicationId(): String = backend.applicationId()
+    功能: 获取应用编号
+    
+    def applicationAttemptId(): Option[String] = backend.applicationAttemptId()
+    功能: 获取任务请求编号
+    
+    def taskSetManagerForAttempt(
+      stageId: Int,
+      stageAttemptId: Int): Option[TaskSetManager]
+    功能: 获取指定stage的指定请求的任务集管理器,测试使用
+    val= synchronized {
+        for {
+          attempts <- taskSetsByStageIdAndAttempt.get(stageId)
+          manager <- attempts.get(stageAttemptId)
+        } yield {
+          manager
+        }
+      }
+    
+    def resourceOffers(offers: IndexedSeq[WorkerOffer]): Seq[Seq[TaskDescription]] 
+    功能: 获取任务描述表
+    输入: 
+    	offers	可使用的资源列表
+    返回:
+    	任务描述表
+    1. 注册可以资源的信息到各个信息映射表中
+    var newExecAvail = false
+    for (o <- offers) {
+      if (!hostToExecutors.contains(o.host)) {
+        hostToExecutors(o.host) = new HashSet[String]()
+      }
+      if (!executorIdToRunningTaskIds.contains(o.executorId)) {
+        hostToExecutors(o.host) += o.executorId
+        executorAdded(o.executorId, o.host)
+        executorIdToHost(o.executorId) = o.host
+        executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
+        newExecAvail = true
+      }
+    }
+    val hosts = offers.map(_.host).toSet.toSeq
+    // 注册主机机架信息表
+    for ((host, Some(rack)) <- hosts.zip(getRacksForHosts(hosts))) {
+      hostsByRack.getOrElseUpdate(rack, new HashSet[String]()) += host
+    }
+    2. 在进行空闲资源分配之前,需要移除黑名单中的执行器或者节点,并进行过滤
+    blacklistTrackerOpt.foreach(_.applyBlacklistTimeout())
+    val filteredOffers = blacklistTrackerOpt.map { blacklistTracker =>
+      offers.filter { offer =>
+        !blacklistTracker.isNodeBlacklisted(offer.host) &&
+          !blacklistTracker.isExecutorBlacklisted(offer.executorId)
+      }
+    }.getOrElse(offers)
+    3. 获取shuffleOffer
+    val shuffledOffers = shuffleOffers(filteredOffers)
+    4. 获取任务及任务分配的资源
+    val tasks = shuffledOffers.map(o => new ArrayBuffer[TaskDescription](
+        o.cores / CPUS_PER_TASK))
+    val availableResources = shuffledOffers.map(_.resources).toArray
+    val availableCpus = shuffledOffers.map(o => o.cores).toArray
+    val sortedTaskSets = rootPool.getSortedTaskSetQueue
+    5. 新建执行器
+    for (taskSet <- sortedTaskSets) {
+      logDebug("parentName: %s, name: %s, runningTasks: %s".format(
+        taskSet.parent.name, taskSet.name, taskSet.runningTasks))
+      if (newExecAvail) {
+        taskSet.executorAdded()
+      }
+    }
+    6. 按照调度顺序将每个任务集加入,然后按照位置升序的顺序排序,以便于可以运行本地任务去运行.
+    	注意: 优先位置为@PROCESS_LOCAL 本地进程 > @NODE_LOCAL 本地节点
+    	> @NO_PREF 无最优位置 > @RACK_LOCAL 本地机架 > ANY 任意
+    for (taskSet <- sortedTaskSets) {
+      val availableSlots = availableCpus.map(c => c / CPUS_PER_TASK).sum
+      if (taskSet.isBarrier && availableSlots < taskSet.numTasks) {
+        logInfo(s"Skip current round of resource o
+        ffers for barrier stage ${taskSet.stageId} " +
+          s"because the barrier taskSet requires ${taskSet.numTasks} 
+          slots, while the total " +
+          s"number of available slots is $availableSlots.")
+      } else {
+        var launchedAnyTask = false
+        val addressesWithDescs = ArrayBuffer[(String, TaskDescription)]()
+        for (currentMaxLocality <- taskSet.myLocalityLevels) {
+          var launchedTaskAtCurrentMaxLocality = false
+          do {
+            launchedTaskAtCurrentMaxLocality = resourceOfferSingleTaskSet(taskSet,
+              currentMaxLocality, shuffledOffers, availableCpus,
+              availableResources, tasks, addressesWithDescs)
+            launchedAnyTask |= launchedTaskAtCurrentMaxLocality
+          } while (launchedTaskAtCurrentMaxLocality)
+        }
+
+        if (!launchedAnyTask) {
+          taskSet.getCompletelyBlacklistedTaskIfAny(hostToExecutors).foreach { taskIndex 				=>
+              executorIdToRunningTaskIds.find(x => !isExecutorBusy(x._1)) match {
+                case Some ((executorId, _)) =>
+                  if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) {
+                    blacklistTrackerOpt.foreach(blt => blt.killBlacklistedIdleExecutor(executorId))
+                    val timeout = conf.get(config.UNSCHEDULABLE_TASKSET_TIMEOUT) * 1000
+                    unschedulableTaskSetToExpiryTime(taskSet) = 
+                      clock.getTimeMillis() + timeout
+                    logInfo(s"Waiting for $timeout ms for completely "
+                      + s"blacklisted task to be schedulable 
+                      again before aborting $taskSet.")
+                    abortTimer.schedule(
+                      createUnschedulableTaskSetAbortTimer(taskSet, taskIndex), timeout)
+                  }
+                case None => // Abort Immediately
+                  logInfo("Cannot schedule any task because 
+                  of complete blacklisting. No idle" +
+                    s" executors can be found to kill. Aborting $taskSet." )
+                  taskSet.abortSinceCompletelyBlacklisted(taskIndex)
+              }
+          }
+        } else {
+          if (unschedulableTaskSetToExpiryTime.nonEmpty) {
+            logInfo("Clearing the expiry times for all unschedulable 
+            taskSets as a task was " +
+            "recently scheduled.")
+            unschedulableTaskSetToExpiryTime.clear()
+          }
+        }
+
+        if (launchedAnyTask && taskSet.isBarrier) {
+          require(addressesWithDescs.size == taskSet.numTasks,
+            s"Skip current round of resource offers for 
+            barrier stage ${taskSet.stageId} " +
+              s"because only ${addressesWithDescs.size} out of a total number of " +
+              s"${taskSet.numTasks} tasks got resource offers. 
+              The resource offers may have " +
+              "been blacklisted or cannot fulfill task locality requirements.")
+          maybeInitBarrierCoordinator()
+          val addressesStr = addressesWithDescs
+            .sortBy(_._2.partitionId)
+            .map(_._1)
+            .mkString(",")
+          addressesWithDescs.foreach(_._2.properties.setProperty(
+              "addresses", addressesStr))
+          logInfo(s"Successfully scheduled all the ${addressesWithDescs.size} 
+          tasks for barrier " +
+          s"stage ${taskSet.stageId}.")
+        }
+      }
+    }
+    
+}
+```
+
+```scala
+private[spark] object TaskSchedulerImpl {
+    属性:
+    #name @SCHEDULER_MODE_PROPERTY = SCHEDULER_MODE.key	调度模式属性
+    操作集：
+    def maybeCreateBlacklistTracker(sc: SparkContext): Option[BlacklistTracker]
+    功能: 创建可能的黑名单追踪器
+    val= if (BlacklistTracker.isBlacklistEnabled(sc.conf)) {
+      val executorAllocClient: Option[ExecutorAllocationClient] = sc.schedulerBackend
+        match {
+            case b: ExecutorAllocationClient => Some(b)
+            case _ => None
+          }
+          Some(new BlacklistTracker(sc, executorAllocClient))
+        } else {
+          None
+    }
+    
+    def prioritizeContainers[K, T] (map: HashMap[K, ArrayBuffer[T]]): List[T]
+    功能: 容器优先化
+    接受一个主机-->资源列表映射的map,返回一个优先列表,按照使用空间大小排序.之所以这样排序是可以避免分配下一个节点的容器.如果节点宕机,可以减少伤害返回
+    例如:
+    @literal <h1, [o1, o2, o3]> @literal <h2, [o4]> @literal <h3, [o5, o6]>
+    返回 @literal [o1, o5, o4, o2, o6, o3]
+    val _keyList = new ArrayBuffer[K](map.size)
+    _keyList ++= map.keys
+    val keyList = _keyList.sortWith(
+      (left, right) => map(left).size > map(right).size
+    )
+    val retval = new ArrayBuffer[T](keyList.size * 2)
+    var index = 0
+    var found = true
+    while (found) {
+      found = false
+      for (key <- keyList) {
+        val containerList: ArrayBuffer[T] = map.getOrElse(key, null)
+        assert(containerList != null)
+        if (index < containerList.size) {
+          retval += containerList.apply(index)
+          found = true
+        }
+      }
+      index += 1
+    }
+    retval.toList
+}
+```
+
 #### TaskSet
 
 ```scala
@@ -5754,16 +6529,980 @@ private[scheduler] class TaskSetBlacklist(
     val= conf.get(config.MAX_FAILURES_PER_EXEC_STAGE)
     #name @MAX_FAILED_EXEC_PER_NODE_STAGE	带个节点stage最大失败次数
     val=conf.get(config.MAX_FAILED_EXEC_PER_NODE_STAGE)
+    #name @nodeToExecsWithFailures = new HashMap[String, HashSet[String]]()	节点失败映射表
+    #name @nodeToBlacklistedTaskIndexes = new HashMap[String, HashSet[Int]]()
+    	节点黑名单任务索引映射表
+    #name @blacklistedExecs = new HashSet[String]()	黑名单执行器列表
+    #name @blacklistedNodes = new HashSet[String]()	黑名单节点列表
+    #name @latestFailureReason: String = null	上一次失败原因
+    操作集:
+    def getLatestFailureReason: String = latestFailureReason
+    功能: 获取最新的失败原因
+    
+    def isNodeBlacklistedForTask(node: String, index: Int): Boolean
+    功能: 确定节点是否对于任务时黑名单状态
+    val= nodeToBlacklistedTaskIndexes.get(node).exists(_.contains(index))
+    
+    def isExecutorBlacklistedForTask(executorId: String, index: Int): Boolean
+    功能: 确定执行器是否对于当前任务处于黑名单状态
+    val= execToFailures.get(executorId).exists { execFailures =>
+      execFailures.getNumTaskFailures(index) >= MAX_TASK_ATTEMPTS_PER_EXECUTOR
+    }
+    
+    def isExecutorBlacklistedForTaskSet(executorId: String): Boolean
+    功能: 确定执行器对任务集是否是黑名单状态
+    val= blacklistedExecs.contains(executorId)
+    
+    def isNodeBlacklistedForTaskSet(node: String): Boolean
+    功能: 确定节点对于任务集是否处于黑名单状态
+    val= blacklistedNodes.contains(node)
+    
+    def updateBlacklistForFailedTask(
+      host: String,
+      exec: String,
+      index: Int,
+      failureReason: String): Unit
+    功能: 更新失败任务的数据块信息
+    1. 更新执行器失败情况
+    val execFailures = execToFailures.getOrElseUpdate(
+        exec, new ExecutorFailuresInTaskSet(host))
+    execFailures.updateWithFailure(index, clock.getTimeMillis())
+    2. 获取节点上的执行器失败信息
+    val execsWithFailuresOnNode = nodeToExecsWithFailures.getOrElseUpdate(
+        host, new HashSet())
+    execsWithFailuresOnNode += exec
+    3. 获取主机上的失败信息
+    val failuresOnHost = execsWithFailuresOnNode.toIterator.flatMap { exec =>
+      execToFailures.get(exec).map { failures =>
+        failures.getNumTaskFailures(index)
+      }
+    }.sum
+    if (failuresOnHost >= MAX_TASK_ATTEMPTS_PER_NODE) {
+      nodeToBlacklistedTaskIndexes.getOrElseUpdate(host, new HashSet()) += index
+    }
+    4. 获取失败次数
+    val numFailures = execFailures.numUniqueTasksWithFailures
+    if (numFailures >= MAX_FAILURES_PER_EXEC_STAGE) {
+      if (blacklistedExecs.add(exec)) {
+        logInfo(s"Blacklisting executor ${exec} for stage $stageId")
+        val blacklistedExecutorsOnNode =
+          execsWithFailuresOnNode.filter(blacklistedExecs.contains(_))
+        val now = clock.getTimeMillis()
+        listenerBus.post(
+          SparkListenerExecutorBlacklistedForStage(
+              now, exec, numFailures, stageId, stageAttemptId))
+        val numFailExec = blacklistedExecutorsOnNode.size
+        if (numFailExec >= MAX_FAILED_EXEC_PER_NODE_STAGE) {
+          if (blacklistedNodes.add(host)) {
+            logInfo(s"Blacklisting ${host} for stage $stageId")
+            listenerBus.post(
+              SparkListenerNodeBlacklistedForStage(
+                  now, host, numFailExec, stageId, stageAttemptId))
+          }
+        }
+      }
+    }
+}
+```
+
+#### TaskSetManager
+
+```markdown
+在@TaskSchedulerImpl 中使用单个任务集进行任务调度.这个类保证了对每个任务的追踪,如果失败的时候进行重试,且对任务集进行位置感应调度(通过调度延时).主要接口是@resourceOffer,询问任务集是否在一个节点上运行任务且处理成功任务/处理失败任务.
+注意: 这个类需要使用@TaskScheduler 加锁进行访问，不能被其他线程访问。
+构造器参数:
+	sched	任务集管理器对应的任务调度器@TaskSchedulerImpl
+	taskSet	管理器调度的任务集
+	maxTaskFailures	最大任务失败次数
+```
+
+```scala
+private[spark] class TaskSetManager(
+    sched: TaskSchedulerImpl,
+    val taskSet: TaskSet,
+    val maxTaskFailures: Int,
+    blacklistTracker: Option[BlacklistTracker] = None,
+    clock: Clock = new SystemClock()) extends Schedulable with Logging {
+    属性:
+    #name @conf = sched.sc.conf	spark配置
+    #name @addedJars = HashMap[String, Long](sched.sc.addedJars.toSeq: _*)	添加jar包表
+    #name @addedFiles = HashMap[String, Long](sched.sc.addedFiles.toSeq: _*) 添加文件表
+    #name @maxResultSize = conf.get(config.MAX_RESULT_SIZE)	最大结果大小
+    #name @env = SparkEnv.get	spark环境
+    #name @ser = env.closureSerializer.newInstance()	序列化实例
+    #name @tasks = taskSet.tasks	任务集任务列表
+    #name @partitionToIndex	分区-->任务索引映射表
+    val= tasks.zipWithIndex
+    .map { case (t, idx) => t.partitionId -> idx }.toMap
+    #name @numTasks = tasks.length	任务数量
+    #name @copiesRunning = new Array[Int](numTasks)	运行副本?
+    #name @speculationEnabled = conf.get(SPECULATION_ENABLED)	是否允许推测执行
+    #name @speculationQuantile = conf.get(SPECULATION_QUANTILE)	推测执行分位点
+    #name @speculationMultiplier = conf.get(SPECULATION_MULTIPLIER)	推测乘法器
+    #name @minFinishedForSpeculation	推测执行最小截止点
+    val=math.max((speculationQuantile * numTasks).floor.toInt, 1)
+    #name @speculationTaskDurationThresOpt	推测任务容器(无论是否到达分位点)
+    val=  conf.get(SPECULATION_TASK_DURATION_THRESHOLD)
+    #name @speculationTasksLessEqToSlots	推测任务数量是否小于等于槽数
+    val= numTasks <= (conf.get(EXECUTOR_CORES) / sched.CPUS_PER_TASK)
+    	在满足条件的情况下,如果不长于给定指定周期,任务管理器会开启推测执行.
+    	在这种情况下,不能过于激进的使用推测执行.但是需要处理一些基本情景.
+    #name @successful = new Array[Boolean](numTasks)	任务执行成功状态列表
+    #name @numFailures = new Array[Int](numTasks)	任务失败次数列表
+    #name @killedByOtherAttempt = new HashSet[Long]	由于其他请求被kill的任务id列表
+    #name @taskAttempts = Array.fill[List[TaskInfo]](numTasks)(Nil)	任务请求列表
+    #name @tasksSuccessful = 0	任务成功数量
+    #name @weight = 1	权重
+    #name @minShare = 0	最小共享次数
+    #name @priority = taskSet.priority	优先级
+    #name @stageId = taskSet.stageId	stage编号
+    #name @name = "TaskSet_" + taskSet.id	任务名称
+    #name @parent: Pool = null	父调度池
+    #name @totalResultSize = 0L	合计结果大小
+    #name @calculatedTasks = 0	已计算的任务数量
+    #name @runningTasksSet = new HashSet[Long]	运行中的任务集
+    #name @taskSetBlacklistHelperOpt: Option[TaskSetBlacklist]	任务集黑名单
+    val= blacklistTracker.map { _ =>
+          new TaskSetBlacklist(sched.sc.listenerBus, conf, stageId,
+                               taskSet.stageAttemptId, clock)
+        }
+    #name @isZombie = false	是否为僵尸任务集(没有可以运行的任务集)
+  	#name @pendingTasks = new PendingTasksByLocality()	待定任务列表
+    #name @speculatableTasks = new HashSet[Int]	推测任务表
+    #name @pendingSpeculatableTasks = new PendingTasksByLocality()	待定推测任务表
+    #name @taskInfos = new HashMap[Long, TaskInfo]	任务信息映射表(taskId-> TaskInfo)
+    #name @successfulTaskDurations = new MedianHeap()	成功执行任务时间
+    	设置为可以获取中位数的堆,只有当开启推测执行时才能使用
+    #name @EXCEPTION_PRINT_INTERVAL	异常打印时间间隔
+    val= conf.getLong("spark.logging.exceptionPrintInterval", 10000)
+    #name @recentExceptions = HashMap[String, (Int, Long)]()	最近异常列表
+    #name @epoch = sched.mapOutputTracker.getEpoch	mapout定位器所处的位置
+    #name @myLocalityLevels = computeValidLocalityLevels()	当前位置等级
+    #name @localityWaits = myLocalityLevels.map(getLocalityWait)	位置等待信息表
+    #name @currentLocalityIndex = 0	当前位置等级索引
+    #name @lastLaunchTime = clock.getTimeMillis() 	最新运行时间
+    #name @emittedTaskSizeWarning = false	是否发出任务大小的warning信息
+    初始化操作:
+    for (t <- tasks) {
+        t.epoch = epoch
+    }
+    功能: 设置每个任务的定位位置
+    
+    addPendingTasks()
+    功能: 添加所有任务到待定任务中
+    
+    操作集:
+    def runningTasks: Int = runningTasksSet.size
+    功能: 获取正在运行的任务数量
+    
+    def someAttemptSucceeded(tid: Long): Boolean
+    功能: 获取指定任务@tid 的执行成功状态
+    val= successful(taskInfos(tid).index)
+    
+    def isBarrier = taskSet.tasks.nonEmpty && taskSet.tasks(0).isBarrier
+    功能: 确定是否为屏蔽执行
+    
+    def addPendingTasks(): Unit
+    功能: 添加待定任务(按照taskId 倒序,以便以编号小的可以优先运行)
+    val (_, duration) = Utils.timeTakenMs {
+      for (i <- (0 until numTasks).reverse) {
+        addPendingTask(i, resolveRacks = false)
+      }
+      val (hosts, indicesForHosts) = pendingTasks.forHost.toSeq.unzip
+      val racks = sched.getRacksForHosts(hosts)
+      racks.zip(indicesForHosts).foreach {
+        case (Some(rack), indices) => // 更新机架信息
+          pendingTasks.forRack.getOrElseUpdate(rack, new ArrayBuffer) ++= indices
+        case (None, _) => // no rack, nothing to do
+      }
+    }
+    
+    def schedulableQueue: ConcurrentLinkedQueue[Schedulable] = null
+    功能: 获取调度队列
+    
+    def schedulingMode: SchedulingMode = SchedulingMode.NONE
+    功能: 获取调度模式
+    
+    def addPendingTask(
+      index: Int,
+      resolveRacks: Boolean = true,
+      speculatable: Boolean = false): Unit 
+    功能: 添加一个任务到待定任务列表中
+    1. 确定待定任务列表类型
+    val pendingTaskSetToAddTo = 
+    	if (speculatable) pendingSpeculatableTasks else pendingTasks
+    2. 确定任务需要放置的最佳位置
+    for (loc <- tasks(index).preferredLocations) {
+      loc match {
+        case e: ExecutorCacheTaskLocation =>
+          pendingTaskSetToAddTo.forExecutor.getOrElseUpdate(
+              e.executorId, new ArrayBuffer) += index
+        case e: HDFSCacheTaskLocation =>
+          val exe = sched.getExecutorsAliveOnHost(loc.host)
+          exe match {
+            case Some(set) =>
+              for (e <- set) {
+                pendingTaskSetToAddTo.forExecutor.getOrElseUpdate(
+                    e, new ArrayBuffer) += index
+              }
+              logInfo(s"Pending task $index has a cached location at ${e.host} " +
+                ", where there are executors " + set.mkString(","))
+            case None => logDebug(s"Pending task $index has a cached 
+            location at ${e.host} " +
+              ", but there are no executors alive there.")
+          }
+        case _ =>
+      }
+      // 更新主机和机架的任务信息映射表
+      pendingTaskSetToAddTo.forHost.getOrElseUpdate(loc.host, new ArrayBuffer) += index
+      if (resolveRacks) {
+        sched.getRackForHost(loc.host).foreach { rack =>
+          pendingTaskSetToAddTo.forRack.getOrElseUpdate(rack, new ArrayBuffer) += index
+        }
+      }
+    }
+    3. 缺省处理(无最佳位置)
+    if (tasks(index).preferredLocations == Nil) {
+      pendingTaskSetToAddTo.noPrefs += index
+    }
+    pendingTaskSetToAddTo.all += index
+    
+    def dequeueTaskFromList(
+      execId: String,
+      host: String,
+      list: ArrayBuffer[Int],
+      speculative: Boolean = false): Option[Int]
+    功能: 将一个任务从待定任务列表中出列,并返回任务编号
+    var indexOffset = list.size
+    1. 找到最后一个可以出列的元素,出列
+    while (indexOffset > 0) {
+      indexOffset -= 1
+      val index = list(indexOffset)
+      if (!isTaskBlacklistedOnExecOrNode(index, execId, host) &&
+          !(speculative && hasAttemptOnHost(index, host))) {
+        list.remove(indexOffset)
+        if (!successful(index)) {
+          if (copiesRunning(index) == 0) {
+            return Some(index)
+          } else if (speculative && copiesRunning(index) == 1) {
+            return Some(index)
+          }
+        }
+      }
+    }
+    2. 缺省处理
+    val= None
+    
+    def hasAttemptOnHost(taskIndex: Int, host: String): Boolean 
+    功能: 确定指定任务@taskIndex是否可以运行在指定@host上
+    val= taskAttempts(taskIndex).exists(_.host == host)
+    
+    def isTaskBlacklistedOnExecOrNode(index: Int, execId: String, host: String): Boolean
+    功能: 确定任务在指定执行器或者节点上是否处于黑名单状态
+    val= taskSetBlacklistHelperOpt.exists { blacklist =>
+      blacklist.isNodeBlacklistedForTask(host, index) ||
+        blacklist.isExecutorBlacklistedForTask(execId, index)
+    }
+    
+    def dequeueTask(
+      execId: String,
+      host: String,
+      maxLocality: TaskLocality.Value): Option[(Int, TaskLocality.Value, Boolean)] 
+    功能: 对于一个指定节点,出队一个待定任务,返回任务编号和位置等级信息及是否为推测执行
+    val= dequeueTaskHelper(execId, host, maxLocality, false).orElse(
+      dequeueTaskHelper(execId, host, maxLocality, true))
+    
+    def dequeueTaskHelper(
+      execId: String,
+      host: String,
+      maxLocality: TaskLocality.Value,
+      speculative: Boolean): Option[(Int, TaskLocality.Value, Boolean)]
+    功能: 出队任务辅助器
+    if (speculative && speculatableTasks.isEmpty) {
+      return None
+    }
+    // 首先处理,当前进程的出队情况
+    val pendingTaskSetToUse = if (speculative) pendingSpeculatableTasks else pendingTasks
+    def dequeue(list: ArrayBuffer[Int]): Option[Int] = {
+      val task = dequeueTaskFromList(execId, host, list, speculative)
+      if (speculative && task.isDefined) {
+        speculatableTasks -= task.get
+      }
+      task
+    }
+    dequeue(pendingTaskSetToUse.forExecutor.getOrElse(execId, ArrayBuffer())).foreach
+    { index =>
+      return Some((index, TaskLocality.PROCESS_LOCAL, speculative))
+    }
+     // 本节点出队情况
+    if (TaskLocality.isAllowed(maxLocality, TaskLocality.NODE_LOCAL)) {
+      dequeue(pendingTaskSetToUse.forHost.getOrElse(host, ArrayBuffer())).foreach { 
+          index =>
+        return Some((index, TaskLocality.NODE_LOCAL, speculative))
+      }
+    }
+    // 无偏好出队情况
+    if (TaskLocality.isAllowed(maxLocality, TaskLocality.NO_PREF)) {
+      dequeue(pendingTaskSetToUse.noPrefs).foreach { index =>
+        return Some((index, TaskLocality.PROCESS_LOCAL, speculative))
+      }
+    }
+    // 本机架出队情况
+    if (TaskLocality.isAllowed(maxLocality, TaskLocality.RACK_LOCAL)) {
+      for {
+        rack <- sched.getRackForHost(host)
+        index <- dequeue(pendingTaskSetToUse.forRack.getOrElse(rack, ArrayBuffer()))
+      } {
+        return Some((index, TaskLocality.RACK_LOCAL, speculative))
+      }
+    }
+    // 其他位置出队情况
+    if (TaskLocality.isAllowed(maxLocality, TaskLocality.ANY)) {
+      dequeue(pendingTaskSetToUse.all).foreach { index =>
+        return Some((index, TaskLocality.ANY, speculative))
+      }
+    }
+    // 缺省
+    val= None
+    
+    def maybeFinishTaskSet(): Unit 
+    功能: 进行可能的结束任务集处理
+    if (isZombie && runningTasks == 0) {
+      sched.taskSetFinished(this)
+      if (tasksSuccessful == numTasks) {
+        blacklistTracker.foreach(_.updateBlacklistForSuccessfulTaskSet(
+          taskSet.stageId,
+          taskSet.stageAttemptId,
+          taskSetBlacklistHelperOpt.get.execToFailures))
+      }
+    }
+    
+    def tasksNeedToBeScheduledFrom(pendingTaskIds: ArrayBuffer[Int]): Boolean 
+    功能: 确认任务是否需要被重新调度
+    var indexOffset = pendingTaskIds.size
+      while (indexOffset > 0) {
+        indexOffset -= 1
+        val index = pendingTaskIds(indexOffset)
+        if (copiesRunning(index) == 0 && !successful(index)) {
+          return true
+        } else {
+          pendingTaskIds.remove(indexOffset)
+        }
+      }
+      val= false
+    
+    def moreTasksToRunIn(pendingTasks: HashMap[String, ArrayBuffer[Int]]): Boolean
+    功能: 是否需要运行更多的任务
+    遍历可以调度的任务列表,如果仍然有任务需要调度返回true。并使用懒加载的方式清除已经被调度的任务。
+    1. 确定是否有未调度的任务
+    val emptyKeys = new ArrayBuffer[String]
+      val hasTasks = pendingTasks.exists {
+        case (id: String, tasks: ArrayBuffer[Int]) =>
+          if (tasksNeedToBeScheduledFrom(tasks)) {
+            true
+          } else {
+            emptyKeys += id
+            false
+          }
+      }
+    2. 清除已经调度的任务
+    emptyKeys.foreach(id => pendingTasks.remove(id))
+    val= hasTasks
+    
+    def getAllowedLocalityLevel(curTime: Long): TaskLocality.TaskLocality
+    功能: 根据延时调度,获取运行任务的位置等级
+    while (currentLocalityIndex < myLocalityLevels.length - 1) {
+      // 获取需要新增的任务
+      val moreTasks = myLocalityLevels(currentLocalityIndex) match {
+        case TaskLocality.PROCESS_LOCAL => moreTasksToRunIn(pendingTasks.forExecutor)
+        case TaskLocality.NODE_LOCAL => moreTasksToRunIn(pendingTasks.forHost)
+        case TaskLocality.NO_PREF => pendingTasks.noPrefs.nonEmpty
+        case TaskLocality.RACK_LOCAL => moreTasksToRunIn(pendingTasks.forRack)
+      }
+      if (!moreTasks) { // 无新增处理方式,无任务则表明没有等待位置延时的必要
+        lastLaunchTime = curTime
+        logDebug(s"No tasks for locality level 
+        ${myLocalityLevels(currentLocalityIndex)}, " +
+        s"so moving to locality level ${myLocalityLevels(currentLocalityIndex + 1)}")
+        currentLocalityIndex += 1 // 位置指针移动
+      } else if (curTime - lastLaunchTime >= localityWaits(currentLocalityIndex)) {
+        lastLaunchTime += localityWaits(currentLocalityIndex) // 更新运行时间
+        logDebug(s"Moving to ${myLocalityLevels(currentLocalityIndex + 1)}
+        after waiting for " +
+        s"${localityWaits(currentLocalityIndex)}ms")
+        currentLocalityIndex += 1 // 移动位置指针
+      } else {
+        return myLocalityLevels(currentLocalityIndex)
+      }
+    }
+    val= myLocalityLevels(currentLocalityIndex) //获取最后一个的位置等级
+    
+    def getLocalityIndex(locality: TaskLocality.TaskLocality): Int
+    功能: 获取位置索引位置,使用顺序查找
+    对于给定@locality 找到在存储等级列表中的位置@myLocalityLevels
+    var index = 0
+    while (locality > myLocalityLevels(index)) {
+      index += 1
+    }
+    val= index
+    
+    def getCompletelyBlacklistedTaskIfAny(
+      hostToExecutors: HashMap[String, HashSet[String]]): Option[Int]
+    功能: 检查给定任务是否被设置了黑名单,以至于不可以再任何位置运行.在黑名单执行器数量小于最大失败次数的时候,最通用的方式是需要探测出这些,从而防止这些job被终止.尝试通过kill空载的黑名单执行器,从而获取新的执行器.
+    这里设置一个交换规则:
+    	确保所有任务都可以调度,但是会花费额外的时间,用于每个迭代器的调度环.这里假定,至少有一个不可调度的任务最终是可以调度的.这就意味着不能尽快的探测到终止信息,但是最终是可以探测到终止信息的,且方法快于传统方式.最差时间复杂度为O(maxTaskFailures + numTasks).但是,在无任何失败的情况下是更快的.
+    1. 对于黑名单列表进行处理
+    taskSetBlacklistHelperOpt.flatMap { taskSetBlacklist =>
+      val appBlacklist = blacklistTracker.get
+      if (hostToExecutors.nonEmpty) {
+        val pendingTask: Option[Int] = {
+          val indexOffset = pendingTasks.all.lastIndexWhere { indexInTaskSet =>
+            copiesRunning(indexInTaskSet) == 0 && !successful(indexInTaskSet)
+          }
+          if (indexOffset == -1) {
+            None
+          } else {
+            Some(pendingTasks.all(indexOffset))
+          }
+        }
+        pendingTask.find { indexInTaskSet =>
+          hostToExecutors.forall { case (host, execsOnHost) =>
+            val nodeBlacklisted =
+              appBlacklist.isNodeBlacklisted(host) ||
+                taskSetBlacklist.isNodeBlacklistedForTaskSet(host) ||
+                taskSetBlacklist.isNodeBlacklistedForTask(host, indexInTaskSet)
+            if (nodeBlacklisted) {
+              true
+            } else {
+              execsOnHost.forall { exec =>
+                appBlacklist.isExecutorBlacklisted(exec) ||
+                  taskSetBlacklist.isExecutorBlacklistedForTaskSet(exec) ||
+                  taskSetBlacklist.isExecutorBlacklistedForTask(exec, indexInTaskSet)
+              }
+            }
+          }
+        }
+      } else {
+        None
+      }
+    }
+    
+    def abortSinceCompletelyBlacklisted(indexInTaskSet: Int): Unit
+    功能: 抛弃黑名单任务集中指定的任务@indexInTaskSet
+    taskSetBlacklistHelperOpt.foreach { taskSetBlacklist =>
+      val partition = tasks(indexInTaskSet).partitionId
+      abort(s"""
+         |Aborting $taskSet because task $indexInTaskSet (partition $partition)
+         |cannot run anywhere due to node and executor blacklist.
+         |Most recent failure:
+         |${taskSetBlacklist.getLatestFailureReason}
+         |
+         |Blacklisting behavior can be configured via spark.blacklist.*.
+         |""".stripMargin)
+    }
+    
+    def handleTaskGettingResult(tid: Long): Unit
+    功能: 处理任务获取结果
+    1. 标记获取任务结果
+    val info = taskInfos(tid)
+    info.markGettingResult(clock.getTimeMillis())
+    2. 获取任务结果
+    sched.dagScheduler.taskGettingResult(info)
+    
+    def canFetchMoreResults(size: Long): Boolean
+    功能: 确认是否可以获取更多结果,大小为size
+    val= sched.synchronized {
+        totalResultSize += size
+        calculatedTasks += 1
+        if (maxResultSize > 0 && totalResultSize > maxResultSize) {
+          val msg = s"Total size of serialized results of ${calculatedTasks} tasks " +
+            s"(${Utils.bytesToString(totalResultSize)}) is bigger than 
+            ${config.MAX_RESULT_SIZE.key} " +
+            s"(${Utils.bytesToString(maxResultSize)})"
+          logError(msg)
+          abort(msg)
+          false
+        } else {
+          true
+        }
+      }
+    
+    def handleSuccessfulTask(tid: Long, result: DirectTaskResult[_]): Unit
+    功能: 标记任务成功执行,提示DAG调度器当前任务已经结束
+    1. 检查之前是否有执行成功但是没有进行处理的请求
+    val info = taskInfos(tid)
+    val index = info.index
+    if (successful(index) && killedByOtherAttempt.contains(tid)) {
+      calculatedTasks -= 1
+      val resultSizeAcc = result.accumUpdates.find(a =>
+        a.name == Some(InternalAccumulator.RESULT_SIZE))
+      if (resultSizeAcc.isDefined) {
+        totalResultSize -= resultSizeAcc.get.asInstanceOf[LongAccumulator].value
+      }
+      handleFailedTask(tid, TaskState.KILLED,
+        TaskKilled("Finish but did not commit due to another attempt succeeded"))
+      return
+    }
+    2. 标志当前任务结束,并移除当前任务
+    info.markFinished(TaskState.FINISHED, clock.getTimeMillis())
+    if (speculationEnabled) {
+      successfulTaskDurations.insert(info.duration)
+    }
+    removeRunningTask(tid)
+    3. 清除对于这个任务的其他请求
+    for (attemptInfo <- taskAttempts(index) if attemptInfo.running) {
+      logInfo(s"Killing attempt ${attemptInfo.attemptNumber} for task ${attemptInfo.id} " +
+        s"in stage ${taskSet.id} (TID ${attemptInfo.taskId}) on ${attemptInfo.host} " +
+        s"as the attempt ${info.attemptNumber} succeeded on ${info.host}")
+      killedByOtherAttempt += attemptInfo.taskId
+      sched.backend.killTask(
+        attemptInfo.taskId,
+        attemptInfo.executorId,
+        interruptThread = true,
+        reason = "another attempt succeeded")
+    }
+    4. 统计执行成功的任务数量
+    if (!successful(index)) {
+      tasksSuccessful += 1
+      logInfo(s"Finished task ${info.id} in stage 
+      ${taskSet.id} (TID ${info.taskId}) in" +
+        s" ${info.duration} ms on ${info.host} (executor ${info.executorId})" +
+        s" ($tasksSuccessful/$numTasks)")
+      successful(index) = true
+      if (tasksSuccessful == numTasks) {
+        isZombie = true
+      }
+    } else {
+      logInfo("Ignoring task-finished event for " + info.id + " in stage " + taskSet.id +
+        " because task " + index + " has already completed successfully")
+    }
+    5. DAG调度器标记任务结束
+    sched.dagScheduler.taskEnded(tasks(index), Success, result.value(),
+                                 result.accumUpdates,result.metricPeaks, info)
+    maybeFinishTaskSet()
+    
+    def markPartitionCompleted(partitionId: Int): Unit
+    功能: 标记分区执行完毕
+    partitionToIndex.get(partitionId).foreach { index =>
+      if (!successful(index)) {
+        tasksSuccessful += 1
+        successful(index) = true
+        if (tasksSuccessful == numTasks) {
+          isZombie = true
+        }
+        // 任务全部执行完毕则关闭
+        maybeFinishTaskSet()
+      }
+    }
+    
+    def abort(message: String, exception: Option[Throwable] = None): Unit 
+    功能: 发送抛弃信息
+    1. DAG调度器设置失败信息
+    sched.dagScheduler.taskSetFailed(taskSet, message, exception)
+    2. 标记为僵尸任务
+    isZombie = true
+    3. 进行可能的任务集清理
+    maybeFinishTaskSet()
+    
+    def addRunningTask(tid: Long): Unit 
+    功能: 添加任务到运行中任务列表
+    if (runningTasksSet.add(tid) && parent != null) {
+      parent.increaseRunningTasks(1)
+    }
+    
+    def removeRunningTask(tid: Long): Unit
+    功能: 移除指定运行任务
+    if (runningTasksSet.remove(tid) && parent != null) {
+      parent.decreaseRunningTasks(1)
+    }
+    
+    def getSchedulableByName(name: String): Schedulable = null
+    功能: 按照名称获取调度组件
+    
+    def addSchedulable(schedulable: Schedulable): Unit = {}
+    def removeSchedulable(schedulable: Schedulable): Unit = {}
+    功能: 添加/删除调度实例
+    
+    def getSortedTaskSetQueue(): ArrayBuffer[TaskSetManager]
+    功能: 获取排序完成的任务集队列
+    val sortedTaskSetQueue = new ArrayBuffer[TaskSetManager]()
+    sortedTaskSetQueue += this
+    val= sortedTaskSetQueue
+    
+    def handleFailedTask(tid: Long, state: TaskState, reason: TaskFailedReason): Unit
+    功能: 标记任务失败,将其重新添加到待定列表中,并提醒DAG调度器
+    1. 标记任务完成,并移除任务
+    val info = taskInfos(tid)
+    if (info.failed || info.killed) {
+      return
+    }
+    removeRunningTask(tid)
+    info.markFinished(state, clock.getTimeMillis())
+    2. 获取任务相关参数
+    val index = info.index
+    copiesRunning(index) -= 1
+    var accumUpdates: Seq[AccumulatorV2[_, _]] = Seq.empty
+    var metricPeaks: Array[Long] = Array.empty
+    val failureReason = s"Lost task ${info.id} in stage
+    ${taskSet.id} (TID $tid, ${info.host}," +
+      s" executor ${info.executorId}): ${reason.toErrorString}"
+    val failureException: Option[Throwable] = reason match {
+      case fetchFailed: FetchFailed =>
+        logWarning(failureReason)
+        if (!successful(index)) {
+          successful(index) = true
+          tasksSuccessful += 1
+        }
+        isZombie = true
+        if (fetchFailed.bmAddress != null) {
+          blacklistTracker.foreach(_.updateBlacklistForFetchFailure(
+            fetchFailed.bmAddress.host, fetchFailed.bmAddress.executorId))
+        }
+        None
+      case ef: ExceptionFailure =>
+        accumUpdates = ef.accums
+        metricPeaks = ef.metricPeaks.toArray
+        if (ef.className == classOf[NotSerializableException].getName) {
+          logError("Task %s in stage %s (TID %d) had a not
+          serializable result: %s; not retrying"
+            .format(info.id, taskSet.id, tid, ef.description))
+          abort("Task %s in stage %s (TID %d) had a not 
+          serializable result: %s".format(
+            info.id, taskSet.id, tid, ef.description))
+          return
+        }
+        if (ef.className == classOf[TaskOutputFileAlreadyExistException].getName) {
+          logError("Task %s in stage %s (TID %d) can not
+          write to output file: %s; not retrying"
+            .format(info.id, taskSet.id, tid, ef.description))
+          abort("Task %s in stage %s (TID %d) can not
+          write to output file: %s".format(
+            info.id, taskSet.id, tid, ef.description))
+          return
+        }
+        val key = ef.description
+        val now = clock.getTimeMillis()
+        val (printFull, dupCount) = {
+          if (recentExceptions.contains(key)) {
+            val (dupCount, printTime) = recentExceptions(key)
+            if (now - printTime > EXCEPTION_PRINT_INTERVAL) {
+              recentExceptions(key) = (0, now)
+              (true, 0)
+            } else {
+              recentExceptions(key) = (dupCount + 1, printTime)
+              (false, dupCount + 1)
+            }
+          } else {
+            recentExceptions(key) = (0, now)
+            (true, 0)
+          }
+        }
+        if (printFull) {
+          logWarning(failureReason)
+        } else {
+          logInfo(
+            s"Lost task ${info.id} in stage ${taskSet.id} 
+            (TID $tid) on ${info.host}, executor" +
+             s" ${info.executorId}: ${ef.className} 
+             (${ef.description}) [duplicate $dupCount]")
+        }
+        ef.exception
+      case tk: TaskKilled =>
+        accumUpdates = tk.accums
+        metricPeaks = tk.metricPeaks.toArray
+        logWarning(failureReason)
+        None
+      case e: ExecutorLostFailure if !e.exitCausedByApp =>
+        logInfo(s"Task $tid failed because while it was being computed, its executor " +
+          "exited for a reason unrelated to the task.
+          Not counting this failure towards the " +
+          "maximum number of failures for the task.")
+        None
+      case e: TaskFailedReason =>  // TaskResultLost and others
+        logWarning(failureReason)
+        None
+    }
+    3. DAG调度器标志任务结束
+    if (tasks(index).isBarrier) {
+      isZombie = true
+    }
+    sched.dagScheduler.taskEnded(tasks(index), reason, null, 
+                                 accumUpdates, metricPeaks, info)
+    4. 失败任务重试
+    if (!isZombie && reason.countTowardsTaskFailures) {
+      assert (null != failureReason)
+      taskSetBlacklistHelperOpt.foreach(_.updateBlacklistForFailedTask(
+        info.host, info.executorId, index, failureReason))
+      numFailures(index) += 1
+      if (numFailures(index) >= maxTaskFailures) {
+        logError("Task %d in stage %s failed %d times; aborting job".format(
+          index, taskSet.id, maxTaskFailures))
+        abort("Task %d in stage %s failed %d times, 
+        most recent failure: %s\nDriver stacktrace:"
+          .format(index, taskSet.id, maxTaskFailures, failureReason), failureException)
+        return
+      }
+    }
+    5. 将失败任务添加到待定列表
+    if (successful(index)) {
+      logInfo(s"Task ${info.id} in stage ${taskSet.id} (TID $tid) 
+      failed, but the task will not" +
+        s" be re-executed (either because the task failed with 
+        a shuffle data fetch failure," +
+        s" so the previous stage needs to be re-run, 
+        or because a different copy of the task" +
+        s" has already succeeded).")
+    } else {
+      addPendingTask(index)
+    }
+    6. 进行可能的清理工作
+    maybeFinishTaskSet()
+    
+    def executorLost(execId: String, host: String, reason: ExecutorLossReason): Unit
+    功能: 处理执行器丢失的问题
+    将允许再失效执行器的任务重新入队(如果是一个shuffle map 的stage且没有使用外部shuffle).原因是下一个stage无法获取这个死亡执行器上的数据.所以需要重新运行.
+    1. 失败任务重新入队(待定列表)
+    if (tasks(0).isInstanceOf[ShuffleMapTask] && !env.blockManager.externalShuffleServiceEnabled
+        && !isZombie) {
+      for ((tid, info) <- taskInfos if info.executorId == execId) {
+        val index = taskInfos(tid).index
+        if (successful(index) && !killedByOtherAttempt.contains(tid)) {
+          successful(index) = false
+          copiesRunning(index) -= 1
+          tasksSuccessful -= 1
+          addPendingTask(index)
+          sched.dagScheduler.taskEnded(
+            tasks(index), Resubmitted, null, Seq.empty, Array.empty, info)
+        }
+      }
+    }
+    2. 确定退出原因,并处理失败任务
+    for ((tid, info) <- taskInfos if info.running && info.executorId == execId) {
+      val exitCausedByApp: Boolean = reason match {
+        case exited: ExecutorExited => exited.exitCausedByApp
+        case ExecutorKilled => false
+        case _ => true
+      }
+      handleFailedTask(tid, TaskState.FAILED, ExecutorLostFailure(info.executorId, exitCausedByApp,
+        Some(reason.toString)))
+    }
+    3. 重新计算位置信息
+    recomputeLocality()
+    
+    def checkAndSubmitSpeculatableTask(
+      tid: Long,
+      currentTimeMillis: Long,
+      threshold: Double): Boolean
+    功能: 检查并提交推测任务
+    val info = taskInfos(tid)
+    val index = info.index
+    if (!successful(index) && copiesRunning(index) == 1 &&
+        info.timeRunning(currentTimeMillis) > threshold &&
+        !speculatableTasks.contains(index)) {
+      addPendingTask(index, speculatable = true)
+      logInfo(
+        ("Marking task %d in stage %s (on %s) as speculatable because it ran more" +
+          " than %.0f ms(%d speculatable tasks in this taskset now)")
+          .format(index, taskSet.id, info.host, threshold, speculatableTasks.size + 1))
+      speculatableTasks += index
+      sched.dagScheduler.speculativeTaskSubmitted(tasks(index))
+      true
+    } else {
+      false
+    }
+    
+    def checkSpeculatableTasks(minTimeToSpeculation: Int): Boolean
+    功能: 检查推测任务,如果有则返回true,有任务调度器@TaskScheduler 周期性调用
+    1. 初始化标志位
+    if (isZombie || isBarrier 
+        || (numTasks == 1 && !speculationTaskDurationThresOpt.isDefined)) {
+      	// 这几种情况下,不需要检查推测任务
+        return false
+    }
+    var foundTasks = false
+    2. 检测推测任务
+    val numSuccessfulTasks = successfulTaskDurations.size()
+    if (numSuccessfulTasks >= minFinishedForSpeculation) {
+      val time = clock.getTimeMillis()
+      val medianDuration = successfulTaskDurations.median
+      val threshold = max(speculationMultiplier * medianDuration, minTimeToSpeculation)
+
+      logDebug("Task length threshold for speculation: " + threshold)
+      for (tid <- runningTasksSet) {
+        foundTasks |= checkAndSubmitSpeculatableTask(tid, time, threshold)
+      }
+    } else if (speculationTaskDurationThresOpt.isDefined && speculationTasksLessEqToSlots) {
+      val time = clock.getTimeMillis()
+      val threshold = speculationTaskDurationThresOpt.get
+      logDebug(s"Tasks taking longer time than provided 
+      speculation threshold: $threshold")
+      for (tid <- runningTasksSet) {
+        foundTasks |= checkAndSubmitSpeculatableTask(tid, time, threshold)
+      }
+    }
+    val= foundTasks
+    
+    def getLocalityWait(level: TaskLocality.TaskLocality): Long
+    功能: 获取位置等待时间
+    1. 获取等待时间
+    val localityWait = level match {
+      case TaskLocality.PROCESS_LOCAL => config.LOCALITY_WAIT_PROCESS
+      case TaskLocality.NODE_LOCAL => config.LOCALITY_WAIT_NODE
+      case TaskLocality.RACK_LOCAL => config.LOCALITY_WAIT_RACK
+      case _ => null
+    }
+    val= if (localityWait != null) {
+      conf.get(localityWait)
+    } else {
+      0L
+    }
+    
+    def computeValidLocalityLevels(): Array[TaskLocality.TaskLocality]
+    功能: 计算有效位置等级
+    val levels = new ArrayBuffer[TaskLocality.TaskLocality]
+    if (!pendingTasks.forExecutor.isEmpty &&
+        pendingTasks.forExecutor.keySet.exists(sched.isExecutorAlive(_))) {
+      levels += PROCESS_LOCAL
+    }
+    if (!pendingTasks.forHost.isEmpty &&
+        pendingTasks.forHost.keySet.exists(sched.hasExecutorsAliveOnHost(_))) {
+      levels += NODE_LOCAL
+    }
+    if (!pendingTasks.noPrefs.isEmpty) {
+      levels += NO_PREF
+    }
+    if (!pendingTasks.forRack.isEmpty &&
+        pendingTasks.forRack.keySet.exists(sched.hasHostAliveOnRack(_))) {
+      levels += RACK_LOCAL
+    }
+    levels += ANY
+    logDebug("Valid locality levels for " + taskSet + ": " + levels.mkString(", "))
+    levels.toArray
+    
+    def recomputeLocality(): Unit
+    功能: 重新计算位置信息
+    val previousLocalityLevel = myLocalityLevels(currentLocalityIndex)
+    myLocalityLevels = computeValidLocalityLevels()
+    localityWaits = myLocalityLevels.map(getLocalityWait)
+    currentLocalityIndex = getLocalityIndex(previousLocalityLevel)
+    
+    def executorAdded(): Unit
+    功能: 添加执行器
+    recomputeLocality()
+    
+    @throws[TaskNotSerializableException]
+    def resourceOffer(
+        execId: String,
+        host: String,
+        maxLocality: TaskLocality.TaskLocality,
+        availableResources: Map[String, Seq[String]] = Map.empty)
+    : Option[TaskDescription]
+    功能: 调度器的执行器通过查找一个任务给与资源回应
+    输入参数:
+    	execId	资源执行器编号
+    	host	资源主机编号
+    	maxLocality	调度任务的最大位置
+    1. 获取黑名单信息
+    val offerBlacklisted = taskSetBlacklistHelperOpt.exists { blacklist =>
+      blacklist.isNodeBlacklistedForTaskSet(host) ||
+        blacklist.isExecutorBlacklistedForTaskSet(execId)
+    }
+    2. 获取分配的任务资源描述信息
+    if (!isZombie && !offerBlacklisted) {
+      val curTime = clock.getTimeMillis()
+      var allowedLocality = maxLocality
+      if (maxLocality != TaskLocality.NO_PREF) {
+        allowedLocality = getAllowedLocalityLevel(curTime)
+        if (allowedLocality > maxLocality) {
+          allowedLocality = maxLocality
+        }
+      }
+      dequeueTask(execId, host, allowedLocality).map { case ((index, taskLocality, speculative)) =>
+        val task = tasks(index)
+        val taskId = sched.newTaskId()
+        copiesRunning(index) += 1
+        val attemptNum = taskAttempts(index).size
+        val info = new TaskInfo(taskId, index, attemptNum, curTime,
+          execId, host, taskLocality, speculative)
+        taskInfos(taskId) = info
+        taskAttempts(index) = info :: taskAttempts(index)
+        if (maxLocality != TaskLocality.NO_PREF) {
+          currentLocalityIndex = getLocalityIndex(taskLocality)
+          lastLaunchTime = curTime
+        }
+        val serializedTask: ByteBuffer = try {
+          ser.serialize(task)
+        } catch {
+          case NonFatal(e) =>
+            val msg = s"Failed to serialize task $taskId, not attempting to retry it."
+            logError(msg, e)
+            abort(s"$msg Exception during serialization: $e")
+            throw new TaskNotSerializableException(e)
+        }
+        if (serializedTask.limit() > TaskSetManager.TASK_SIZE_TO_WARN_KIB * 1024 &&
+          !emittedTaskSizeWarning) {
+          emittedTaskSizeWarning = true
+          logWarning(s"Stage ${task.stageId} contains a task of very large size " +
+            s"(${serializedTask.limit() / 1024} KiB). The
+            maximum recommended task size is " +
+            s"${TaskSetManager.TASK_SIZE_TO_WARN_KIB} KiB.")
+        }
+        addRunningTask(taskId)
+        val taskName = s"task ${info.id} in stage ${taskSet.id}"
+        logInfo(s"Starting $taskName (TID $taskId, $host,
+        executor ${info.executorId}, " +
+        s"partition ${task.partitionId}, $taskLocality, 
+        ${serializedTask.limit()} bytes)")
+        val extraResources = sched.resourcesReqsPerTask.map { taskReq =>
+          val rName = taskReq.resourceName
+          val count = taskReq.amount
+          val rAddresses = availableResources.getOrElse(rName, Seq.empty)
+          assert(rAddresses.size >= count, s"Required $count $rName 
+          addresses, but only " +
+            s"${rAddresses.size} available.")
+          val allocatedAddresses = rAddresses.take(count)
+          (rName, new ResourceInformation(rName, allocatedAddresses.toArray))
+        }.toMap
+
+        sched.dagScheduler.taskStarted(task, info)
+        new TaskDescription(
+          taskId,
+          attemptNum,
+          execId,
+          taskName,
+          index,
+          task.partitionId,
+          addedFiles,
+          addedJars,
+          task.localProperties,
+          extraResources,
+          serializedTask)
+      }
+    } else {
+      None
+    }
+}
+```
+
+```scala
+private[spark] object TaskSetManager {
+  val TASK_SIZE_TO_WARN_KIB = 1000 // 任务数量警告值
+}
+```
+
+```scala
+private[scheduler] class PendingTasksByLocality {
+    介绍: 携带位置新的待定任务
+    属性:
+    #name @forExecutor = new HashMap[String, ArrayBuffer[Int]]	执行器待定任务信息表
+    #name @forHost = new HashMap[String, ArrayBuffer[Int]]	主机待定任务信息表
+    #name @noPrefs = new ArrayBuffer[Int]	无参考任务信息表
+    #name @forRack = new HashMap[String, ArrayBuffer[Int]]	机架待定任务信息表
+    #name @all = new ArrayBuffer[Int]	任意位置的待定任务表
 }
 ```
 
 
-
-#### TaskSetManager
-
-```scala
-
-```
 
 #### WorkerOffer
 
