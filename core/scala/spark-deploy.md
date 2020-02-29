@@ -44,7 +44,1211 @@
 
 #### security
 
+1.  [HadoopDelegationTokenManager.scala](# HadoopDelegationTokenManager)
+
+2.  [HadoopFSDelegationTokenProvider.scala](# HadoopFSDelegationTokenProvider)
+
+3.  [HBaseDelegationTokenProvider.scala](# HBaseDelegationTokenProvider)
+
+   ---
+
+   #### HadoopDelegationTokenManager
+
+   ```markdown
+   介绍:
+   	hadoop授权令牌管理器,管理spark应用程序的授权令牌.
+   	当运行更新授权令牌时,这个管理器会确保长期运行,且获取安全服务时不会中断.周期性地向密钥分配中心产生日志,使用用户提供的证书与所有配置的安全服务交互,目的是获取授权令牌去分配到剩余的应用上.
+   	新的授权令牌每次创建的时间为原始授权令牌更新时间的75%.新的令牌会发送的spark驱动器端点上.驱动器将令牌分配到需要它的进程中.
+   	更新可以使用两种方式开启:
+   	1. 提供转换准则和spark的密钥表
+   	2. 允许基于本地证书缓存更新
+   	后者有一个缺陷,spark自身无法生成TGT票据,因此用于必须手动更新Kerberos票据缓存.
+    	这个类也可以仅仅用来创建授权令牌,通过调用@obtainDelegationTokens 方法,这个配置不需要使用@start方法或者提供驱动器属性,但是调用者需要自己分配产生的授权令牌.
+    	构造器参数:
+    		sparkConf	spark配置
+    		hadoopConf	hadoop配置
+    		schedulerRef	调度的RPC端点(驱动器)
+   ```
+
+   ```scala
+   private[spark] class HadoopDelegationTokenManager(
+       protected val sparkConf: SparkConf,
+       protected val hadoopConf: Configuration,
+       protected val schedulerRef: RpcEndpointRef) extends Logging {
+       属性:
+       #name @deprecatedProviderEnabledConfigs	弃用配置信息
+       val= List(
+       "spark.yarn.security.tokens.%s.enabled",
+       "spark.yarn.security.credentials.%s.enabled")
+       #name @providerEnabledConfig = "spark.security.credentials.%s.enabled"
+       	提供的运行配置
+       #name @principal = sparkConf.get(PRINCIPAL).orNull	Kerberos准则
+       #name @keytab = sparkConf.get(KEYTAB).map { uri => new URI(uri).getPath() }.orNull
+       	密钥表
+       #name @delegationTokenProviders = loadProviders()	授权令牌提供者
+       #name @renewalExecutor: ScheduledExecutorService = _	更新执行器
+       操作集:
+       def renewalEnabled: Boolean
+       功能: 确认授权令牌是否可以更新
+       val= sparkConf.get(KERBEROS_RENEWAL_CREDENTIALS) match {
+           case "keytab" => principal != null
+           case "ccache" => 
+               UserGroupInformation.getCurrentUser().hasKerberosCredentials()
+           case _ => false
+         }
+       
+       def start(): Array[Byte]
+       功能: 启动令牌刷新器,需要Kerberos准则和密钥表.启动时,刷新器会获取所有配置服务的授权令牌,并发送到驱动器上,创建任务,周期性的刷新令牌信息.
+       这个方法需要给spark提供一个密钥表,在管理器可用的时候,会注册TGT的可用性.
+       返回配置的Kerberos准则的授权令牌.
+       1. 参数断言
+       require(renewalEnabled, "Token renewal must be enabled to start the renewer.")
+       require(schedulerRef != null, "Token renewal requires a scheduler endpoint.")
+       2. 创建一个线程,用于定期刷新令牌
+       renewalExecutor =
+         ThreadUtils.newDaemonSingleThreadScheduledExecutor("Credential Renewal Thread")
+       3. 获取用户组信息,进行可能的TGT检查
+       val ugi = UserGroupInformation.getCurrentUser()
+       if (ugi.isFromKeytab()) {
+   	 /**
+   	 在hadoop 2.x中密钥表的更新看起来是自动的,但是在hadoop 3.x中是可以进行配置的,具体请参考HADOOP-9567.
+   	 使用@hadoop.kerberos.keytab.login.autorenewal.enabled 进行配置,这个任务会确保用户保证处于登录状态,而不需要处理配置值的情况.注意到当TGT不需要更新时,@checkTGTAndReloginFromKeytab()时no-op的.
+   	 */
+         val tgtRenewalTask = new Runnable() {
+           override def run(): Unit = {
+             ugi.checkTGTAndReloginFromKeytab()
+           }
+         }
+         val tgtRenewalPeriod = sparkConf.get(KERBEROS_RELOGIN_PERIOD) //kerberos重新注册周期
+         renewalExecutor.scheduleAtFixedRate(tgtRenewalTask, tgtRenewalPeriod, tgtRenewalPeriod,
+           TimeUnit.SECONDS)
+       }
+       4. 更新令牌
+       updateTokensTask()
+       
+       def stop(): Unit
+       功能: 关闭管理器(关闭刷新的执行器即可)
+       if (renewalExecutor != null) {
+         renewalExecutor.shutdownNow()
+       }
+       
+       def obtainDelegationTokens(creds: Credentials): Unit 
+       功能: 获取授权密钥，存储在给定的证书中
+       1. 获取当前用户组信息
+       val currentUser = UserGroupInformation.getCurrentUser()
+       2. 获取授权令牌，并将其存储到证书中
+       val hasKerberosCreds = principal != null ||
+         Option(currentUser.getRealUser()).getOrElse(currentUser).hasKerberosCredentials()
+       if (hasKerberosCreds) {
+         val freshUGI = doLogin()
+         freshUGI.doAs(new PrivilegedExceptionAction[Unit]() {
+           override def run(): Unit = {
+             val (newTokens, _) = obtainDelegationTokens()
+             creds.addAll(newTokens)
+           }
+         })
+       }
+       
+       def obtainDelegationTokens(): (Credentials, Long)
+       功能: 获取配置服务的授权令牌，并返回带有授权令牌的证书以及令牌刷新时间
+       1. 获取证书
+       val creds = new Credentials()
+       2. 获取令牌刷新时间
+       val nextRenewal = delegationTokenProviders.values.flatMap { provider =>
+         if (provider.delegationTokensRequired(sparkConf, hadoopConf)) {
+           provider.obtainDelegationTokens(hadoopConf, sparkConf, creds)
+         } else {
+           logDebug(s"Service ${provider.serviceName} does not require a token." +
+             s" Check your configuration to see if security is disabled or not.")
+           None
+         }
+       }.foldLeft(Long.MaxValue)(math.min)
+       val= (creds, nextRenewal)
+       
+       def isProviderLoaded(serviceName: String): Boolean
+       功能: 确定指定服务是否加载 （测试使用）
+       val= delegationTokenProviders.contains(serviceName)
+       
+       def isServiceEnabled(serviceName: String): Boolean
+       功能: 确定服务是否可用
+       val key = providerEnabledConfig.format(serviceName)
+       deprecatedProviderEnabledConfigs.foreach { pattern =>
+         val deprecatedKey = pattern.format(serviceName)
+         if (sparkConf.contains(deprecatedKey)) {
+           logWarning(s"${deprecatedKey} is deprecated.  Please use ${key} instead.")
+         }
+       }
+       val isEnabledDeprecated = deprecatedProviderEnabledConfigs.forall { pattern =>
+         sparkConf
+           .getOption(pattern.format(serviceName))
+           .map(_.toBoolean)
+           .getOrElse(true)
+       }
+       val= sparkConf
+         .getOption(key)
+         .map(_.toBoolean)
+         .getOrElse(isEnabledDeprecated)
+       
+       def scheduleRenewal(delay: Long): Unit
+       功能: 按照指定时间间隔进行调度延时
+       1. 确定调度延时
+       val _delay = math.max(0, delay)
+       logInfo(s"Scheduling renewal in ${UIUtils.formatDuration(delay)}.")
+       2. 确定调度任务体(更新令牌)
+       val renewalTask = new Runnable() {
+         override def run(): Unit = {
+           updateTokensTask()
+         }
+       }
+       3. 进行任务调度
+       renewalExecutor.schedule(renewalTask, _delay, TimeUnit.MILLISECONDS)
+       
+       def updateTokensTask(): Array[Byte]
+       功能: 周期性的调度,用于登录到密钥分配中心KDC,且创建授权密钥,重新调度会获取下一组密钥.
+       try {
+         // 获取令牌信息
+         val freshUGI = doLogin()
+         val creds = obtainTokensAndScheduleRenewal(freshUGI)
+         val tokens = SparkHadoopUtil.get.serialize(creds)
+         logInfo("Updating delegation tokens.")
+         // 发送更新令牌消息到driver端 
+         schedulerRef.send(UpdateDelegationTokens(tokens))
+         tokens
+       } catch {
+         case _: InterruptedException =>
+           null
+         case e: Exception =>
+           val delay = TimeUnit.SECONDS.toMillis(sparkConf.get(CREDENTIALS_RENEWAL_RETRY_WAIT))
+           logWarning(s"Failed to update tokens, will try again in 
+           ${UIUtils.formatDuration(delay)}!" +
+             " If this happens too often tasks will fail.", e)
+           scheduleRenewal(delay)
+           null
+       }
+       
+       def obtainTokensAndScheduleRenewal(ugi: UserGroupInformation): Credentials 
+       功能: 获取令牌并调度更新,返回包含新的令牌的证书
+       val= ugi.doAs(new PrivilegedExceptionAction[Credentials]() {
+         override def run(): Credentials = {
+           val (creds, nextRenewal) = obtainDelegationTokens()
+           val now = System.currentTimeMillis
+           val ratio = sparkConf.get(CREDENTIALS_RENEWAL_INTERVAL_RATIO)
+           val delay = (ratio * (nextRenewal - now)).toLong
+           scheduleRenewal(delay)
+           creds
+         }
+       })
+       
+       def doLogin(): UserGroupInformation
+       功能: 登录,并返回用户组信息
+       if (principal != null) {
+         logInfo(s"Attempting to login to KDC using principal: $principal")
+         require(new File(keytab).isFile(), s"Cannot find keytab at $keytab.")
+         val ugi = UserGroupInformation.loginUserFromKeytabAndReturnUGI(principal, keytab)
+         logInfo("Successfully logged into KDC.")
+         ugi
+       } else if (!SparkHadoopUtil.get.isProxyUser(UserGroupInformation.getCurrentUser())) {
+         logInfo(s"Attempting to load user's ticket cache.")
+         val ccache = sparkConf.getenv("KRB5CCNAME")
+         val user = Option(sparkConf.getenv("KRB5PRINCIPAL")).getOrElse(
+           UserGroupInformation.getCurrentUser().getUserName())
+         UserGroupInformation.getUGIFromTicketCache(ccache, user)
+       } else {
+         UserGroupInformation.getCurrentUser()
+       }
+       
+       def loadProviders(): Map[String, HadoopDelegationTokenProvider]
+       功能: 加载供应器,返回供应器表
+       val loader = ServiceLoader.load(classOf[HadoopDelegationTokenProvider],
+         Utils.getContextOrSparkClassLoader)
+       val providers = mutable.ArrayBuffer[HadoopDelegationTokenProvider]()
+       val iterator = loader.iterator
+       while (iterator.hasNext) {
+         try {
+           providers += iterator.next
+         } catch {
+           case t: Throwable =>
+             logDebug(s"Failed to load built in provider.", t)
+         }
+       }
+   	providers
+         .filter { p => isServiceEnabled(p.serviceName) }
+         .map { p => (p.serviceName, p) }
+         .toMap
+   }
+   ```
+
+   #### HadoopFSDelegationTokenProvider
+
+   ```scala
+   private[deploy] class HadoopFSDelegationTokenProvider
+   extends HadoopDelegationTokenProvider with Logging {
+       介绍: Hadoop文件系统授权令牌提供器
+       属性:
+       #name @tokenRenewalInterval: Option[Long] = null	令牌更新周期
+       #name @serviceName: String = "hadoopfs"	服务名称
+       操作集:
+       def obtainDelegationTokens(
+         hadoopConf: Configuration,
+         sparkConf: SparkConf,
+         creds: Credentials): Option[Long]
+       功能: 获取授权令牌,返回令牌下次刷新时间
+       try {
+         1. 获取证书
+         val fileSystems = HadoopFSDelegationTokenProvider.hadoopFSsToAccess(sparkConf, hadoopConf)
+         val fetchCreds = fetchDelegationTokens(getTokenRenewer(hadoopConf), fileSystems, creds)
+         2. 确定令牌刷新周期
+         if (tokenRenewalInterval == null) {
+           tokenRenewalInterval = getTokenRenewalInterval(hadoopConf, sparkConf, fileSystems)
+         }
+         val nextRenewalDate = tokenRenewalInterval.flatMap { interval =>
+           val nextRenewalDates = fetchCreds.getAllTokens.asScala
+             .filter(_.decodeIdentifier().isInstanceOf[AbstractDelegationTokenIdentifier])
+             .map { token =>
+               val identifier = token
+                 .decodeIdentifier()
+                 .asInstanceOf[AbstractDelegationTokenIdentifier]
+               identifier.getIssueDate + interval
+             }
+           if (nextRenewalDates.isEmpty) None else Some(nextRenewalDates.min)
+         }
+         nextRenewalDate
+       } catch {
+         case NonFatal(e) =>
+           logWarning(s"Failed to get token from service $serviceName", e)
+           None
+       }
+     
+       def delegationTokensRequired(
+         sparkConf: SparkConf,
+         hadoopConf: Configuration): Boolean
+       功能: 确认是否需要授权令牌
+       val= UserGroupInformation.isSecurityEnabled
+       
+       def getTokenRenewer(hadoopConf: Configuration): String
+       功能: 获取令牌更新器
+       val tokenRenewer = Master.getMasterPrincipal(hadoopConf)
+       logDebug("Delegation token renewer is: " + tokenRenewer)
+       if (tokenRenewer == null || tokenRenewer.length() == 0) {
+         val errorMessage = "Can't get Master Kerberos principal for use as renewer."
+         logError(errorMessage)
+         throw new SparkException(errorMessage)
+       }
+   	val= tokenRenewer
+       
+       def fetchDelegationTokens(
+         renewer: String,
+         filesystems: Set[FileSystem],
+         creds: Credentials): Credentials
+       功能: 获取带有授权令牌的证书
+       filesystems.foreach { fs =>
+         logInfo(s"getting token for: $fs with renewer $renewer")
+         fs.addDelegationTokens(renewer, creds)
+       }
+       val= creds
+       
+       def getTokenRenewalInterval(
+         hadoopConf: Configuration,
+         sparkConf: SparkConf,
+         filesystems: Set[FileSystem]): Option[Long]
+       功能: 获取令牌更新周期
+      	不能通过刷新yarn来产生令牌,所有通过更新者的身份登录并创建令牌.
+       1. 确定更新者身份
+       val renewer = UserGroupInformation.getCurrentUser().getUserName()
+       2. 获取证书,并添加令牌
+       val creds = new Credentials()
+       fetchDelegationTokens(renewer, filesystems, creds)
+       3. 确定更新周期
+       val renewIntervals = creds.getAllTokens.asScala.filter {
+         _.decodeIdentifier().isInstanceOf[AbstractDelegationTokenIdentifier]
+       }.flatMap { token =>
+         Try {
+           val newExpiration = token.renew(hadoopConf)
+           val identifier = token.decodeIdentifier().asInstanceOf[AbstractDelegationTokenIdentifier]
+           val interval = newExpiration - identifier.getIssueDate
+           logInfo(s"Renewal interval is $interval for token ${token.getKind.toString}")
+           interval
+         }.toOption
+       }
+       val= if (renewIntervals.isEmpty) None else Some(renewIntervals.min)
+   }
+   ```
+
+   ```scala
+   private[deploy] object HadoopFSDelegationTokenProvider {
+       操作集:
+       def hadoopFSsToAccess(
+         sparkConf: SparkConf,
+         hadoopConf: Configuration): Set[FileSystem]
+       功能: 获取权限范围内的文件系统列表
+       val defaultFS = FileSystem.get(hadoopConf)
+       val filesystemsToAccess = sparkConf.get(KERBEROS_FILESYSTEMS_TO_ACCESS)
+         .map(new Path(_).getFileSystem(hadoopConf))
+         .toSet
+       val master = sparkConf.get("spark.master", null)
+       val stagingFS = if (master != null && master.contains("yarn")) {
+         sparkConf.get(STAGING_DIR).map(new Path(_).getFileSystem(hadoopConf))
+       } else {
+         None
+       }
+       val= filesystemsToAccess ++ stagingFS + defaultFS
+   }
+   ```
+
+   #### HBaseDelegationTokenProvider
+
+   ```scala
+   private[security] class HBaseDelegationTokenProvider
+   extends HadoopDelegationTokenProvider with Logging {
+       介绍: HBase 授权令牌提供器
+       操作集:
+       def serviceName: String = "hbase"
+       功能: 获取服务名称
+       
+       def obtainDelegationTokens(
+         hadoopConf: Configuration,
+         sparkConf: SparkConf,
+         creds: Credentials): Option[Long]
+       功能: 获取授权令牌
+       try {
+         val mirror = universe.runtimeMirror(Utils.getContextOrSparkClassLoader)
+         val obtainToken = mirror.classLoader.
+           loadClass("org.apache.hadoop.hbase.security.token.TokenUtil")
+           .getMethod("obtainToken", classOf[Configuration])
+         logDebug("Attempting to fetch HBase security token.")
+         val token = obtainToken.invoke(null, hbaseConf(hadoopConf))
+           .asInstanceOf[Token[_ <: TokenIdentifier]]
+         logInfo(s"Get token from HBase: ${token.toString}")
+         creds.addToken(token.getService, token)
+       } catch {
+         case NonFatal(e) =>
+           logWarning(s"Failed to get token from service $serviceName due to  " + e +
+             s" Retrying to fetch HBase security token with hbase connection parameter.")
+           obtainDelegationTokensWithHBaseConn(hadoopConf, creds)
+       }
+       val= None
+       
+       def delegationTokensRequired(
+         sparkConf: SparkConf,
+         hadoopConf: Configuration): Boolean
+       功能: 确认是否需要授权令牌
+       val= hbaseConf(hadoopConf).get("hbase.security.authentication") == "kerberos"
+       
+       def hbaseConf(conf: Configuration): Configuration
+       功能: 获取hbase配置信息
+       try {
+         val mirror = universe.runtimeMirror(Utils.getContextOrSparkClassLoader)
+         val confCreate = mirror.classLoader.
+           loadClass("org.apache.hadoop.hbase.HBaseConfiguration").
+           getMethod("create", classOf[Configuration])
+         confCreate.invoke(null, conf).asInstanceOf[Configuration]
+       } catch {
+         case NonFatal(e) =>
+           logDebug("Unable to load HBaseConfiguration.", e)
+           conf
+       }
+       
+       def obtainDelegationTokensWithHBaseConn(
+         hadoopConf: Configuration,
+         creds: Credentials): Unit
+       功能: 获取带有HBase连接的授权密钥
+       @Token<AuthenticationTokenIdentifier> obtainToken(Configuration conf) 方法是一个弃用的方法没带HBase 2.0.0 这个方法以及被移除. HBase 客户端API使用下述方法(0.98.9)从@ConnectionFactory中检索出第一条链接,,这个链接会通过@Token<AuthenticationTokenIdentifier> obtainToken(Connection conn) 调用.
+       输入参数:
+       	hadoopConf	hadoop配置
+       	creds	需要添加的证书
+       var hbaseConnection : Closeable = null
+       try {
+         val mirror = universe.runtimeMirror(Utils.getContextOrSparkClassLoader)
+         val connectionFactoryClass = mirror.classLoader
+           .loadClass("org.apache.hadoop.hbase.client.ConnectionFactory")
+           .getMethod("createConnection", classOf[Configuration])
+         hbaseConnection = connectionFactoryClass.invoke(null, hbaseConf(hadoopConf))
+           .asInstanceOf[Closeable]
+         val connectionParamTypeClassRef = mirror.classLoader
+           .loadClass("org.apache.hadoop.hbase.client.Connection")
+         val obtainTokenMethod = mirror.classLoader
+           .loadClass("org.apache.hadoop.hbase.security.token.TokenUtil")
+           .getMethod("obtainToken", connectionParamTypeClassRef)
+         logDebug("Attempting to fetch HBase security token.")
+         val token = obtainTokenMethod.invoke(null, hbaseConnection)
+           .asInstanceOf[Token[_ <: TokenIdentifier]]
+         logInfo(s"Get token from HBase: ${token.toString}")
+         creds.addToken(token.getService, token)
+       } catch {
+         case NonFatal(e) =>
+           logWarning(s"Failed to get token from service $serviceName", e)
+       } finally {
+         if (null != hbaseConnection) {
+           hbaseConnection.close()
+         }
+       }
+   }
+   ```
+
 #### worker
+
+1.  [ui](# ui)
+
+2.  [CommandUtils.scala](# CommandUtils)
+
+3.  [DriverRunner.scala](# DriverRunner)
+
+4.  [DriverWrapper.scala](# DriverWrapper)
+
+5.  [ExecutorRunner.scala](# ExecutorRunner)
+
+6.  [Worker.scala](# Worker)
+
+7.  [WorkerArguments.scala](# WorkerArguments)
+
+8. [WorkerSource.scala](# WorkerSource)
+
+9.  [WorkerWatcher.scala](# WorkerWatcher)
+
+   ---
+
+   #### ui
+
+   ```scala
+   介绍: 这个目录下是worker所属web UI内容
+   提供了
+   """
+   1. LogPage	日志页面
+   2. WorkerPage	worker页面
+   3. WorkerWebUI	独立运行的worker web服务器
+   """
+   ```
+
+   #### CommandUtils
+
+   ```scala
+   private[deploy]
+   object CommandUtils extends Logging {
+       介绍: spark类路径的运行指令
+       操作集:
+       def buildProcessBuilder(
+         command: Command,
+         securityMgr: SecurityManager,
+         memory: Int,
+         sparkHome: String,
+         substituteArguments: String => String,
+         classPaths: Seq[String] = Seq.empty,
+         env: Map[String, String] = sys.env): ProcessBuilder
+       功能: 基于给定参数构建进程构建器@ProcessBuilder，env参数可以暴露给测试
+       1. 获取进程构建器
+       val localCommand = buildLocalCommand(
+         command, securityMgr, substituteArguments, classPaths, env)
+       val commandSeq = buildCommandSeq(localCommand, memory, sparkHome)
+       val builder = new ProcessBuilder(commandSeq: _*)
+       val environment = builder.environment()
+       2. 设置环境变量
+       for ((key, value) <- localCommand.environment) {
+         environment.put(key, value)
+       }
+       val= builder
+       
+       def buildCommandSeq(command: Command, memory: Int, sparkHome: String): Seq[String]
+       功能: 构建命令序列
+       注意: 不要调用run.cmd脚本,在windows上不能使用process.destroy() kill进程树
+       val cmd = new WorkerCommandBuilder(sparkHome, memory, command).buildCommand()
+       cmd.asScala ++ Seq(command.mainClass) ++ command.arguments
+       
+       def buildLocalCommand(
+         command: Command,
+         securityMgr: SecurityManager,
+         substituteArguments: String => String,
+         classPath: Seq[String] = Seq.empty,
+         env: Map[String, String]): Command 
+       功能: 基于给定命令@command构建本地命令,考虑到本地的环境变量
+       1. 确定指令的库路径
+       val libraryPathName = Utils.libraryPathEnvName
+       val libraryPathEntries = command.libraryPathEntries
+       val cmdLibraryPath = command.environment.get(libraryPathName)
+       2. 获取环境变量(考虑到本地环境变量)
+       var newEnvironment = if (libraryPathEntries.nonEmpty && libraryPathName.nonEmpty) {
+         val libraryPaths = libraryPathEntries ++ cmdLibraryPath ++ env.get(libraryPathName)
+         command.environment + ((libraryPathName, libraryPaths.mkString(File.pathSeparator)))
+       } else {
+         command.environment
+       }
+       3. 设置授权密码
+       if (securityMgr.isAuthenticationEnabled) {
+         newEnvironment += (SecurityManager.ENV_AUTH_SECRET -> securityMgr.getSecretKey)
+       }
+       val=Command(
+         command.mainClass,
+         command.arguments.map(substituteArguments),
+         newEnvironment,
+         command.classPathEntries ++ classPath,
+         Seq.empty, 
+         command.javaOpts.filterNot(_.startsWith("-D" + SecurityManager.SPARK_AUTH_SECRET_CONF)))
+       
+       def redirectStream(in: InputStream, file: File): Unit
+       功能: 创建一个线程,用于重定向输入流到文件中
+       1. 确定输出流
+       val out = new FileOutputStream(file, true)
+       2. 重定向输出到指定文件中
+       new Thread("redirect output to " + file) {
+         override def run(): Unit = {
+           try {
+             Utils.copyStream(in, out, true)
+           } catch {
+             case e: IOException =>
+               logInfo("Redirection to " + file + " closed: " + e.getMessage)
+           }
+         }
+       }.start()
+   }
+   ```
+
+   #### DriverRunner
+
+   ```scala
+   private[deploy] class DriverRunner(
+       conf: SparkConf, // spark配置
+       val driverId: String, // 驱动器编号
+       val workDir: File, // 工作目录
+       val sparkHome: File, // spark 目录
+       val driverDesc: DriverDescription, // 驱动器描述
+       val worker: RpcEndpointRef, //worker端点
+       val workerUrl: String, // worker URL地址
+       val securityManager: SecurityManager, // 安全管理器
+       val resources: Map[String, ResourceInformation] = Map.empty) // 资源列表
+   extends Logging {
+       介绍: 管理driver的执行,自动包含驱动器的失败重启,只能使用于独立模式运行下的驱动器.
+       属性:
+       #name @process: Option[Process] = None	volatile	进程
+       #name @killed = false	volatile	是否被kill
+       #name @finalState: Option[DriverState] = None volatile	最终状态下驱动器状态
+       #name @finalException: Option[Exception] = None volatile	最终状态下异常
+       #name @driverTerminateTimeoutMs = conf.get(WORKER_DRIVER_TERMINATE_TIMEOUT)
+       	驱动器结束等待时延
+       #name @clock: Clock = new SystemClock()	系统时钟
+       #name @sleeper #type @Sleeper 睡眠器
+       val= new Sleeper {
+           def sleep(seconds: Int): Unit = (0 until seconds).takeWhile { _ =>
+             Thread.sleep(1000)
+             !killed
+           }
+         }
+       操作集:
+       def setClock(_clock: Clock): Unit = clock = _clock
+       功能: 设置时钟,用于测试
+       
+       def setSleeper(_sleeper: Sleeper): Unit = sleeper = _sleeper
+       功能: 设置睡眠器
+       
+       def start()
+       功能: 启动并管理驱动器
+       new Thread("DriverRunner for " + driverId) {
+         override def run(): Unit = {
+           var shutdownHook: AnyRef = null
+           try {
+             // 设置停止处理函数
+             shutdownHook = ShutdownHookManager.addShutdownHook { () =>
+               logInfo(s"Worker shutting down, killing driver $driverId")
+               kill()
+             }
+             // 获取最终状态
+             val exitCode = prepareAndRunDriver()
+             finalState = if (exitCode == 0) {
+               Some(DriverState.FINISHED)
+             } else if (killed) {
+               Some(DriverState.KILLED)
+             } else {
+               Some(DriverState.FAILED)
+             }
+           } catch {
+             case e: Exception =>
+               kill()
+               finalState = Some(DriverState.ERROR)
+               finalException = Some(e)
+           } finally {
+             if (shutdownHook != null) {
+               ShutdownHookManager.removeShutdownHook(shutdownHook)
+             }
+           }
+           // worker发送驱动器状态已经发生改变
+           worker.send(DriverStateChanged(driverId, finalState.get, finalException))
+         }
+       }.start()
+       
+       def kill(): Unit
+       功能: 终止驱动器
+       logInfo("Killing driver process!")
+       killed = true
+       synchronized {
+         process.foreach { p =>
+           val exitCode = Utils.terminateProcess(p, driverTerminateTimeoutMs)
+           if (exitCode.isEmpty) {
+             logWarning("Failed to terminate driver process: " + p +
+                 ". This process will likely be orphaned.")
+           }
+         }
+       }
+       
+       def createWorkingDirectory(): File
+       功能: 创建工作目录
+       val driverDir = new File(workDir, driverId)
+       if (!driverDir.exists() && !driverDir.mkdirs()) {
+         throw new IOException("Failed to create directory " + driverDir)
+       }
+       val= driverDir
+       
+       def downloadUserJar(driverDir: File): String
+       功能: 将用户jar包下载到指定目录,并返回类路径
+       val jarFileName = new URI(driverDesc.jarUrl).getPath.split("/").last
+       val localJarFile = new File(driverDir, jarFileName)
+       if (!localJarFile.exists()) { // May already exist if running multiple workers on one node
+         logInfo(s"Copying user jar ${driverDesc.jarUrl} to $localJarFile")
+         Utils.fetchFile(
+           driverDesc.jarUrl,
+           driverDir,
+           conf,
+           securityManager,
+           SparkHadoopUtil.get.newConfiguration(conf),
+           System.currentTimeMillis(),
+           useCache = false)
+         if (!localJarFile.exists()) { // Verify copy succeeded
+           throw new IOException(
+             s"Can not find expected jar $jarFileName which should have been loaded in $driverDir")
+         }
+       }
+       val= localJarFile.getAbsolutePath
+       
+       def substituteVariables(argument: String): String = argument match {
+         case "{{WORKER_URL}}" => workerUrl
+         case "{{USER_JAR}}" => localJarFilename
+         case other => other
+       }
+       功能: 变量替换
+       
+       def prepareAndRunDriver(): Int
+       功能: 进行准备并运行驱动器
+       1. 准备运行参数
+       val driverDir = createWorkingDirectory()
+       val localJarFilename = downloadUserJar(driverDir)
+       val resourceFileOpt = prepareResourcesFile(SPARK_DRIVER_PREFIX, resources, driverDir)
+       val javaOpts = driverDesc.command.javaOpts ++ resourceFileOpt.map(f =>
+         Seq(s"-D${DRIVER_RESOURCES_FILE.key}=${f.getAbsolutePath}")).getOrElse(Seq.empty)
+       val builder = CommandUtils.buildProcessBuilder(driverDesc.command.copy(javaOpts = javaOpts),
+         securityManager, driverDesc.mem, sparkHome.getAbsolutePath, substituteVariables)
+       2. 运行驱动器
+       runDriver(builder, driverDir, driverDesc.supervise)
+       
+       def initialize(process: Process): Unit
+       功能: 初始化进程
+       1. 重定向标准输出到文件
+       val stdout = new File(baseDir, "stdout")
+       CommandUtils.redirectStream(process.getInputStream, stdout)
+       2. 重定向标准错误到文件
+       val stderr = new File(baseDir, "stderr")
+       val redactedCommand = Utils.redactCommandLineArgs(conf, builder.command.asScala)
+       .mkString("\"", "\" \"", "\"")
+       val header = "Launch Command: %s\n%s\n\n".format(redactedCommand, "=" * 40)
+       Files.append(header, stderr, StandardCharsets.UTF_8)
+       CommandUtils.redirectStream(process.getErrorStream, stderr)
+       
+       def runDriver(builder: ProcessBuilder, baseDir: File, supervise: Boolean): Int
+       功能: 启动驱动器
+       builder.directory(baseDir) // 设置进程工作目录
+       // 可重试的执行指令
+       runCommandWithRetry(ProcessBuilderLike(builder), initialize, supervise)
+       
+       def runCommandWithRetry(
+         command: ProcessBuilderLike, initialize: Process => Unit, supervise: Boolean): Int
+       功能: 可重试的运行指令
+       1. 确定是否进行尝试
+       var exitCode = -1
+       var waitSeconds = 1
+       val successfulRunDuration = 5
+       var keepTrying = !killed
+       val redactedCommand = Utils.redactCommandLineArgs(conf, command.command)
+         .mkString("\"", "\" \"", "\"")
+       2. 重复尝试执行指令
+       while (keepTrying) {
+         logInfo("Launch Command: " + redactedCommand)
+         synchronized {
+           if (killed) { return exitCode }
+           process = Some(command.start())
+           initialize(process.get)
+         }
+         val processStart = clock.getTimeMillis()
+         exitCode = process.get.waitFor()
+         keepTrying = supervise && exitCode != 0 && !killed
+         if (keepTrying) {
+           if (clock.getTimeMillis() - processStart > successfulRunDuration * 1000L) {
+             waitSeconds = 1
+           }
+           logInfo(s"Command exited with status $exitCode, re-launching after $waitSeconds s.")
+           sleeper.sleep(waitSeconds)
+           waitSeconds = waitSeconds * 2 // exponential back-off
+         }
+       }
+       val= exitCode
+   }
+   ```
+
+   ```scala
+   private[deploy] trait Sleeper {
+     def sleep(seconds: Int): Unit
+   }
+   
+   private[deploy] trait ProcessBuilderLike {
+     def start(): Process
+     def command: Seq[String]
+   }
+   介绍: 类进程构建器
+   
+   private[deploy] object ProcessBuilderLike {
+     def apply(processBuilder: ProcessBuilder): ProcessBuilderLike = new ProcessBuilderLike {
+       override def start(): Process = processBuilder.start()
+       override def command: Seq[String] = processBuilder.command().asScala
+     }
+   }
+   ```
+
+   #### DriverWrapper
+
+   ```scala
+   object DriverWrapper extends Logging {
+       介绍: 驱动器包装器
+       操作集:
+       def setupDependencies(loader: MutableURLClassLoader, userJar: String): Unit
+       功能: 创建依赖
+       输入参数:
+       	loader	类加载器
+       	userJar	用户jar信息
+       1. 获取依赖五元组
+       val sparkConf = new SparkConf()
+       val secMgr = new SecurityManager(sparkConf)
+       val hadoopConf = SparkHadoopUtil.newConfiguration(sparkConf)
+       val Seq(packagesExclusions, packages, repositories, ivyRepoPath, ivySettingsPath) =
+         Seq(
+           "spark.jars.excludes",
+           "spark.jars.packages",
+           "spark.jars.repositories",
+           "spark.jars.ivy",
+           "spark.jars.ivySettings"
+         ).map(sys.props.get(_).orNull)
+       2. 处理maven依赖
+       val resolvedMavenCoordinates = DependencyUtils.resolveMavenDependencies(packagesExclusions,
+         packages, repositories, ivyRepoPath, Option(ivySettingsPath))
+       3. 获取jar属性
+       val jars = {
+         val jarsProp = sys.props.get(config.JARS.key).orNull
+         if (!StringUtils.isBlank(resolvedMavenCoordinates)) {
+           DependencyUtils.mergeFileLists(jarsProp, resolvedMavenCoordinates)
+         } else {
+           jarsProp
+         }
+       }
+       val localJars = DependencyUtils.resolveAndDownloadJars(
+           jars, userJar, sparkConf, hadoopConf,secMgr)
+       4. 添加jar到类路径中
+       DependencyUtils.addJarsToClassPath(localJars, loader)
+       
+       def main(args: Array[String]): Unit
+       功能: 启动函数
+       case workerUrl :: userJar :: mainClass :: extraArgs =>
+           1. 获取启动参数,处理依赖关系
+           val conf = new SparkConf()
+           val host: String = Utils.localHostName()
+           val port: Int = sys.props.getOrElse(config.DRIVER_PORT.key, "0").toInt
+           val rpcEnv = RpcEnv.create("Driver", host, port, conf, new SecurityManager(conf))
+           logInfo(s"Driver address: ${rpcEnv.address}")
+           rpcEnv.setupEndpoint("workerWatcher", new WorkerWatcher(rpcEnv, workerUrl))
+           val currentLoader = Thread.currentThread.getContextClassLoader
+           val userJarUrl = new File(userJar).toURI().toURL()
+           val loader =
+             if (sys.props.getOrElse(config.DRIVER_USER_CLASS_PATH_FIRST.key, "false").toBoolean) {
+               new ChildFirstURLClassLoader(Array(userJarUrl), currentLoader)
+             } else {
+               new MutableURLClassLoader(Array(userJarUrl), currentLoader)
+             }
+           Thread.currentThread.setContextClassLoader(loader)
+           setupDependencies(loader, userJar)
+       	2. 启动main
+           val clazz = Utils.classForName(mainClass)
+           val mainMethod = clazz.getMethod("main", classOf[Array[String]])
+           mainMethod.invoke(null, extraArgs.toArray[String])
+           rpcEnv.shutdown()
+   
+         case _ =>
+           System.err.println("Usage: DriverWrapper <workerUrl>
+           <userJar> <driverMainClass> [options]")
+           System.exit(-1)
+   }
+   ```
+
+   #### ExecutorRunner
+
+   ```scala
+   private[deploy] class ExecutorRunner(
+       val appId: String, // 应用ID
+       val execId: Int, // 执行器ID
+       val appDesc: ApplicationDescription, // 应用描述
+       val cores: Int, //CPU数量
+       val memory: Int, // 内存量
+       val worker: RpcEndpointRef, // worker RPC通信端口
+       val workerId: String, // workerID
+       val webUiScheme: String, // webUI schema
+       val host: String, // 主机名称
+       val webUiPort: Int, // webUI端口
+       val publicAddress: String, // 公共地址
+       val sparkHome: File, // sparkHome
+       val executorDir: File, // 执行器目录
+       val workerUrl: String, // workerURL地址
+       conf: SparkConf, // spark配置
+       val appLocalDirs: Seq[String], // 应用本地目录
+       @volatile var state: ExecutorState.Value, // 执行器状态
+       val resources: Map[String, ResourceInformation] = Map.empty) // 资源列表
+   extends Logging {
+       介绍: 管理一个执行器进程的执行,只能在独立运行模式下使用.
+       属性:
+       #name @fullId = appId + "/" + execId	id全称
+       #name @workerThread: Thread = null	worker线程
+       #name @process: Process = null	进程
+       #name @stdoutAppender: FileAppender = null	标准输出文件添加器
+       #name @stderrAppender: FileAppender = null	标准错误文件添加器
+       #name @EXECUTOR_TERMINATE_TIMEOUT_MS = 10 * 1000	执行器停止时延
+       #name @shutdownHook: AnyRef = null	停止点
+       操作集:
+       def start(): Unit
+       功能: 启动运行
+       1. 创建并启动用户进程
+       workerThread = new Thread("ExecutorRunner for " + fullId) {
+         override def run(): Unit = { fetchAndRunExecutor() }
+       }
+       workerThread.start()
+       2. 设定关闭处理函数
+       shutdownHook = ShutdownHookManager.addShutdownHook { () =>
+         if (state == ExecutorState.LAUNCHING) {
+           state = ExecutorState.FAILED
+         }
+         killProcess(Some("Worker shutting down")) }
+       
+       def killProcess(message: Option[String]): Unit
+       功能: kill进程
+       1. 停止进程(停止文件添加器)
+       var exitCode: Option[Int] = None
+       if (process != null) {
+         logInfo("Killing process!")
+         if (stdoutAppender != null) {
+           stdoutAppender.stop()
+         }
+         if (stderrAppender != null) {
+           stderrAppender.stop()
+         }
+         exitCode = Utils.terminateProcess(process, EXECUTOR_TERMINATE_TIMEOUT_MS)
+         if (exitCode.isEmpty) {
+           logWarning("Failed to terminate process: " + process +
+             ". This process will likely be orphaned.")
+         }
+       }
+       2. 发送执行器状态更新消息
+       try {
+         worker.send(ExecutorStateChanged(appId, execId, state, message, exitCode))
+       } catch {
+         case e: IllegalStateException => logWarning(e.getMessage(), e)
+       }
+       
+       def kill(): Unit
+       功能: 停止执行器运行器,包括kill运行的进程
+       if (workerThread != null) {
+         workerThread.interrupt()
+         workerThread = null
+         state = ExecutorState.KILLED
+         try {
+           ShutdownHookManager.removeShutdownHook(shutdownHook)
+         } catch {
+           case e: IllegalStateException => None
+         }
+       }
+       
+       def substituteVariables(argument: String): String
+       功能: 变量替换
+       val= argument match {
+           case "{{WORKER_URL}}" => workerUrl
+           case "{{EXECUTOR_ID}}" => execId.toString
+           case "{{HOSTNAME}}" => host
+           case "{{CORES}}" => cores.toString
+           case "{{APP_ID}}" => appId
+           case other => other
+         }
+       
+       def fetchAndRunExecutor(): Unit
+       功能: 下载并运行应用描述中的执行器
+       try {
+         val resourceFileOpt = prepareResourcesFile(SPARK_EXECUTOR_PREFIX, resources, executorDir)
+         val arguments = appDesc.command.arguments ++ resourceFileOpt.map(f =>
+           Seq("--resourcesFile", f.getAbsolutePath)).getOrElse(Seq.empty)
+         val subsOpts = appDesc.command.javaOpts.map {
+           Utils.substituteAppNExecIds(_, appId, execId.toString)
+         }
+         val subsCommand = appDesc.command.copy(arguments = arguments, javaOpts = subsOpts)
+         val builder = CommandUtils.buildProcessBuilder(subsCommand, new SecurityManager(conf),
+           memory, sparkHome.getAbsolutePath, substituteVariables)
+         val command = builder.command()
+         val redactedCommand = Utils.redactCommandLineArgs(conf, command.asScala)
+           .mkString("\"", "\" \"", "\"")
+         logInfo(s"Launch command: $redactedCommand")
+         builder.directory(executorDir)
+         builder.environment.put("SPARK_EXECUTOR_DIRS", appLocalDirs.mkString(File.pathSeparator))
+         builder.environment.put("SPARK_LAUNCH_WITH_SCALA", "0")
+         val baseUrl =
+           if (conf.get(UI_REVERSE_PROXY)) {
+             s"/proxy/$workerId/logPage/?appId=$appId&executorId=$execId&logType="
+           } else {
+             s"$webUiScheme$publicAddress:$webUiPort/logPage/?
+             appId=$appId&executorId=$execId&logType="
+           }
+         builder.environment.put("SPARK_LOG_URL_STDERR", s"${baseUrl}stderr")
+         builder.environment.put("SPARK_LOG_URL_STDOUT", s"${baseUrl}stdout")
+         process = builder.start()
+         val header = "Spark Executor Command: %s\n%s\n\n".format(
+           redactedCommand, "=" * 40)
+         val stdout = new File(executorDir, "stdout")
+         stdoutAppender = FileAppender(process.getInputStream, stdout, conf)
+         val stderr = new File(executorDir, "stderr")
+         Files.write(header, stderr, StandardCharsets.UTF_8)
+         stderrAppender = FileAppender(process.getErrorStream, stderr, conf)
+         state = ExecutorState.RUNNING
+         worker.send(ExecutorStateChanged(appId, execId, state, None, None))
+         val exitCode = process.waitFor()
+         state = ExecutorState.EXITED
+         val message = "Command exited with code " + exitCode
+         worker.send(ExecutorStateChanged(appId, execId, state, Some(message), Some(exitCode)))
+       } catch {
+         case interrupted: InterruptedException =>
+           logInfo("Runner thread for executor " + fullId + " interrupted")
+           state = ExecutorState.KILLED
+           killProcess(None)
+         case e: Exception =>
+           logError("Error running executor", e)
+           state = ExecutorState.FAILED
+           killProcess(Some(e.toString))
+       }
+   }
+   ```
+
+   #### Worker
+
+   #### WorkerArguments
+
+   ```scala
+   private[worker] class WorkerArguments(args: Array[String], conf: SparkConf){
+       介绍: worker的命令行转换器
+       属性:
+       #name @host = Utils.localHostName()	主机名称
+       #name @port = 0	端口号
+       #name @webUiPort = 8081	webUI端口
+       #name @cores = inferDefaultCores()	CPU数量
+       #name @memory = inferDefaultMemory()	内存量
+       #name @masters: Array[String] = null	master列表
+       #name @workDir: String = null	工作目录
+       #name @propertiesFile: String = null 属性文件
+       初始化操作:
+       if (System.getenv("SPARK_WORKER_PORT") != null) {
+           port = System.getenv("SPARK_WORKER_PORT").toInt
+       }
+       if (System.getenv("SPARK_WORKER_CORES") != null) {
+           cores = System.getenv("SPARK_WORKER_CORES").toInt
+       }
+       if (conf.getenv("SPARK_WORKER_MEMORY") != null) {
+           memory = Utils.memoryStringToMb(conf.getenv("SPARK_WORKER_MEMORY"))
+       }
+       if (System.getenv("SPARK_WORKER_WEBUI_PORT") != null) {
+           webUiPort = System.getenv("SPARK_WORKER_WEBUI_PORT").toInt
+       }
+       if (System.getenv("SPARK_WORKER_DIR") != null) {
+           workDir = System.getenv("SPARK_WORKER_DIR")
+       }
+       介绍: 检查环境变量
+       
+       @tailrec
+       private def parse(args: List[String]): Unit
+       功能: 参数转换
+       args match {
+           case ("--ip" | "-i") :: value :: tail =>
+             Utils.checkHost(value)
+             host = value
+             parse(tail)
+           case ("--host" | "-h") :: value :: tail =>
+             Utils.checkHost(value)
+             host = value
+             parse(tail)
+           case ("--port" | "-p") :: IntParam(value) :: tail =>
+             port = value
+             parse(tail)
+           case ("--cores" | "-c") :: IntParam(value) :: tail =>
+             cores = value
+             parse(tail)
+           case ("--memory" | "-m") :: MemoryParam(value) :: tail =>
+             memory = value
+             parse(tail)
+           case ("--work-dir" | "-d") :: value :: tail =>
+             workDir = value
+             parse(tail)
+           case "--webui-port" :: IntParam(value) :: tail =>
+             webUiPort = value
+             parse(tail)
+           case ("--properties-file") :: value :: tail =>
+             propertiesFile = value
+             parse(tail)
+           case ("--help") :: tail =>
+             printUsageAndExit(0)
+           case value :: tail =>
+             if (masters != null) {  // Two positional arguments were given
+               printUsageAndExit(1)
+             }
+             masters = Utils.parseStandaloneMasterUrls(value)
+             parse(tail)
+           case Nil =>
+             if (masters == null) {  // No positional argument was given
+               printUsageAndExit(1)
+             }
+           case _ =>
+             printUsageAndExit(1)
+         }
+       
+       def printUsageAndExit(exitCode: Int): Unit
+       功能: 打印使用情况,并退出JVM
+       System.err.println(
+         "Usage: Worker [options] <master>\n" +
+         "\n" +
+         "Master must be a URL of the form spark://hostname:port\n" +
+         "\n" +
+         "Options:\n" +
+         "  -c CORES, --cores CORES  Number of cores to use\n" +
+         "  -m MEM, --memory MEM     Amount of memory to use (e.g. 1000M, 2G)\n" +
+         "  -d DIR, --work-dir DIR   Directory to run apps in (default: SPARK_HOME/work)\n" +
+         "  -i HOST, --ip IP         Hostname to listen on (deprecated, please use --host or -h)\n" +
+         "  -h HOST, --host HOST     Hostname to listen on\n" +
+         "  -p PORT, --port PORT     Port to listen on (default: random)\n" +
+         "  --webui-port PORT        Port for web UI (default: 8081)\n" +
+         "  --properties-file FILE   Path to a custom Spark properties file.\n" +
+         "                           Default is conf/spark-defaults.conf.")
+       System.exit(exitCode)
+       
+       def inferDefaultCores(): Int = Runtime.getRuntime.availableProcessors()
+       功能: 获取默认CPU数量
+       
+       def inferDefaultMemory(): Int
+       功能: 获取默认内存量
+       val= {
+           val ibmVendor = System.getProperty("java.vendor").contains("IBM")
+           var totalMb = 0
+           try {
+             val bean = ManagementFactory.getOperatingSystemMXBean()
+             if (ibmVendor) {
+               val beanClass = Class.forName("com.ibm.lang.management.OperatingSystemMXBean")
+               val method = beanClass.getDeclaredMethod("getTotalPhysicalMemory")
+               totalMb = (method.invoke(bean).asInstanceOf[Long] / 1024 / 1024).toInt
+             } else {
+               val beanClass = Class.forName("com.sun.management.OperatingSystemMXBean")
+               val method = beanClass.getDeclaredMethod("getTotalPhysicalMemorySize")
+               totalMb = (method.invoke(bean).asInstanceOf[Long] / 1024 / 1024).toInt
+             }
+           } catch {
+             case e: Exception =>
+               totalMb = 2*1024
+               System.out.println("Failed to get total physical memory. Using " + totalMb + " MB")
+           }
+           math.max(totalMb - 1024, Utils.DEFAULT_DRIVER_MEM_MB)
+         }
+       
+       def checkWorkerMemory(): Unit
+       功能: 校验worker内存量
+       if (memory <= 0) {
+         val message = "Memory is below 1MB, or missing a M/G at the end of 
+         the memory specification?"
+         throw new IllegalStateException(message)
+       }
+   }
+   ```
+
+   #### WorkerSource
+
+   ```scala
+   private[worker] class WorkerSource(val worker: Worker) extends Source {
+       介绍:
+       	worker资源
+       属性:
+       #name @sourceName = "worker"	资源名称
+       #name @metricRegistry = new MetricRegistry()	度量注册器
+       初始化操作:
+       metricRegistry.register(MetricRegistry.name("executors"), new Gauge[Int] {
+           override def getValue: Int = worker.executors.size
+         })
+       功能: 注册执行器数量
+       
+       metricRegistry.register(MetricRegistry.name("coresUsed"), new Gauge[Int] {
+           override def getValue: Int = worker.coresUsed
+         })
+       功能: 注册CPU数量
+       
+       metricRegistry.register(MetricRegistry.name("memUsed_MB"), new Gauge[Int] {
+           override def getValue: Int = worker.memoryUsed
+         })
+       功能: 注册内存使用量
+       
+       metricRegistry.register(MetricRegistry.name("coresFree"), new Gauge[Int] {
+           override def getValue: Int = worker.coresFree
+         })
+       功能: 注册空闲CPU数量
+       
+       metricRegistry.register(MetricRegistry.name("memFree_MB"), new Gauge[Int] {
+           override def getValue: Int = worker.memoryFree
+         })
+       功能: 注册空闲内存量
+   }
+   ```
+
+   #### WorkerWatcher
+
+   ```scala
+   private[spark] class WorkerWatcher(
+       override val rpcEnv: RpcEnv, workerUrl: String, isTesting: Boolean = false)
+   extends RpcEndpoint with Logging {
+       介绍: worker监视器
+       这是一个RPC端点,连接到一个进程,如果链接已经被占用了,则会终止JVM.提供worker与子进程的共享.
+       属性:
+       #name @isShutDown = false	关闭状态(用于避免测试时JVM关闭)
+       #name @expectedAddress = RpcAddress.fromURIString(workerUrl)	期望地址
+       操作集:
+       def isWorker(address: RpcAddress) = expectedAddress == address
+       功能: 确定是否为worker
+       
+       def exitNonZero() = if (isTesting) isShutDown = true else System.exit(-1)
+       功能: 非正常退出
+       
+       def receive: PartialFunction[Any, Unit]
+       功能: 接受RPC消息
+       case e => logWarning(s"Received unexpected message: $e")
+       
+       def onConnected(remoteAddress: RpcAddress): Unit
+       功能: 连接处理
+       if (isWorker(remoteAddress)) {
+         logInfo(s"Successfully connected to $workerUrl")
+       }
+       
+       def onDisconnected(remoteAddress: RpcAddress): Unit
+       功能: 断开连接处理
+       if (isWorker(remoteAddress)) {
+         logError(s"Lost connection to worker rpc endpoint $workerUrl. Exiting.")
+         exitNonZero()
+       }
+       
+       def onNetworkError(cause: Throwable, remoteAddress: RpcAddress): Unit
+       功能: 处理网络错误
+       if (isWorker(remoteAddress)) {
+         logError(s"Could not initialize connection to worker $workerUrl. Exiting.")
+         logError(s"Error was: $cause")
+         exitNonZero()
+       }
+   }
+   ```
 
 #### ApplicationDescription
 
@@ -1587,9 +2791,112 @@ extends Logging {
 
 #### PythonRunner
 
+```scala
+介绍: 运行python应用程序的主类,在这里不做详细介绍
+object PythonRunner {
+    操作集:
+    def formatPath(path: String, testWindows: Boolean = false): String
+    功能: 格式化python文件路径,以至于可以添加到python路径中
+    python不了解路径中的URI schema,再添加到python文件之前,首先需要根据URI抓取路径.由于只支持本地文件所以这样做是安全的.
+    
+    def formatPaths(paths: String, testWindows: Boolean = false): Array[String]
+    功能: 格式化python文件路径,以至于可以添加到python路径中去
+    
+    def resolvePyFiles(pyFiles: Array[String]): Array[String]
+    功能: 解决.py文件,该方法创建一个临时目录,将.py文件放入给定的路径中去
+    
+    def main(args: Array[String]): Unit
+    功能: 启动函数
+}
+```
+
 #### RPackageUtils
 
+```scala
+介绍: R语言的打包工具,不做详细介绍
+private[deploy] object RPackageUtils extends Logging {
+    属性:
+    #name @hasRPackage = "Spark-HasRPackage"
+    	MANIFEST.mf寻找的key,这个jar中含有R程序代码
+    #name @baseInstallCmd = Seq("R", "CMD", "INSTALL", "-l")
+    	基本shell指令,用于安装R包
+    #name @RJarEntries = "R/pkg"	
+    	R代码的具体位置
+    #name @val RJarDoc R源文件在jar中的展示形式
+    val= s"""In order for Spark to build R packages that are parts of 
+    Spark Packages, there are a few
+      |requirements. The R source code must be shipped in a jar, 
+      with additional Java/Scala
+      |classes. The jar must be in the following format:
+      |  1- The Manifest (META-INF/MANIFEST.mf) must contain the key-value: 
+      $hasRPackage: true
+      |  2- The standard R package layout must be preserved under R/pkg/ 
+      inside the jar. More
+      |  information on the standard R package layout can be found in:
+      |  http://cran.r-project.org/doc/contrib/Leisch-CreatingPackages.pdf
+      |  An example layout is given below. After running `jar tf $$JAR_FILE | sort`:
+      |
+      |META-INF/MANIFEST.MF
+      |R/
+      |R/pkg/
+      |R/pkg/DESCRIPTION
+      |R/pkg/NAMESPACE
+      |R/pkg/R/
+      |R/pkg/R/myRcode.R
+      |org/
+      |org/apache/
+      |...
+    """.stripMargin.trim
+    
+    操作集:
+    def print(
+      msg: String,
+      printStream: PrintStream,
+      level: Level = Level.FINE,
+      e: Throwable = null): Unit
+    功能: 打印方法,用于debug
+    
+    def checkManifestForR(jar: JarFile): Boolean
+    功能: 检查是否有R代码打包到jar包,用于测试
+    
+    def rPackageBuilder(
+      dir: File,
+      printStream: PrintStream,
+      verbose: Boolean,
+      libDir: String): Boolean
+    功能: 运行R包标准安装代码,由资源构建jar包.
+    def rPackageBuilder(
+      dir: File,
+      printStream: PrintStream,
+      verbose: Boolean,
+      libDir: String): Boolean
+    
+    def extractRFolder(jar: JarFile, printStream: PrintStream, verbose: Boolean): File
+    功能: 抓取在/R 目录下的文件到一个临时文件中,用于构建
+    
+    def checkAndBuildRPackage(
+      jars: String,
+      printStream: PrintStream = null,
+      verbose: Boolean = false): Unit 
+    功能: 检查和构建R包
+    
+    def listFilesRecursively(dir: File, excludePatterns: Seq[String]): Set[File]
+    功能: 迭代列举文件
+    
+    def zipRLibraries(dir: File, name: String): File
+    功能: 归档所有R的库文件,用于分发到集群上
+}
+```
+
 #### RRunner
+
+```scala
+介绍: R语言的运行类,这里不做详细介绍
+object RRunner {
+    def main(args: Array[String]): Unit
+    功能: 启动函数
+}
+```
 
 #### SparkApplication
 
@@ -1669,4 +2976,7 @@ private[spark] object SparkCuratorUtil extends Logging {
 #### 基础拓展
 
 1.  [抽象语法树 AST](https://en.wikipedia.org/wiki/Abstract_syntax_tree)
+2.  [密钥分配中心 KDC](https://en.wikipedia.org/wiki/Key_distribution_center)
+3.  [TGT](https://en.wikipedia.org/wiki/Ticket_Granting_Ticket)
+4.   [REST](https://zh.wikipedia.org/wiki/表现层状态转换)
 
