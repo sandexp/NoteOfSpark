@@ -258,693 +258,2004 @@ private[spark] trait StandaloneAppClientListener {
 
 #### master
 
+##### UI
+
+```markdown
+包含三个WEB相关的页面
+1. 应用程序页	@ApplicationPage
+2. master页	@MasterPage
+3. master webUI	@MasterWebUI
+```
+
+##### ApplicationInfo
+
+```scala
+private[spark] class ApplicationInfo(
+    val startTime: Long,
+    val id: String,
+    val desc: ApplicationDescription,
+    val submitDate: Date,
+    val driver: RpcEndpointRef,
+    defaultCores: Int)
+extends Serializable {
+    介绍: 应用信息
+    构造器参数:
+    	startTime	开始时间
+    	id	应用编号
+    	desc	应用描述
+    	submitDate	提交日期
+    	driver	驱动器RPC引用
+    	defaultCores	默认核心数量
+    属性:
+    #name @state: ApplicationState.Value = _	transient	应用状态
+    #name @executors: mutable.HashMap[Int, ExecutorDesc]	transient	执行器描述映射表
+    #name @removedExecutors: ArrayBuffer[ExecutorDesc] = _	transient	移除的执行器列表
+    #name @coresGranted: Int = _	transient	授权的核心数量
+    #name @endTime: Long = _	transient	结束时间
+    #name @appSource: ApplicationSource = _	transient	应用资源
+    #name @_retryCount = 0	重试计数器
+    #name @requestedCores = desc.maxCores.getOrElse(defaultCores)	请求核心数量
+    #name @nextExecutorId: Int = _	transient	执行器编号
+    #name @executorLimit: Int = _	执行器上限数量
+    操作集:
+    def readObject(in: java.io.ObjectInputStream): Unit
+    功能: 读取配置文件
+    Utils.tryOrIOException {
+        in.defaultReadObject()
+        init()
+      }
+    
+    def init(): Unit
+    功能: 初始化
+    state = ApplicationState.WAITING
+    executors = new mutable.HashMap[Int, ExecutorDesc]
+    coresGranted = 0
+    endTime = -1L
+    appSource = new ApplicationSource(this)
+    nextExecutorId = 0
+    removedExecutors = new ArrayBuffer[ExecutorDesc]
+    executorLimit = desc.initialExecutorLimit.getOrElse(Integer.MAX_VALUE)
+    
+    def newExecutorId(useID: Option[Int] = None): Int
+    功能: 新建执行器编号
+    val= useID match {
+      case Some(id) => // 移动执行器编号指针
+        nextExecutorId = math.max(nextExecutorId, id + 1)
+        id
+      case None => // 新建并移动执行器指针
+        val id = nextExecutorId
+        nextExecutorId += 1
+        id
+    }
+    
+    def addExecutor(
+      worker: WorkerInfo,
+      cores: Int,
+      resources: Map[String, ResourceInformation],
+      useID: Option[Int] = None): ExecutorDesc
+    功能: 添加指定执行器@userID
+    1. 获取执行描述
+    val exec = new ExecutorDesc(newExecutorId(useID), this, worker, cores,
+      desc.memoryPerExecutorMB, resources)
+    2. 更新执行器列表,以及CPU数量信息
+    executors(exec.id) = exec
+    coresGranted += cores
+    val= exec
+    
+    def removeExecutor(exec: ExecutorDesc): Unit 
+    功能: 移除执行器
+    if (executors.contains(exec.id)) {
+      removedExecutors += executors(exec.id)
+      executors -= exec.id
+      coresGranted -= exec.cores
+    }
+    
+    def coresLeft: Int = requestedCores - coresGranted
+    功能: 计算剩余的核心数量
+    
+    def retryCount = _retryCount
+    功能: 计算重试次数
+    
+    def incrementRetryCount() 
+    功能: 增加重试计数次数
+    _retryCount += 1
+    val= _retryCount
+    
+    def resetRetryCount() = _retryCount = 0
+    功能: 重置重试计数器
+    
+    def markFinished(endState: ApplicationState.Value): Unit
+    功能: 标记应用完成
+    state = endState
+    endTime = System.currentTimeMillis()
+    
+    def isFinished: Boolean
+    功能: 确定任务是否完成
+    val= state != ApplicationState.WAITING && state != ApplicationState.RUNNING
+    
+    def getExecutorLimit: Int = executorLimit
+    功能: 获取执行器上限数量
+    
+    def duration: Long
+    功能: 确定任务持续时间
+    val= if (endTime != -1) {
+      endTime - startTime
+    } else {
+      System.currentTimeMillis() - startTime
+    }
+}
+```
+
+##### ApplicationSource
+
+```scala
+private[master] class ApplicationSource(val application: ApplicationInfo) extends Source {
+    介绍: 应用资源
+    构造器参数:
+    	application	应用信息
+    属性:
+    #name @metricRegistry = new MetricRegistry()	度量值注册器
+    #name @sourceName	资源名称
+    val= "%s.%s.%s".format("application", application.desc.name,
+    System.currentTimeMillis())
+    初始化操作:
+    metricRegistry.register(MetricRegistry.name("status"), new Gauge[String] {
+        override def getValue: String = application.state.toString
+      })
+    功能: 注册状态信息
+    
+    metricRegistry.register(MetricRegistry.name("runtime_ms"), new Gauge[Long] {
+        override def getValue: Long = application.duration
+      })
+    功能: 注册运行时间信息
+    
+    metricRegistry.register(MetricRegistry.name("cores"), new Gauge[Int] {
+        override def getValue: Int = application.coresGranted
+      })
+    功能: 注册核心数量信息
+}
+```
+
+##### ApplicationState
+
+```scala
+private[master] object ApplicationState extends Enumeration {
+    介绍: 应用状态
+    type ApplicationState = Value
+    val WAITING, RUNNING, FINISHED, FAILED, KILLED, UNKNOWN = Value
+    状态类型:
+    	1. 等待
+    	2. 运行中
+    	3. 完成
+    	4. 失败
+    	5. 中断(Kill)
+    	6. 未知
+}
+```
+
+##### DriverInfo
+
+```scala
+private[deploy] class DriverInfo(
+    val startTime: Long,
+    val id: String,
+    val desc: DriverDescription,
+    val submitDate: Date)
+extends Serializable {
+    介绍: 驱动器信息
+    构造器参数:
+    	startTime	开始时间
+    	id	驱动器ID
+    	desc	驱动器描述
+    	submitDate	提交日期
+    属性:
+    #name @state: DriverState.Value = DriverState.SUBMITTED	驱动器状态
+    #name @exception: Option[Exception] = None	异常
+    #name @worker: Option[WorkerInfo] = None	worker信息
+    #name @_resources: Map[String, ResourceInformation] = _	资源信息表(gpu,fpga等等)
+    操作集:
+    def readObject(in: java.io.ObjectInputStream): Unit
+    功能: 读取外部配置
+    in.defaultReadObject()
+    init()
+    
+    def init(): Unit
+    功能: 初始化
+    state = DriverState.SUBMITTED
+    worker = None
+    exception = None
+    
+    def withResources(r: Map[String, ResourceInformation]): Unit = _resources = r
+    功能: 设置资源列表
+    
+    def resources: Map[String, ResourceInformation] = _resources
+    功能: 获取驱动器资源列表
+}
+```
+
+##### DriverState
+
+```scala
+private[deploy] object DriverState extends Enumeration {
+    介绍: 驱动器状态
+    type DriverState = Value
+    val SUBMITTED, RUNNING, FINISHED, RELAUNCHING, UNKNOWN, KILLED, FAILED, ERROR = Value
+    状态列表:
+    	SUBMITTED	提交但是没有在worker上调用
+    	RUNNING	已经分配运行的worker
+    	FINISHED	运行完毕
+    	RELAUCHING	重新运行
+    	UNKNOWN	未知状态
+    	KILLED	kill状态
+    	FAILED	运行失败
+    	ERROR	运行错误
+}
+```
+
+##### ExecutorDesc
+
+```scala
+private[master] class ExecutorDesc(
+    val id: Int,
+    val application: ApplicationInfo,
+    val worker: WorkerInfo,
+    val cores: Int,
+    val memory: Int,
+    val resources: Map[String, ResourceInformation]) {
+    功能: 执行器描述
+    构造器参数:
+    	id	执行器编号
+    	application	应用信息
+    	worker	worker信息
+    	cores	核心数量
+    	memory	内存占用大小
+    	resources	执行器分配的资源列表(gpu/resources)
+    属性:
+    #name @state = ExecutorState.LAUNCHING	执行器状态
+    操作集:
+    def fullId: String = application.id + "/" + id
+    功能: 获取全局唯一标识符
+    
+    def equals(other: Any): Boolean
+    功能: 相等判定
+    val= other match {
+      case info: ExecutorDesc =>
+        fullId == info.fullId &&
+        worker.id == info.worker.id &&
+        cores == info.cores &&
+        memory == info.memory
+      case _ => false
+    }
+    
+    def toString: String = fullId
+    功能: 信息显示
+    
+    def hashCode: Int = toString.hashCode()
+    功能: 求解hashcode
+    
+    def copyState(execDesc: ExecutorDescription): Unit
+    功能: 从制定的执行器描述@execDesc中拷贝所有状态变量
+}
+```
+
+##### FileSystemPersistenceEngine
+
+```scala
+private[master] class FileSystemPersistenceEngine(
+    val dir: String,
+    val serializer: Serializer)
+extends PersistenceEngine with Logging {
+    介绍: 文件系统持久化引擎
+    存储数据到磁盘目录上,按照每个worker每个应用存储一个文件的原则存储.
+    构造器参数:
+    	dir	目录名称
+    	serializer	序列化器
+    操作集:
+    def persist(name: String, obj: Object): Unit
+    功能: 将指定对象@obj 持久化为文件名称为dir+name的文件
+    serializeIntoFile(new File(dir + File.separator + name), obj)
+    
+    def unpersist(name: String): Unit
+    功能: 去除指定dir+name持久化
+    val f = new File(dir + File.separator + name)
+    if (!f.delete()) {
+      logWarning(s"Error deleting ${f.getPath()}")
+    }
+    
+    def read[T: ClassTag](prefix: String): Seq[T]
+    功能: 读取目录dir中前缀为@prefix的文件
+    val files = new File(dir).listFiles().filter(_.getName.startsWith(prefix))
+    files.map(deserializeFromFile[T])
+    
+    def serializeIntoFile(file: File, value: AnyRef): Unit
+    功能: 序列化为文件
+    val created = file.createNewFile()
+    if (!created) { throw new IllegalStateException("Could not create file: " + file) }
+    val fileOut = new FileOutputStream(file)
+    var out: SerializationStream = null
+    Utils.tryWithSafeFinally {
+      out = serializer.newInstance().serializeStream(fileOut)
+      out.writeObject(value)
+    } {
+      fileOut.close()
+      if (out != null) {
+        out.close()
+      }
+    }
+    
+    def deserializeFromFile[T](file: File)(implicit m: ClassTag[T]): T
+    功能: 反序列化指定文件
+    val fileIn = new FileInputStream(file)
+    var in: DeserializationStream = null
+    try {
+      in = serializer.newInstance().deserializeStream(fileIn)
+      in.readObject[T]()
+    } finally {
+      fileIn.close()
+      if (in != null) {
+        in.close()
+      }
+    }
+    
+    初始化操作:
+    new File(dir).mkdir()
+    功能: 创建指定目录
+}
+```
+
+##### LeaderElectionAgent
+
+```scala
+@DeveloperApi
+trait LeaderElectionAgent {
+	介绍: leader选举代理,定位当前master,对于所有选举代理来说是一个通用接口
+    val masterInstance: LeaderElectable 
+    def stop(): Unit = {} // to avoid noops in implementations.
+}
+
+@DeveloperApi
+trait LeaderElectable {
+    介绍: 可以选择leader
+    def electedLeader(): Unit
+    功能: 选举leader
+    def revokedLeadership(): Unit
+    功能: 取消leader
+}
+
+private[spark] class MonarchyLeaderAgent(val masterInstance: LeaderElectable)
+extends LeaderElectionAgent {
+    介绍: leader选举代理的单节点实现
+    masterInstance.electedLeader()
+}
+```
+
+##### master
+
+##### MasterArguments
+
+```scala
+private[master] class MasterArguments(args: Array[String], conf: SparkConf) 
+extends Logging {
+    介绍: master属性
+    构造器参数:
+    	args	属性列表
+    	conf	spark配置
+    属性:
+    #name @host = Utils.localHostName()	主机名称
+    #name @port = 7077	端口号
+    #name @webUiPort = 8080	web端口号
+    #name @propertiesFile: String = null	属性文件
+    操作集:
+    @tailrec
+    private def parse(args: List[String]): Unit
+    功能: 指令转换
+    args match {
+        case ("--ip" | "-i") :: value :: tail => // 主机指令
+          Utils.checkHost(value)
+          host = value
+          parse(tail)
+        case ("--host" | "-h") :: value :: tail => // 主机指令
+          Utils.checkHost(value)
+          host = value
+          parse(tail)
+        case ("--port" | "-p") :: IntParam(value) :: tail => // 端口指令
+          port = value
+          parse(tail)
+        case "--webui-port" :: IntParam(value) :: tail => // web端口指令
+          webUiPort = value
+          parse(tail)
+        case ("--properties-file") :: value :: tail => // 指定配置文件
+          propertiesFile = value
+          parse(tail)
+        case ("--help") :: tail => // 正常打印信息并退出
+          printUsageAndExit(0)
+        case Nil => // No-op
+        case _ =>
+          printUsageAndExit(1) // 打印信息,非正常退出
+      }
+    
+    def printUsageAndExit(exitCode: Int): Unit
+    功能: 打印使用信息,并退出
+    System.err.println(
+      "Usage: Master [options]\n" +
+      "\n" +
+      "Options:\n" +
+      "  -i HOST, --ip HOST     Hostname to listen on 
+      (deprecated, please use --host or -h) \n" +
+      "  -h HOST, --host HOST   Hostname to listen on\n" +
+      "  -p PORT, --port PORT   Port to listen on (default: 7077)\n" +
+      "  --webui-port PORT      Port for web UI (default: 8080)\n" +
+      "  --properties-file FILE Path to a custom Spark properties file.\n" +
+      "                         Default is conf/spark-defaults.conf.")
+    System.exit(exitCode)
+    
+    初始化操作:
+    if (System.getenv("SPARK_MASTER_IP") != null) {
+        logWarning("SPARK_MASTER_IP is deprecated, please use SPARK_MASTER_HOST")
+        host = System.getenv("SPARK_MASTER_IP")
+      }
+      if (System.getenv("SPARK_MASTER_HOST") != null) {
+        host = System.getenv("SPARK_MASTER_HOST")
+      }
+      if (System.getenv("SPARK_MASTER_PORT") != null) {
+        port = System.getenv("SPARK_MASTER_PORT").toInt
+      }
+      if (System.getenv("SPARK_MASTER_WEBUI_PORT") != null) {
+        webUiPort = System.getenv("SPARK_MASTER_WEBUI_PORT").toInt
+      }
+    功能: 检查环境变量
+    
+    parse(args.toList)
+    功能: 转换参数列表中的参数
+    
+    propertiesFile = Utils.loadDefaultSparkProperties(conf, propertiesFile)
+    功能: 指定配置文件
+    
+    if (conf.contains(MASTER_UI_PORT.key)) {
+        webUiPort = conf.get(MASTER_UI_PORT)
+    }
+    功能: 设定web端口
+}
+```
+
+##### MasterMessages
+
+```scala
+private[master] object MasterMessages {
+    介绍: master消息,内部包含只有master可见的信息
+    
+    ---
+    使用选举代理
+    
+    case object ElectedLeader
+    介绍: 选举的leader
+    
+    case object RevokedLeadership
+    介绍: 取消leader
+    
+    ---
+    自己管理自己
+    case object CheckForWorkerTimeOut
+    介绍: 检查超时时间
+    
+    case class BeginRecovery(storedApps: Seq[ApplicationInfo], 
+                             storedWorkers: Seq[WorkerInfo])
+    介绍: 开始恢复
+    
+    case object CompleteRecovery
+    介绍: 完成恢复
+    
+    case object BoundPortsRequest
+    介绍: 请求界限端口
+    
+    class BoundPortsResponse(rpcEndpointPort: Int, webUIPort: Int, restPort: Option[Int])
+    介绍: 响应界限端口
+}
+```
+
+##### MasterSource
+
+```scala
+private[spark] class MasterSource(val master: Master) extends Source {
+    属性: 
+    #name @metricRegistry = new MetricRegistry()	度量值注册器
+    #name @sourceName = "master"	资源名称
+    初始化操作:
+    metricRegistry.register(MetricRegistry.name("workers"), new Gauge[Int] {
+        override def getValue: Int = master.workers.size
+    })
+	功能: 注册worker信息
+    
+    metricRegistry.register(MetricRegistry.name("aliveWorkers"), new Gauge[Int]{
+        override def getValue: Int = master.workers.count(_.state == WorkerState.ALIVE)
+    })
+    功能: 注册存活的worker信息
+    
+    metricRegistry.register(MetricRegistry.name("apps"), new Gauge[Int] {
+        override def getValue: Int = master.apps.size
+    })
+    功能: 注册应用信息
+    
+    metricRegistry.register(MetricRegistry.name("waitingApps"), new Gauge[Int] {
+        override def getValue: Int = master.apps.count(
+            _.state == ApplicationState.WAITING)
+    })
+    功能: 注册等待应用信息
+}
+```
+
+##### PersistenceEngine
+
+```markdown
+介绍:
+ 	运行master持久化任何需要的状态,用于从失败中恢复
+ 	需要下述语义:
+ 	1. 添加应用@addApplication和添加worker @addWorker 在完成新的应用/worker注册之前进行调用.
+ 	2. 移除应用和移除worker可以在任何时刻调用
+ 	满足上述两点前置需求,就可以将应用/worker进行持久化,但是不可以删除已经完成的应用/worker(恢复的时候必须要获得生产状态)
+ 	这个类的实现定义了命名对象键值对是如何进行存储和检索的.
+```
+
+```scala
+@DeveloperApi
+abstract class PersistenceEngine {
+    操作集:
+    def persist(name: String, obj: Object): Unit
+    功能: 持久化指定对象@obj
+    
+    def unpersist(name: String): Unit
+    功能: 解除指定名称的持久化
+    
+    def read[T: ClassTag](prefix: String): Seq[T]
+    功能:  根据前缀信息@prefix 返回读取回来的数据
+    
+    final def addApplication(app: ApplicationInfo): Unit
+    功能: 添加应用
+    persist("app_" + app.id, app)
+    
+    final def removeApplication(app: ApplicationInfo): Unit
+    功能: 移除应用@app
+    unpersist("app_" + app.id)
+    
+    final def addWorker(worker: WorkerInfo): Unit
+    功能: 添加worker
+    persist("worker_" + worker.id, worker)
+    
+    final def removeWorker(worker: WorkerInfo): Unit 
+    功能: 移除worker
+    unpersist("worker_" + worker.id)
+    
+    final def addDriver(driver: DriverInfo): Unit
+    功能: 添加驱动器
+    persist("driver_" + driver.id, driver)
+    
+    final def removeDriver(driver: DriverInfo): Unit
+    功能: 移除驱动器
+    unpersist("driver_" + driver.id)
+    
+    def close(): Unit = {}
+    功能: 关闭引擎
+    
+    final def readPersistedData(
+      rpcEnv: RpcEnv): (Seq[ApplicationInfo], Seq[DriverInfo], Seq[WorkerInfo])
+    功能: 读取持久化数据
+    rpcEnv.deserialize { () =>
+      (read[ApplicationInfo]("app_"), read[DriverInfo]("driver_"), 
+       read[WorkerInfo]("worker_"))
+    }
+}
+```
+
+```scala
+private[master] class BlackHolePersistenceEngine extends PersistenceEngine {
+    def persist(name: String, obj: Object): Unit = {}
+    功能: 持久化
+    
+    def unpersist(name: String): Unit = {}
+    功能: 解除持久化
+    
+    def read[T: ClassTag](name: String): Seq[T] = Nil
+    功能: 读取持久化数据
+}
+```
+
+##### StandaloneRecoveryModeFactory
+
+```scala
+@DeveloperApi
+abstract class StandaloneRecoveryModeFactory(conf: SparkConf, serializer: Serializer){
+    介绍: 独立运行恢复模式工厂
+    这个类的实现可以在spark独立模式下作为恢复模式进行插拔
+    操作集:
+    def createPersistenceEngine(): PersistenceEngine
+    功能: 创建持久化引擎
+    
+    def createLeaderElectionAgent(master: LeaderElectable): LeaderElectionAgent
+    功能: 创建leader引擎代理
+}
+```
+
+```scala
+private[master] class FileSystemRecoveryModeFactory(
+    conf: SparkConf, serializer: Serializer)
+extends StandaloneRecoveryModeFactory(conf, serializer) with Logging {
+    介绍: 文件系统恢复模式工厂,这种情况下领导者代理@LeaderAgent 是无法操作的,由于是从文件系统进行恢复,所以leader永远是leader.
+    属性:
+    #name @recoveryDir = conf.get(RECOVERY_DIRECTORY)	恢复目录
+    操作集:
+    def createPersistenceEngine(): PersistenceEngine
+    功能: 创建持久化引擎
+    logInfo("Persisting recovery state to directory: " + recoveryDir)
+    val= new FileSystemPersistenceEngine(recoveryDir, serializer)
+    
+    def createLeaderElectionAgent(master: LeaderElectable): LeaderElectionAgent
+    功能: 创建leader代理
+    val= new MonarchyLeaderAgent(master)
+}
+```
+
+```scala
+private[master] class ZooKeeperRecoveryModeFactory(
+    conf: SparkConf, serializer: Serializer)
+extends StandaloneRecoveryModeFactory(conf, serializer) {
+    介绍: zookeeper恢复模式工厂
+    操作集:
+    def createPersistenceEngine(): PersistenceEngine
+    功能: 创建持久化引擎
+    val= new ZooKeeperPersistenceEngine(conf, serializer)
+    
+    def createLeaderElectionAgent(master: LeaderElectable): LeaderElectionAgent
+    功能: 创建leader选举代理
+    val= new ZooKeeperLeaderElectionAgent(master, conf)
+}
+```
+
+##### RecoveryState
+
+```scala
+private[deploy] object RecoveryState extends Enumeration {
+    type MasterState = Value
+	
+    val STANDBY, ALIVE, RECOVERING, COMPLETING_RECOVERY = Value
+    状态列表:
+    	standby		备用
+    	alive	存活
+    	recovering	恢复状态
+    	complete_recovery	完全恢复
+}
+```
+
+##### WorkerInfo
+
+```scala
+private[spark] case class WorkerResourceInfo(name: String, addresses: Seq[String])
+extends ResourceAllocator {
+    介绍: worker的资源信息
+    构造器参数:
+    	name 	worker名称
+    	address	地址列表
+    操作集:
+    def resourceName = this.name
+    功能: 获取资源名称
+    
+    def resourceAddresses = this.addresses
+    功能: 获取资源地址
+    
+    def slotsPerAddress: Int = 1
+    功能: 获取每个地址的槽数
+    
+    def acquire(amount: Int): ResourceInformation
+    功能: 获取指定数量的资源信息
+    val allocated = availableAddrs.take(amount)
+    acquire(allocated)
+    val= new ResourceInformation(resourceName, allocated.toArray)
+}
+```
+
+```scala
+private[spark] class WorkerInfo(
+    val id: String,
+    val host: String,
+    val port: Int,
+    val cores: Int,
+    val memory: Int,
+    val endpoint: RpcEndpointRef,
+    val webUiAddress: String,
+    val resources: Map[String, WorkerResourceInfo])
+extends Serializable {
+    介绍: worker信息
+    构造器参数:
+    	id	worker编号
+    	host	主机名称
+    	port	端口号
+    	cores	核心数量
+    	memory	内存大小
+    	endpoint	RPC端点
+    	webUiAddress	webUI地址
+    	resources	资源列表
+    属性:
+    #name @executors: mutable.HashMap[String, ExecutorDesc] = _	执行器描述映射表
+    #name @drivers: mutable.HashMap[String, DriverInfo] = _	驱动器映射表
+    #name @state: WorkerState.Value = _	状态信息
+    #name @coresUsed: Int = _	核心使用量
+    #name @memoryUsed: Int = _	内存使用量
+    #name @lastHeartbeat: Long = _	上次心跳时间
+    操作集:
+    def coresFree: Int = cores - coresUsed
+    功能: 获取空闲核心数量
+    
+    def memoryFree: Int = memory - memoryUsed
+    功能: 获取内存释放量
+    
+    def resourcesAmountFree: Map[String, Int]
+    功能: 获取资源释放量
+    val= resources.map { case (rName, rInfo) =>
+      rName -> rInfo.availableAddrs.length
+    }
+    
+    def resourcesInfo: Map[String, ResourceInformation]
+    功能: 获取资源信息表
+    val= resources.map { case (rName, rInfo) =>
+      rName -> new ResourceInformation(rName, rInfo.addresses.toArray)
+    }
+    
+    def resourcesInfoFree: Map[String, ResourceInformation]
+    功能: 获取资源释放表
+    val= resources.map { case (rName, rInfo) =>
+      rName -> new ResourceInformation(rName, rInfo.availableAddrs.toArray)
+    }
+    
+    def resourcesInfoUsed: Map[String, ResourceInformation]
+    功能: 获取资源使用情况表
+    val= resources.map { case (rName, rInfo) =>
+      rName -> new ResourceInformation(rName, rInfo.assignedAddrs.toArray)
+    }
+    
+    def readObject(in: java.io.ObjectInputStream): Unit
+    功能: 读取参数信息
+    val= Utils.tryOrIOException {
+        in.defaultReadObject()
+        init()
+      }
+    
+    def init(): Unit
+    功能: 初始化
+    executors = new mutable.HashMap
+    drivers = new mutable.HashMap
+    state = WorkerState.ALIVE
+    coresUsed = 0
+    memoryUsed = 0
+    lastHeartbeat = System.currentTimeMillis()
+    
+    def removeExecutor(exec: ExecutorDesc): Unit
+    功能: 移除执行器(移除度量信息+ 释放执行器所占有的内存)
+    if (executors.contains(exec.fullId)) {
+      executors -= exec.fullId
+      coresUsed -= exec.cores
+      memoryUsed -= exec.memory
+      releaseResources(exec.resources)
+    }
+    
+    def addExecutor(exec: ExecutorDesc): Unit
+    功能: 添加执行器
+    executors(exec.fullId) = exec
+    coresUsed += exec.cores
+    memoryUsed += exec.memory
+    
+    def addDriver(driver: DriverInfo): Unit
+    功能: 添加驱动器
+    drivers(driver.id) = driver
+    memoryUsed += driver.desc.mem
+    coresUsed += driver.desc.cores
+    
+    def removeDriver(driver: DriverInfo): Unit
+    功能: 移除驱动器
+    drivers -= driver.id
+    memoryUsed -= driver.desc.mem
+    coresUsed -= driver.desc.cores
+    releaseResources(driver.resources)
+    
+    def setState(state: WorkerState.Value): Unit
+    功能: 设置worker状态
+    this.state = state
+    
+    def isAlive(): Boolean = this.state == WorkerState.ALIVE
+    功能: 确定worker是否存活
+    
+    def acquireResources(resourceReqs: Seq[ResourceRequirement])
+    : Map[String, ResourceInformation]
+    功能: 获取指定的资源列表,返回一个资源映射表(执行器编号--> 资源信息)
+    resourceReqs.map { req =>
+      val rName = req.resourceName
+      val amount = req.amount
+      rName -> resources(rName).acquire(amount)
+    }.toMap
+    
+    def recoverResources(expected: Map[String, ResourceInformation]): Unit
+    功能: 恢复资源,在master恢复时使用
+    expected.foreach { case (rName, rInfo) =>
+      resources(rName).acquire(rInfo.addresses)
+    }
+    
+    def releaseResources(allocated: Map[String, ResourceInformation]): Unit
+    功能: 释放指定的资源信息表
+    allocated.foreach { case (rName, rInfo) =>
+      resources(rName).release(rInfo.addresses)
+    }
+}
+```
+
+##### WorkerState
+
+```scala
+private[master] object WorkerState extends Enumeration {
+    type WorkerState = Value
+
+    val ALIVE, DEAD, DECOMMISSIONED, UNKNOWN = Value
+  	worker状态列表:
+    	alive	存活
+    	dead	死亡
+    	decommissioned	退役
+    	unknown	未知状态
+}
+```
+
+##### ZooKeeperLeaderElectionAgent
+
+```scala
+private[master] class ZooKeeperLeaderElectionAgent(val masterInstance: LeaderElectable,
+    conf: SparkConf) extends LeaderLatchListener with LeaderElectionAgent with Logging  {
+    介绍: zookeeper leader选举代理
+    属性:
+    #name @workingDir 	工作目录
+    val= conf.get(ZOOKEEPER_DIRECTORY).getOrElse("/spark") + "/leader_election"
+    #name @zk: CuratorFramework = _	zk监视框架
+    #name @leaderLatch: LeaderLatch = _	领导占有者
+    在一组JMV(连接到zk集群)中的多个竞争者中选取一个leader,如果N个线程/进程竞争leader,其中一个会被随机的任命为leader,直到它释放了leader权限,才会任命其他竞争者作为leader
+    #name @status = LeadershipStatus.NOT_LEADER	leader状态
+    操作集:
+    def start(): Unit
+    功能: 启动zk leader选举代理
+    zk = SparkCuratorUtil.newClient(conf)
+    leaderLatch = new LeaderLatch(zk, workingDir)
+    leaderLatch.addListener(this)
+    leaderLatch.start()
+    
+    def stop(): Unit
+    功能: 停止代理
+    leaderLatch.close()
+    zk.close()
+    
+    def isLeader(): Unit
+    功能: 确认是否为leader
+    synchronized {
+      // could have lost leadership by now.
+      if (!leaderLatch.hasLeadership) {
+        return
+      }
+      logInfo("We have gained leadership") // 获取了leader
+      updateLeadershipStatus(true)
+    }
+    
+    def notLeader(): Unit
+    功能: 没有leader的处理
+    synchronized {
+      // could have gained leadership by now.
+      if (leaderLatch.hasLeadership) {
+        return
+      }
+      logInfo("We have lost leadership")
+      updateLeadershipStatus(false)
+    }
+    
+    def updateLeadershipStatus(isLeader: Boolean): Unit
+    功能: 更新leader状态
+    if (isLeader && status == LeadershipStatus.NOT_LEADER) { // leader选举处理
+      status = LeadershipStatus.LEADER
+      masterInstance.electedLeader()
+    } else if (!isLeader && status == LeadershipStatus.LEADER) { // leader释放处理
+      status = LeadershipStatus.NOT_LEADER
+      masterInstance.revokedLeadership()
+    }
+    
+    内部类:
+    private object LeadershipStatus extends Enumeration {
+        type LeadershipStatus = Value
+        val LEADER, NOT_LEADER = Value
+      }
+}
+```
+
+##### ZooKeeperPersistenceEngine
+
+```scala
+private[master] class ZooKeeperPersistenceEngine(conf: SparkConf, val serializer: Serializer) extends PersistenceEngine with Logging {
+    介绍: zk 持久化引擎
+    属性:
+    #name @workingDir	工作目录
+    val= conf.get(ZOOKEEPER_DIRECTORY).getOrElse("/spark") + "/master_status"
+    #name @zk: CuratorFramework = SparkCuratorUtil.newClient(conf)	zk监视框架
+    操作集:
+    def persist(name: String, obj: Object): Unit
+    功能: 持久化数据
+    serializeIntoFile(workingDir + "/" + name, obj)
+    
+    def unpersist(name: String): Unit
+    功能: 解除持久化
+    zk.delete().forPath(workingDir + "/" + name)
+    
+    def read[T: ClassTag](prefix: String): Seq[T]
+    功能: 读取工作目录中,指定前缀的数据
+    val= zk.getChildren.forPath(workingDir).asScala
+      .filter(_.startsWith(prefix)).flatMap(deserializeFromFile[T])
+    
+    def close(): Unit
+    功能: 关闭zk
+    zk.close()
+    
+    def serializeIntoFile(path: String, value: AnyRef): Unit
+    功能: 序列化文件
+    val serialized = serializer.newInstance().serialize(value)
+    val bytes = new Array[Byte](serialized.remaining())
+    serialized.get(bytes)
+    zk.create().withMode(CreateMode.PERSISTENT).forPath(path, bytes)
+    
+    def deserializeFromFile[T](filename: String)(implicit m: ClassTag[T]): Option[T]
+    功能: 从文件中反序列化
+    val fileData = zk.getData().forPath(workingDir + "/" + filename)
+    val= try {
+      Some(serializer.newInstance().deserialize[T](ByteBuffer.wrap(fileData)))
+    } catch {
+      case e: Exception =>
+        logWarning("Exception while reading persisted file, deleting", e)
+        zk.delete().forPath(workingDir + "/" + filename)
+        None
+    }
+}
+```
+
 #### rest
 
-1.  [RestSubmissionClient.scala](# RestSubmissionClient)
+##### RestSubmissionClient
 
-   ```markdown
-   介绍:
-   	这是一个客户端,可以提交应用到Rest服务器上.
-    	在v1版本的协议中,rest url 的格式采取http://[host:port]/v1/submissions/[action],其中action是create,kill,status中的一个.每种请求代表着不同种类的HTTP消息.
-    	1. submit	POST --> /submission/create
-    	2. kill		POST --> /submission/kill/[submissionId]
-    	3. status	GET --> /submission/status/[submissionId]
-    	在类型1的情况下,蚕食使用json的格式放入HTTP的请求体中.否则URL完全指定客户端需要的动作.由于协议需要获取稳定的spark版本信息,所以存在的属性不能被添加或者移除,尽管新的配置属性可以添加.很少事件的前后兼容性被打破,spark必须提供一套新的协议(v2).
-    	客户端和服务器必须使用同样的协议才能够进行通信,如果不匹配,服务器会回应其支持的最高版本.会创建一个任务,这个异步任务描述的是客户端尝试使用这个版本与服务器进行通信.
-   ```
+```markdown
+介绍:
+	这是一个客户端,可以提交应用到Rest服务器上.
+ 	在v1版本的协议中,rest url 的格式采取http://[host:port]/v1/submissions/[action],其中action是create,kill,status中的一个.每种请求代表着不同种类的HTTP消息.
+ 	1. submit	POST --> /submission/create
+ 	2. kill		POST --> /submission/kill/[submissionId]
+ 	3. status	GET --> /submission/status/[submissionId]
+ 	在类型1的情况下,蚕食使用json的格式放入HTTP的请求体中.否则URL完全指定客户端需要的动作.由于协议需要获取稳定的spark版本信息,所以存在的属性不能被添加或者移除,尽管新的配置属性可以添加.很少事件的前后兼容性被打破,spark必须提供一套新的协议(v2).
+ 	客户端和服务器必须使用同样的协议才能够进行通信,如果不匹配,服务器会回应其支持的最高版本.会创建一个任务,这个异步任务描述的是客户端尝试使用这个版本与服务器进行通信.
+```
 
-   ```scala
-   private[spark] class RestSubmissionClient(master: String) extends Logging {
-       属性:
-       #name @masters: Array[String]	master列表
-       val= if (master.startsWith("spark://")) Utils.parseStandaloneMasterUrls(master)?
-       	else Array(master)
-       #name @lostMasters = new mutable.HashSet[String]	丢失master列表(去重)
-       操作集:
-       def createSubmission(request: CreateSubmissionRequest): SubmitRestProtocolResponse
-       功能: 创建一个提交,如果提交成功,轮询提交的状态位,并汇报给用户.否则汇报服务端的错误信息
-       1. 初始化执行标记
-       var handled: Boolean = false
-       var response: SubmitRestProtocolResponse = null
-       2. 处理master列表中的每个未处理的消息
-       for (m <- masters if !handled) {
-         // 验证master的合法性
-         validateMaster(m)
-         // 获取提交地址
-         val url = getSubmitUrl(m)
-         try {
-           // 获取request请求
-           response = postJson(url, request.toJson)
-           // 执行请求处理
-           response match {
-             case s: CreateSubmissionResponse =>
-               if (s.success) {
-                 reportSubmissionStatus(s)
-                 handleRestResponse(s)
-                 handled = true
-               }
-             case unexpected =>
-               handleUnexpectedRestResponse(unexpected)
-           }
-         } catch {
-           case e: SubmitRestConnectionException =>
-             if (handleConnectionException(m)) {
-               throw new SubmitRestConnectionException("Unable to connect to server", e)
-             }
-         }
-       }
-       
-       def killSubmission(submissionId: String): SubmitRestProtocolResponse
-       功能: 请求kill指定请求@submissionId
-       1. 初始化处理标记
-       var handled: Boolean = false
-       var response: SubmitRestProtocolResponse = null
-       2. 处理master中未处理的信息列表
-       for (m <- masters if !handled) {
-           // 验证master合法性
-         validateMaster(m)
-           // 获取需要kill的位置地址@URL
-         val url = getKillUrl(m, submissionId)
-         try {
-             // 发送请求,获取响应
-           response = post(url)
-             // 响应处理
-           response match {
-             case k: KillSubmissionResponse =>
-               if (!Utils.responseFromBackup(k.message)) {
-                 handleRestResponse(k)
-                 handled = true
-               }
-             case unexpected =>
-               handleUnexpectedRestResponse(unexpected)
-           }
-         } catch {
-           case e: SubmitRestConnectionException =>
-             if (handleConnectionException(m)) {
-               throw new SubmitRestConnectionException("Unable to connect to server", e)
-             }
-         }
-       }
-       val= response
-       
-       def requestSubmissionStatus(
-         submissionId: String,
-         quiet: Boolean = false): SubmitRestProtocolResponse
-       功能: 请求获取提交状态
-       输入参数:
-       	quiet 是否后台执行
-       1. 初始化处理标记
-       var handled: Boolean = false
-       var response: SubmitRestProtocolResponse = null
-       2. 处理masters列表中未处理消息中相关请求
-       for (m <- masters if !handled) {
-           // 验证master信息
-         validateMaster(m)
-           // 获取状态地址
-         val url = getStatusUrl(m, submissionId)
-             if (!quiet) { // 处理非后台执行
-               handleRestResponse(s)
-             }
-             handled = true
-             try {
-                 // 获取状态响应
-               response = get(url)
-               response match {
-                 case s: SubmissionStatusResponse if s.success =>
-           case unexpected =>
-             handleUnexpectedRestResponse(unexpected)
-           }
-         } catch {
-           case e: SubmitRestConnectionException =>
-             if (handleConnectionException(m)) {
-               throw new SubmitRestConnectionException("Unable to connect to server", e)
-             }
-         }
-       }
-       
-       def constructSubmitRequest(
-         appResource: String,
-         mainClass: String,
-         appArgs: Array[String],
-         sparkProperties: Map[String, String],
-         environmentVariables: Map[String, String]): CreateSubmissionRequest
-       功能: 构造提交请求
-       输入参数:
-       	appResource	应用资源信息
-       	mainClass	主类
-       	appArgs	应用参数
-       	sparkProperties	spark参数表
-       	environmentVariables	环境变量信息表
-       val message = new CreateSubmissionRequest
-       message.clientSparkVersion = sparkVersion
-       message.appResource = appResource
-       message.mainClass = mainClass
-       message.appArgs = appArgs
-       message.sparkProperties = sparkProperties
-       message.environmentVariables = environmentVariables
-       message.validate()
-       val= message
-       
-       def get(url: URL): SubmitRestProtocolResponse
-       功能: 发送GET请求到指定地址,获取响应
-       val conn = url.openConnection().asInstanceOf[HttpURLConnection]
-       conn.setRequestMethod("GET")
-       readResponse(conn)
-       
-       def post(url: URL): SubmitRestProtocolResponse
-       功能: 发送POST请求到指定地址,获取响应
-       val conn = url.openConnection().asInstanceOf[HttpURLConnection]
-       conn.setRequestMethod("POST")
-       readResponse(conn)
-       
-       def postJson(url: URL, json: String): SubmitRestProtocolResponse
-       功能: 使用指定json发送post请求到指定的url,并获取响应
-       1. 获取链接信息
-       val conn = url.openConnection().asInstanceOf[HttpURLConnection]
-       conn.setRequestMethod("POST")
-       conn.setRequestProperty("Content-Type", "application/json")
-       conn.setRequestProperty("charset", "utf-8")
-       conn.setDoOutput(true)
-       2. 写出json信息
-       try {
-         val out = new DataOutputStream(conn.getOutputStream)
-         Utils.tryWithSafeFinally {
-           out.write(json.getBytes(StandardCharsets.UTF_8))
-         } {
-           out.close()
-         }
-       } catch {
-         case e: ConnectException =>
-           throw new SubmitRestConnectionException("Connect Exception when connect to server", e)
-       }
-       3. 获取回应
-       val= readResponse(conn)
-       
-       def readResponse(connection: HttpURLConnection): SubmitRestProtocolResponse
-       功能: 读取服务器回应,并进行验证,之后获取@SubmitRestProtocolResponse,如果回应出错,则汇报一条嵌入式的消息给用户,可以暴露给测试
-       1. 获取一个异步任务,用户处理服务器回应
-       val responseFuture = Future {
-           // 获取请求码,并进行校验,如果请求码不正确
-           // 1. 服务器内部错误 --> 直接抛出异常
-           // 2. 其他错误,则包装错误信息,返回给用户
-         val responseCode = connection.getResponseCode
-         if (responseCode != HttpServletResponse.SC_OK) {
-           val errString = Some(Source.fromInputStream(connection.getErrorStream())
-             .getLines().mkString("\n"))
-           if (responseCode == HttpServletResponse.SC_INTERNAL_SERVER_ERROR &&
-             !connection.getContentType().contains("application/json")) {
-             throw new SubmitRestProtocolException(s"Server responded with exception:\n${errString}")
-           }
-           logError(s"Server responded with error:\n${errString}")
-           val error = new ErrorResponse
-           if (responseCode == RestSubmissionServer.SC_UNKNOWN_PROTOCOL_VERSION) {
-             error.highestProtocolVersion = RestSubmissionServer.PROTOCOL_VERSION
-           }
-           error.message = errString.get
-           error
-         } else {
-             // 读取请求发送过来的json数据,并对其做出响应
-           val dataStream = connection.getInputStream
-           if (dataStream == null) {
-             throw new SubmitRestProtocolException("Server returned empty body")
-           }
-           val responseJson = Source.fromInputStream(dataStream).mkString
-           logDebug(s"Response from the server:\n$responseJson")
-           val response = SubmitRestProtocolMessage.fromJson(responseJson)
-           response.validate()
-           response match {
-             case error: ErrorResponse =>
-               logError(s"Server responded with error:\n${error.message}")
-               error
-             case response: SubmitRestProtocolResponse => response
-             case unexpected =>
-               throw new SubmitRestProtocolException(
-                 s"Message received from server was not a response:\n${unexpected.toJson}")
-           }
-         }
-       }
-       2. 周期性的获取异步任务执行结果
-       try { Await.result(responseFuture, 10.seconds) } catch {
-         case unreachable @ (_: FileNotFoundException | _: SocketException) =>
-           throw new SubmitRestConnectionException("Unable to connect to server", unreachable)
-         case malformed @ (_: JsonProcessingException | _: SubmitRestProtocolException) =>
-           throw new SubmitRestProtocolException("Malformed response received from server"
-                                                 , malformed)
-         case timeout: TimeoutException =>
-           throw new SubmitRestConnectionException("No response from server", timeout)
-         case NonFatal(t) =>
-           throw new SparkException("Exception while waiting for response", t)
-       }
-       
-       def getSubmitUrl(master: String): URL
-       功能: 返回rest URL,用于创建新的提交
-       val baseUrl = getBaseUrl(master)
-       new URL(s"$baseUrl/create")
-       
-       def getKillUrl(master: String, submissionId: String): URL
-       功能: 用于创建url,用于kill已经存在的提交
-       val baseUrl = getBaseUrl(master)
-       new URL(s"$baseUrl/kill/$submissionId")
-       
-       def getStatusUrl(master: String, submissionId: String): URL
-       功能: 用于创建状态URL
-       val baseUrl = getBaseUrl(master)
-       new URL(s"$baseUrl/status/$submissionId")
-       
-       def getBaseUrl(master: String): String
-       功能: 获取与服务器交换的基本URL地址,包括协议版本
-       var masterUrl = master
-       supportedMasterPrefixes.foreach { prefix =>
-         if (master.startsWith(prefix)) {
-           masterUrl = master.stripPrefix(prefix)
-         }
-       }
-       masterUrl = masterUrl.stripSuffix("/")
-       val= s"http://$masterUrl/$PROTOCOL_VERSION/submissions"
-       
-       def validateMaster(master: String): Unit
-       功能: master校验,如果在非独立部署的情况下,抛出异常
-       val valid = supportedMasterPrefixes.exists { prefix => master.startsWith(prefix) }
-       if (!valid) {
-         throw new IllegalArgumentException(
-           "This REST client only supports master URLs that start with " +
-             "one of the following: " + supportedMasterPrefixes.mkString(","))
-       }
-       
-       def reportSubmissionStatus(submitResponse: CreateSubmissionResponse): Unit
-       功能: 汇报新创建提交的提交状态,成功则轮询并记录消息,失败则打印失败日志
-       if (submitResponse.success) {
-         val submissionId = submitResponse.submissionId
-         if (submissionId != null) {
-           logInfo(s"Submission successfully created as $submissionId. Polling submission state...")
-           pollSubmissionStatus(submissionId)
-         } else {
-           // should never happen
-           logError("Application successfully submitted, but submission ID was not provided!")
-         }
-       } else {
-         val failMessage = Option(submitResponse.message).map { ": " + _ }.getOrElse("")
-         logError(s"Application submission failed$failMessage")
-       }
-       
-       def pollSubmissionStatus(submissionId: String): Unit
-       功能: 轮询指定提交的状态,可以进行多次尝试
-       (1 to REPORT_DRIVER_STATUS_MAX_TRIES).foreach { _ =>
-         val response = requestSubmissionStatus(submissionId, quiet = true)
-         val statusResponse = response match {
-           case s: SubmissionStatusResponse => s
-           case _ => return 
-         }
-           // 提交成功,则显示状态信息到日志中,并停止
-         if (statusResponse.success) {
-           val driverState = Option(statusResponse.driverState)
-           val workerId = Option(statusResponse.workerId)
-           val workerHostPort = Option(statusResponse.workerHostPort)
-           val exception = Option(statusResponse.message)
-           driverState match {
-             case Some(state) => logInfo(s"State of driver $submissionId is now $state.")
-             case _ => logError(s"State of driver $submissionId was not found!")
-           }
-           (workerId, workerHostPort) match {
-             case (Some(id), Some(hp)) => logInfo(s"Driver is running on worker $id at $hp.")
-             case _ =>
-           }
-           exception.foreach { e => logError(e) }
-           return
-         }
-           // 汇报中断时间
-         Thread.sleep(REPORT_DRIVER_STATUS_INTERVAL)
-       }
-       
-       def handleRestResponse(response: SubmitRestProtocolResponse): Unit
-       功能: 打印rest 服务器发送的信息,在rest应用提交协议中
-       logInfo(s"Server responded with ${response.messageType}:\n${response.toJson}")
-       
-       def handleUnexpectedRestResponse(unexpected: SubmitRestProtocolResponse): Unit 
-       功能: 如果服务器发送的响应类型不符合,打印日志
-       logError(s"Error: Server responded with message of unexpected
-       	type ${unexpected.messageType}.")
-       
-       def handleConnectionException(masterUrl: String): Boolean
-      	功能: 当捕捉到异常的时候,返回true,注意到master由于在生命周期内的恢复不会考虑在内.这个假设没有影响,因为现在还不支持客户端的尝试提交.(SPAKR-6443).
-       if (!lostMasters.contains(masterUrl)) {
-         logWarning(s"Unable to connect to server ${masterUrl}.")
-         lostMasters += masterUrl
-       }
-       val= lostMasters.size >= masters.length
-   }
-   ```
+```scala
+private[spark] class RestSubmissionClient(master: String) extends Logging {
+    属性:
+    #name @masters: Array[String]	master列表
+    val= if (master.startsWith("spark://")) Utils.parseStandaloneMasterUrls(master)?
+    	else Array(master)
+    #name @lostMasters = new mutable.HashSet[String]	丢失master列表(去重)
+    操作集:
+    def createSubmission(request: CreateSubmissionRequest): SubmitRestProtocolResponse
+    功能: 创建一个提交,如果提交成功,轮询提交的状态位,并汇报给用户.否则汇报服务端的错误信息
+    1. 初始化执行标记
+    var handled: Boolean = false
+    var response: SubmitRestProtocolResponse = null
+    2. 处理master列表中的每个未处理的消息
+    for (m <- masters if !handled) {
+      // 验证master的合法性
+      validateMaster(m)
+      // 获取提交地址
+      val url = getSubmitUrl(m)
+      try {
+        // 获取request请求
+        response = postJson(url, request.toJson)
+        // 执行请求处理
+        response match {
+          case s: CreateSubmissionResponse =>
+            if (s.success) {
+              reportSubmissionStatus(s)
+              handleRestResponse(s)
+              handled = true
+            }
+          case unexpected =>
+            handleUnexpectedRestResponse(unexpected)
+        }
+      } catch {
+        case e: SubmitRestConnectionException =>
+          if (handleConnectionException(m)) {
+            throw new SubmitRestConnectionException("Unable to connect to server", e)
+          }
+      }
+    }
+    
+    def killSubmission(submissionId: String): SubmitRestProtocolResponse
+    功能: 请求kill指定请求@submissionId
+    1. 初始化处理标记
+    var handled: Boolean = false
+    var response: SubmitRestProtocolResponse = null
+    2. 处理master中未处理的信息列表
+    for (m <- masters if !handled) {
+        // 验证master合法性
+      validateMaster(m)
+        // 获取需要kill的位置地址@URL
+      val url = getKillUrl(m, submissionId)
+      try {
+          // 发送请求,获取响应
+        response = post(url)
+          // 响应处理
+        response match {
+          case k: KillSubmissionResponse =>
+            if (!Utils.responseFromBackup(k.message)) {
+              handleRestResponse(k)
+              handled = true
+            }
+          case unexpected =>
+            handleUnexpectedRestResponse(unexpected)
+        }
+      } catch {
+        case e: SubmitRestConnectionException =>
+          if (handleConnectionException(m)) {
+            throw new SubmitRestConnectionException("Unable to connect to server", e)
+          }
+      }
+    }
+    val= response
+    
+    def requestSubmissionStatus(
+      submissionId: String,
+      quiet: Boolean = false): SubmitRestProtocolResponse
+    功能: 请求获取提交状态
+    输入参数:
+    	quiet 是否后台执行
+    1. 初始化处理标记
+    var handled: Boolean = false
+    var response: SubmitRestProtocolResponse = null
+    2. 处理masters列表中未处理消息中相关请求
+    for (m <- masters if !handled) {
+        // 验证master信息
+      validateMaster(m)
+        // 获取状态地址
+      val url = getStatusUrl(m, submissionId)
+          if (!quiet) { // 处理非后台执行
+            handleRestResponse(s)
+          }
+          handled = true
+          try {
+              // 获取状态响应
+            response = get(url)
+            response match {
+              case s: SubmissionStatusResponse if s.success =>
+        case unexpected =>
+          handleUnexpectedRestResponse(unexpected)
+        }
+      } catch {
+        case e: SubmitRestConnectionException =>
+          if (handleConnectionException(m)) {
+            throw new SubmitRestConnectionException("Unable to connect to server", e)
+          }
+      }
+    }
+    
+    def constructSubmitRequest(
+      appResource: String,
+      mainClass: String,
+      appArgs: Array[String],
+      sparkProperties: Map[String, String],
+      environmentVariables: Map[String, String]): CreateSubmissionRequest
+    功能: 构造提交请求
+    输入参数:
+    	appResource	应用资源信息
+    	mainClass	主类
+    	appArgs	应用参数
+    	sparkProperties	spark参数表
+    	environmentVariables	环境变量信息表
+    val message = new CreateSubmissionRequest
+    message.clientSparkVersion = sparkVersion
+    message.appResource = appResource
+    message.mainClass = mainClass
+    message.appArgs = appArgs
+    message.sparkProperties = sparkProperties
+    message.environmentVariables = environmentVariables
+    message.validate()
+    val= message
+    
+    def get(url: URL): SubmitRestProtocolResponse
+    功能: 发送GET请求到指定地址,获取响应
+    val conn = url.openConnection().asInstanceOf[HttpURLConnection]
+    conn.setRequestMethod("GET")
+    readResponse(conn)
+    
+    def post(url: URL): SubmitRestProtocolResponse
+    功能: 发送POST请求到指定地址,获取响应
+    val conn = url.openConnection().asInstanceOf[HttpURLConnection]
+    conn.setRequestMethod("POST")
+    readResponse(conn)
+    
+    def postJson(url: URL, json: String): SubmitRestProtocolResponse
+    功能: 使用指定json发送post请求到指定的url,并获取响应
+    1. 获取链接信息
+    val conn = url.openConnection().asInstanceOf[HttpURLConnection]
+    conn.setRequestMethod("POST")
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.setRequestProperty("charset", "utf-8")
+    conn.setDoOutput(true)
+    2. 写出json信息
+    try {
+      val out = new DataOutputStream(conn.getOutputStream)
+      Utils.tryWithSafeFinally {
+        out.write(json.getBytes(StandardCharsets.UTF_8))
+      } {
+        out.close()
+      }
+    } catch {
+      case e: ConnectException =>
+        throw new SubmitRestConnectionException("Connect Exception when connect to server", e)
+    }
+    3. 获取回应
+    val= readResponse(conn)
+    
+    def readResponse(connection: HttpURLConnection): SubmitRestProtocolResponse
+    功能: 读取服务器回应,并进行验证,之后获取@SubmitRestProtocolResponse,如果回应出错,则汇报一条嵌入式的消息给用户,可以暴露给测试
+    1. 获取一个异步任务,用户处理服务器回应
+    val responseFuture = Future {
+        // 获取请求码,并进行校验,如果请求码不正确
+        // 1. 服务器内部错误 --> 直接抛出异常
+        // 2. 其他错误,则包装错误信息,返回给用户
+      val responseCode = connection.getResponseCode
+      if (responseCode != HttpServletResponse.SC_OK) {
+        val errString = Some(Source.fromInputStream(connection.getErrorStream())
+          .getLines().mkString("\n"))
+        if (responseCode == HttpServletResponse.SC_INTERNAL_SERVER_ERROR &&
+          !connection.getContentType().contains("application/json")) {
+          throw new SubmitRestProtocolException(s"Server responded with exception:\n${errString}")
+        }
+        logError(s"Server responded with error:\n${errString}")
+        val error = new ErrorResponse
+        if (responseCode == RestSubmissionServer.SC_UNKNOWN_PROTOCOL_VERSION) {
+          error.highestProtocolVersion = RestSubmissionServer.PROTOCOL_VERSION
+        }
+        error.message = errString.get
+        error
+      } else {
+          // 读取请求发送过来的json数据,并对其做出响应
+        val dataStream = connection.getInputStream
+        if (dataStream == null) {
+          throw new SubmitRestProtocolException("Server returned empty body")
+        }
+        val responseJson = Source.fromInputStream(dataStream).mkString
+        logDebug(s"Response from the server:\n$responseJson")
+        val response = SubmitRestProtocolMessage.fromJson(responseJson)
+        response.validate()
+        response match {
+          case error: ErrorResponse =>
+            logError(s"Server responded with error:\n${error.message}")
+            error
+          case response: SubmitRestProtocolResponse => response
+          case unexpected =>
+            throw new SubmitRestProtocolException(
+              s"Message received from server was not a response:\n${unexpected.toJson}")
+        }
+      }
+    }
+    2. 周期性的获取异步任务执行结果
+    try { Await.result(responseFuture, 10.seconds) } catch {
+      case unreachable @ (_: FileNotFoundException | _: SocketException) =>
+        throw new SubmitRestConnectionException("Unable to connect to server", unreachable)
+      case malformed @ (_: JsonProcessingException | _: SubmitRestProtocolException) =>
+        throw new SubmitRestProtocolException("Malformed response received from server"
+                                              , malformed)
+      case timeout: TimeoutException =>
+        throw new SubmitRestConnectionException("No response from server", timeout)
+      case NonFatal(t) =>
+        throw new SparkException("Exception while waiting for response", t)
+    }
+    
+    def getSubmitUrl(master: String): URL
+    功能: 返回rest URL,用于创建新的提交
+    val baseUrl = getBaseUrl(master)
+    new URL(s"$baseUrl/create")
+    
+    def getKillUrl(master: String, submissionId: String): URL
+    功能: 用于创建url,用于kill已经存在的提交
+    val baseUrl = getBaseUrl(master)
+    new URL(s"$baseUrl/kill/$submissionId")
+    
+    def getStatusUrl(master: String, submissionId: String): URL
+    功能: 用于创建状态URL
+    val baseUrl = getBaseUrl(master)
+    new URL(s"$baseUrl/status/$submissionId")
+    
+    def getBaseUrl(master: String): String
+    功能: 获取与服务器交换的基本URL地址,包括协议版本
+    var masterUrl = master
+    supportedMasterPrefixes.foreach { prefix =>
+      if (master.startsWith(prefix)) {
+        masterUrl = master.stripPrefix(prefix)
+      }
+    }
+    masterUrl = masterUrl.stripSuffix("/")
+    val= s"http://$masterUrl/$PROTOCOL_VERSION/submissions"
+    
+    def validateMaster(master: String): Unit
+    功能: master校验,如果在非独立部署的情况下,抛出异常
+    val valid = supportedMasterPrefixes.exists { prefix => master.startsWith(prefix) }
+    if (!valid) {
+      throw new IllegalArgumentException(
+        "This REST client only supports master URLs that start with " +
+          "one of the following: " + supportedMasterPrefixes.mkString(","))
+    }
+    
+    def reportSubmissionStatus(submitResponse: CreateSubmissionResponse): Unit
+    功能: 汇报新创建提交的提交状态,成功则轮询并记录消息,失败则打印失败日志
+    if (submitResponse.success) {
+      val submissionId = submitResponse.submissionId
+      if (submissionId != null) {
+        logInfo(s"Submission successfully created as $submissionId. Polling submission state...")
+        pollSubmissionStatus(submissionId)
+      } else {
+        // should never happen
+        logError("Application successfully submitted, but submission ID was not provided!")
+      }
+    } else {
+      val failMessage = Option(submitResponse.message).map { ": " + _ }.getOrElse("")
+      logError(s"Application submission failed$failMessage")
+    }
+    
+    def pollSubmissionStatus(submissionId: String): Unit
+    功能: 轮询指定提交的状态,可以进行多次尝试
+    (1 to REPORT_DRIVER_STATUS_MAX_TRIES).foreach { _ =>
+      val response = requestSubmissionStatus(submissionId, quiet = true)
+      val statusResponse = response match {
+        case s: SubmissionStatusResponse => s
+        case _ => return 
+      }
+        // 提交成功,则显示状态信息到日志中,并停止
+      if (statusResponse.success) {
+        val driverState = Option(statusResponse.driverState)
+        val workerId = Option(statusResponse.workerId)
+        val workerHostPort = Option(statusResponse.workerHostPort)
+        val exception = Option(statusResponse.message)
+        driverState match {
+          case Some(state) => logInfo(s"State of driver $submissionId is now $state.")
+          case _ => logError(s"State of driver $submissionId was not found!")
+        }
+        (workerId, workerHostPort) match {
+          case (Some(id), Some(hp)) => logInfo(s"Driver is running on worker $id at $hp.")
+          case _ =>
+        }
+        exception.foreach { e => logError(e) }
+        return
+      }
+        // 汇报中断时间
+      Thread.sleep(REPORT_DRIVER_STATUS_INTERVAL)
+    }
+    
+    def handleRestResponse(response: SubmitRestProtocolResponse): Unit
+    功能: 打印rest 服务器发送的信息,在rest应用提交协议中
+    logInfo(s"Server responded with ${response.messageType}:\n${response.toJson}")
+    
+    def handleUnexpectedRestResponse(unexpected: SubmitRestProtocolResponse): Unit 
+    功能: 如果服务器发送的响应类型不符合,打印日志
+    logError(s"Error: Server responded with message of unexpected
+    	type ${unexpected.messageType}.")
+    
+    def handleConnectionException(masterUrl: String): Boolean
+   	功能: 当捕捉到异常的时候,返回true,注意到master由于在生命周期内的恢复不会考虑在内.这个假设没有影响,因为现在还不支持客户端的尝试提交.(SPAKR-6443).
+    if (!lostMasters.contains(masterUrl)) {
+      logWarning(s"Unable to connect to server ${masterUrl}.")
+      lostMasters += masterUrl
+    }
+    val= lostMasters.size >= masters.length
+}
+```
 
-   ```scala
-   private[spark] object RestSubmissionClient {
-       属性:
-       #name @supportedMasterPrefixes = Seq("spark://", "mesos://")	支持的master前缀
-       #name @BLACKLISTED_SPARK_ENV_VARS = Set("SPARK_ENV_LOADED", "SPARK_HOME", "SPARK_CONF_DIR")
-       	黑名单环境变量(这些变量在远端机器上会导致错误,SPARK-12345,SPARK-25934)
-       #name @REPORT_DRIVER_STATUS_INTERVAL = 1000	汇报给读取器状态的时间间隔
-       #name @REPORT_DRIVER_STATUS_MAX_TRIES = 10	汇报次数
-       #name @PROTOCOL_VERSION = "v1"	最大尝试次数
-       操作集:
-       def filterSystemEnvironment(env: Map[String, String]): Map[String, String]
-       功能: 获取过滤完毕的系统环境变量表
-       val= env.filterKeys { k =>
-         (k.startsWith("SPARK_") && !BLACKLISTED_SPARK_ENV_VARS.contains(k))
-           || k.startsWith("MESOS_")
-       }
-       
-       def supportsRestClient(master: String): Boolean
-       功能: 确定是否支持REST客户端(检查是否存在这个服务器即可)
-       val= supportedMasterPrefixes.exists(master.startsWith)
-   }
-   ```
+```scala
+private[spark] object RestSubmissionClient {
+    属性:
+    #name @supportedMasterPrefixes = Seq("spark://", "mesos://")	支持的master前缀
+    #name @BLACKLISTED_SPARK_ENV_VARS = Set("SPARK_ENV_LOADED", "SPARK_HOME", "SPARK_CONF_DIR")
+    	黑名单环境变量(这些变量在远端机器上会导致错误,SPARK-12345,SPARK-25934)
+    #name @REPORT_DRIVER_STATUS_INTERVAL = 1000	汇报给读取器状态的时间间隔
+    #name @REPORT_DRIVER_STATUS_MAX_TRIES = 10	汇报次数
+    #name @PROTOCOL_VERSION = "v1"	最大尝试次数
+    操作集:
+    def filterSystemEnvironment(env: Map[String, String]): Map[String, String]
+    功能: 获取过滤完毕的系统环境变量表
+    val= env.filterKeys { k =>
+      (k.startsWith("SPARK_") && !BLACKLISTED_SPARK_ENV_VARS.contains(k))
+        || k.startsWith("MESOS_")
+    }
+    
+    def supportsRestClient(master: String): Boolean
+    功能: 确定是否支持REST客户端(检查是否存在这个服务器即可)
+    val= supportedMasterPrefixes.exists(master.startsWith)
+}
+```
 
-   ```scala
-   private[spark] class RestSubmissionClientApp extends SparkApplication {
-       def run(
-         appResource: String,
-         mainClass: String,
-         appArgs: Array[String],
-         conf: SparkConf,
-         env: Map[String, String] = Map()): SubmitRestProtocolResponse
-       功能: 提交请求,运行应用,返回响应,测试可见
-       val master = conf.getOption("spark.master").getOrElse {
-         throw new IllegalArgumentException("'spark.master' must be set.")
-       }
-       val sparkProperties = conf.getAll.toMap
-       val client = new RestSubmissionClient(master)
-       val submitRequest = client.constructSubmitRequest(
-         appResource, mainClass, appArgs, sparkProperties, env)
-       val= client.createSubmission(submitRequest)
-       
-       def start(args: Array[String], conf: SparkConf): Unit
-       功能: 启动函数
-       if (args.length < 2) {
-         sys.error("Usage: RestSubmissionClient [app resource] [main class] [app args*]")
-         sys.exit(1)
-       }
-       val appResource = args(0)
-       val mainClass = args(1)
-       val appArgs = args.slice(2, args.length)
-       val env = RestSubmissionClient.filterSystemEnvironment(sys.env)
-       run(appResource, mainClass, appArgs, conf, env)
-   }
-   ```
+```scala
+private[spark] class RestSubmissionClientApp extends SparkApplication {
+    def run(
+      appResource: String,
+      mainClass: String,
+      appArgs: Array[String],
+      conf: SparkConf,
+      env: Map[String, String] = Map()): SubmitRestProtocolResponse
+    功能: 提交请求,运行应用,返回响应,测试可见
+    val master = conf.getOption("spark.master").getOrElse {
+      throw new IllegalArgumentException("'spark.master' must be set.")
+    }
+    val sparkProperties = conf.getAll.toMap
+    val client = new RestSubmissionClient(master)
+    val submitRequest = client.constructSubmitRequest(
+      appResource, mainClass, appArgs, sparkProperties, env)
+    val= client.createSubmission(submitRequest)
+    
+    def start(args: Array[String], conf: SparkConf): Unit
+    功能: 启动函数
+    if (args.length < 2) {
+      sys.error("Usage: RestSubmissionClient [app resource] [main class] [app args*]")
+      sys.exit(1)
+    }
+    val appResource = args(0)
+    val mainClass = args(1)
+    val appArgs = args.slice(2, args.length)
+    val env = RestSubmissionClient.filterSystemEnvironment(sys.env)
+    run(appResource, mainClass, appArgs, conf, env)
+}RestSubmissionServer
+```
 
-2. [RestSubmissionServer.scala](# RestSubmissionServer)
+##### RestSubmissionServer
 
-   ```markdown
-   介绍:
-   	REST提交服务器,用于回应由@RestSubmissionClient 提交的请求
-   	根据情况回应不同的响应码:
-   	200 	OK	请求成功的执行了
-   	400		BAD REQUEST		请求形式不正确,或者形式错误
-   	468		UNKNOWN PROTOCOL VERSION	位置协议版本,服务器不能识别
-   	500		INTERNAL SERVER ERROR 	服务器内部错误
-    	服务从事涉及到一个json表示的响应@SubmitRestProtocolResponse,json信息在HTTP请求体中.但是如果发生了错误,服务器会包含一个错误响应@ErrorResponse,而非客户端所需要的响应.如果错误响应自己失败了,响应的HTTP请求体就为空.且携带有响应码,表示服务器内部发生了错误.
-   ```
+```markdown
+介绍:
+	REST提交服务器,用于回应由@RestSubmissionClient 提交的请求
+	根据情况回应不同的响应码:
+	200 	OK	请求成功的执行了
+	400		BAD REQUEST		请求形式不正确,或者形式错误
+	468		UNKNOWN PROTOCOL VERSION	位置协议版本,服务器不能识别
+	500		INTERNAL SERVER ERROR 	服务器内部错误
+ 	服务从事涉及到一个json表示的响应@SubmitRestProtocolResponse,json信息在HTTP请求体中.但是如果发生了错误,服务器会包含一个错误响应@ErrorResponse,而非客户端所需要的响应.如果错误响应自己失败了,响应的HTTP请求体就为空.且携带有响应码,表示服务器内部发生了错误.
+```
 
-   ```scala
-   private[spark] abstract class RestSubmissionServer(
-       val host: String,
-       val requestedPort: Int,
-       val masterConf: SparkConf) extends Logging {
-       构造器参数:
-       	host	主机名称
-       	requestPort	请求端口号
-       	masterConf	spark配置
-       属性:
-       #name @submitRequestServlet	#type @SubmitRequestServlet	提交的请求服务程序(servlet)
-       #name @killRequestServlet: KillRequestServlet	kill的请求服务程序
-       #name @statusRequestServlet: StatusRequestServlet	状态请求服务程序
-       #name @_server: Option[Server] = None	服务器
-       #name @baseContext = s"/${RestSubmissionServer.PROTOCOL_VERSION}/submissions"	
-       	基本上下文信息
-       #name @contextToServlet	URL前缀与服务程序的映射,可以暴露给测试
-       val= Map[String, RestServlet](
-           s"$baseContext/create/*" -> submitRequestServlet,
-           s"$baseContext/kill/*" -> killRequestServlet,
-           s"$baseContext/status/*" -> statusRequestServlet,
-           "/*" -> new ErrorServlet // default handler
-         )
-       操作集:
-       def start(): Int
-       功能: 启动服务器,并返回端口号
-       val (server, boundPort) = Utils.startServiceOnPort[Server](requestedPort, doStart, masterConf)
-       _server = Some(server)
-       logInfo(s"Started REST server for submitting applications on port $boundPort")
-       boundPort
-       
-       def doStart(startPort: Int): (Server, Int)
-       功能: 映射servlet到相应的上下文,并连接到服务器上.返回启动服务器与端口号的二元组
-       1. 获取链接
-       val threadPool = new QueuedThreadPool
-       threadPool.setDaemon(true)
-       val server = new Server(threadPool)
-       val connector = new ServerConnector(
-         server,
-         null,
-         // Call this full constructor to set this, which forces daemon threads:
-         new ScheduledExecutorScheduler("RestSubmissionServer-JettyScheduler", true),
-         null,
-         -1,
-         -1,
-         new HttpConnectionFactory())
-       connector.setHost(host)
-       connector.setPort(startPort)
-       connector.setReuseAddress(!Utils.isWindows)
-       server.addConnector(connector)
-       2. 获取服务程序主处理器
-       val mainHandler = new ServletContextHandler
-       mainHandler.setServer(server)
-       mainHandler.setContextPath("/")
-       contextToServlet.foreach { case (prefix, servlet) =>
-         mainHandler.addServlet(new ServletHolder(servlet), prefix)
-       }
-       3. 启动服务器
-       server.setHandler(mainHandler)
-       server.start()
-       val boundPort = connector.getLocalPort
-       val= (server, boundPort)
-       
-       def stop(): Unit
-       功能: 停止服务器
-   }
-   ```
+```scala
+private[spark] abstract class RestSubmissionServer(
+    val host: String,
+    val requestedPort: Int,
+    val masterConf: SparkConf) extends Logging {
+    构造器参数:
+    	host	主机名称
+    	requestPort	请求端口号
+    	masterConf	spark配置
+    属性:
+    #name @submitRequestServlet	#type @SubmitRequestServlet	提交的请求服务程序(servlet)
+    #name @killRequestServlet: KillRequestServlet	kill的请求服务程序
+    #name @statusRequestServlet: StatusRequestServlet	状态请求服务程序
+    #name @_server: Option[Server] = None	服务器
+    #name @baseContext = s"/${RestSubmissionServer.PROTOCOL_VERSION}/submissions"	
+    	基本上下文信息
+    #name @contextToServlet	URL前缀与服务程序的映射,可以暴露给测试
+    val= Map[String, RestServlet](
+        s"$baseContext/create/*" -> submitRequestServlet,
+        s"$baseContext/kill/*" -> killRequestServlet,
+        s"$baseContext/status/*" -> statusRequestServlet,
+        "/*" -> new ErrorServlet // default handler
+      )
+    操作集:
+    def start(): Int
+    功能: 启动服务器,并返回端口号
+    val (server, boundPort) = Utils.startServiceOnPort[Server](requestedPort, doStart, masterConf)
+    _server = Some(server)
+    logInfo(s"Started REST server for submitting applications on port $boundPort")
+    boundPort
+    
+    def doStart(startPort: Int): (Server, Int)
+    功能: 映射servlet到相应的上下文,并连接到服务器上.返回启动服务器与端口号的二元组
+    1. 获取链接
+    val threadPool = new QueuedThreadPool
+    threadPool.setDaemon(true)
+    val server = new Server(threadPool)
+    val connector = new ServerConnector(
+      server,
+      null,
+      // Call this full constructor to set this, which forces daemon threads:
+      new ScheduledExecutorScheduler("RestSubmissionServer-JettyScheduler", true),
+      null,
+      -1,
+      -1,
+      new HttpConnectionFactory())
+    connector.setHost(host)
+    connector.setPort(startPort)
+    connector.setReuseAddress(!Utils.isWindows)
+    server.addConnector(connector)
+    2. 获取服务程序主处理器
+    val mainHandler = new ServletContextHandler
+    mainHandler.setServer(server)
+    mainHandler.setContextPath("/")
+    contextToServlet.foreach { case (prefix, servlet) =>
+      mainHandler.addServlet(new ServletHolder(servlet), prefix)
+    }
+    3. 启动服务器
+    server.setHandler(mainHandler)
+    server.start()
+    val boundPort = connector.getLocalPort
+    val= (server, boundPort)
+    
+    def stop(): Unit
+    功能: 停止服务器
+}
+```
 
-   ```scala
-   private[rest] object RestSubmissionServer {
-       #name @PROTOCOL_VERSION = RestSubmissionClient.PROTOCOL_VERSION	协议版本号
-       #name @SC_UNKNOWN_PROTOCOL_VERSION = 468	未知版本号错误码
-   }
-   ```
+```scala
+private[rest] object RestSubmissionServer {
+    #name @PROTOCOL_VERSION = RestSubmissionClient.PROTOCOL_VERSION	协议版本号
+    #name @SC_UNKNOWN_PROTOCOL_VERSION = 468	未知版本号错误码
+}
+```
 
-   ```scala
-   private[rest] abstract class RestServlet extends HttpServlet with Logging {
-       介绍: 用于处理发送给服务器@RestSubmissionServer的REST服务程序
-       操作集:
-       def sendResponse(
-         responseMessage: SubmitRestProtocolResponse,
-         responseServlet: HttpServletResponse): Unit
-       功能: 序列化给定响应信息为json形式,通过响应服务程序发送,这个在发送之前验证了请求的形式.
-       1. 确定响应形式
-       val message = validateResponse(responseMessage, responseServlet)
-       2. 设置内容类型
-       responseServlet.setContentType("application/json")
-       responseServlet.setCharacterEncoding("utf-8")
-       3. 写出消息的json形式
-       responseServlet.getWriter.write(message.toJson)
-       
-       def findUnknownFields(
-         requestJson: String,
-         requestMessage: SubmitRestProtocolMessage): Array[String]
-       功能: 返回客户端请求信息中,服务器不知道的信息
-       val clientSideJson = parse(requestJson)
-       val serverSideJson = parse(requestMessage.toJson)
-       val Diff(_, _, unknown) = clientSideJson.diff(serverSideJson)
-       unknown match {
-         case j: JObject => j.obj.map { case (k, _) => k }.toArray
-         case _ => Array.empty[String] // No difference
-       }
-       
-       def formatException(e: Throwable): String
-       功能: 返回认为可识别的格式异常
-       val stackTraceString = e.getStackTrace.map { "\t" + _ }.mkString("\n")
-       val= s"$e\n$stackTraceString"
-       
-       def handleError(message: String): ErrorResponse
-       功能: 构建错误响应
-       val e = new ErrorResponse
-       e.serverSparkVersion = sparkVersion
-       e.message = message
-       val= e
-       
-       def parseSubmissionId(path: String): Option[String]
-       功能: 从相关路径@path转换提交ID,假定这是路径的首个部分.例如,希望采取格式/[submission ID]/maybe/something/else,返回的提交ID不能为空,不适合返回None
-       val=if (path == null || path.isEmpty) {
-         None
-       } else {
-         path.stripPrefix("/").split("/").headOption.filter(_.nonEmpty)
-       }
-       
-       def validateResponse(
-         responseMessage: SubmitRestProtocolResponse,
-         responseServlet: HttpServletResponse): SubmitRestProtocolResponse
-       功能: 响应信息验证
-       val= try {
-         responseMessage.validate()
-         responseMessage
-       } catch {
-         case e: Exception =>
-           responseServlet.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
-           handleError("Internal server error: " + formatException(e))
-       }
-   }
-   ```
+```scala
+private[rest] abstract class RestServlet extends HttpServlet with Logging {
+    介绍: 用于处理发送给服务器@RestSubmissionServer的REST服务程序
+    操作集:
+    def sendResponse(
+      responseMessage: SubmitRestProtocolResponse,
+      responseServlet: HttpServletResponse): Unit
+    功能: 序列化给定响应信息为json形式,通过响应服务程序发送,这个在发送之前验证了请求的形式.
+    1. 确定响应形式
+    val message = validateResponse(responseMessage, responseServlet)
+    2. 设置内容类型
+    responseServlet.setContentType("application/json")
+    responseServlet.setCharacterEncoding("utf-8")
+    3. 写出消息的json形式
+    responseServlet.getWriter.write(message.toJson)
+    
+    def findUnknownFields(
+      requestJson: String,
+      requestMessage: SubmitRestProtocolMessage): Array[String]
+    功能: 返回客户端请求信息中,服务器不知道的信息
+    val clientSideJson = parse(requestJson)
+    val serverSideJson = parse(requestMessage.toJson)
+    val Diff(_, _, unknown) = clientSideJson.diff(serverSideJson)
+    unknown match {
+      case j: JObject => j.obj.map { case (k, _) => k }.toArray
+      case _ => Array.empty[String] // No difference
+    }
+    
+    def formatException(e: Throwable): String
+    功能: 返回认为可识别的格式异常
+    val stackTraceString = e.getStackTrace.map { "\t" + _ }.mkString("\n")
+    val= s"$e\n$stackTraceString"
+    
+    def handleError(message: String): ErrorResponse
+    功能: 构建错误响应
+    val e = new ErrorResponse
+    e.serverSparkVersion = sparkVersion
+    e.message = message
+    val= e
+    
+    def parseSubmissionId(path: String): Option[String]
+    功能: 从相关路径@path转换提交ID,假定这是路径的首个部分.例如,希望采取格式/[submission ID]/maybe/something/else,返回的提交ID不能为空,不适合返回None
+    val=if (path == null || path.isEmpty) {
+      None
+    } else {
+      path.stripPrefix("/").split("/").headOption.filter(_.nonEmpty)
+    }
+    
+    def validateResponse(
+      responseMessage: SubmitRestProtocolResponse,
+      responseServlet: HttpServletResponse): SubmitRestProtocolResponse
+    功能: 响应信息验证
+    val= try {
+      responseMessage.validate()
+      responseMessage
+    } catch {
+      case e: Exception =>
+        responseServlet.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
+        handleError("Internal server error: " + formatException(e))
+    }
+}
+```
 
-   ```scala
-   private[rest] abstract class KillRequestServlet extends RestServlet {
-       介绍: kill请求的服务程序
-       操作集:
-       def handleKill(submissionId: String): KillSubmissionResponse
-       功能: 处理kill指定提交的逻辑,并返回指定响应
-       
-       def doPost(
-         request: HttpServletRequest,
-         response: HttpServletResponse): Unit
-       功能: 如果提交ID在URL中指定了,如果master中含有这个信息,则kill对应的驱动器并返回合适的响应.否则返回错误信息.
-       val submissionId = parseSubmissionId(request.getPathInfo)
-       val responseMessage = submissionId.map(handleKill).getOrElse {
-         response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
-         handleError("Submission ID is missing in kill request.")
-       }
-       sendResponse(responseMessage, response)
-   }
-   ```
+```scala
+private[rest] abstract class KillRequestServlet extends RestServlet {
+    介绍: kill请求的服务程序
+    操作集:
+    def handleKill(submissionId: String): KillSubmissionResponse
+    功能: 处理kill指定提交的逻辑,并返回指定响应
+    
+    def doPost(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit
+    功能: 如果提交ID在URL中指定了,如果master中含有这个信息,则kill对应的驱动器并返回合适的响应.否则返回错误信息.
+    val submissionId = parseSubmissionId(request.getPathInfo)
+    val responseMessage = submissionId.map(handleKill).getOrElse {
+      response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
+      handleError("Submission ID is missing in kill request.")
+    }
+    sendResponse(responseMessage, response)
+}
+```
 
-   ```scala
-   private[rest] abstract class StatusRequestServlet extends RestServlet {
-       介绍: 请求状态获取服务程序
-       操作集:
-       def handleStatus(submissionId: String): SubmissionStatusResponse
-       功能: 处理指定提交任务的状态信息,并返回状态信息
-       
-       def doGet(
-         request: HttpServletRequest,
-         response: HttpServletResponse): Unit
-       功能: 如果提交的任务在URL中,从master中请求驱动器相关的状态,包装到响应中返回,如果没有则返回错误信息
-       val submissionId = parseSubmissionId(request.getPathInfo)
-       val responseMessage = submissionId.map(handleStatus).getOrElse {
-         response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
-         handleError("Submission ID is missing in status request.")
-       }
-       sendResponse(responseMessage, response)
-   }
-   ```
+```scala
+private[rest] abstract class StatusRequestServlet extends RestServlet {
+    介绍: 请求状态获取服务程序
+    操作集:
+    def handleStatus(submissionId: String): SubmissionStatusResponse
+    功能: 处理指定提交任务的状态信息,并返回状态信息
+    
+    def doGet(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit
+    功能: 如果提交的任务在URL中,从master中请求驱动器相关的状态,包装到响应中返回,如果没有则返回错误信息
+    val submissionId = parseSubmissionId(request.getPathInfo)
+    val responseMessage = submissionId.map(handleStatus).getOrElse {
+      response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
+      handleError("Submission ID is missing in status request.")
+    }
+    sendResponse(responseMessage, response)
+}
+```
 
-   ```scala
-   private[rest] abstract class SubmitRequestServlet extends RestServlet {
-       介绍: 用于将请求提交给服务器的服务程序
-       操作集:
-       def handleSubmit(
-         requestMessageJson: String,
-         requestMessage: SubmitRestProtocolMessage,
-         responseServlet: HttpServletResponse): SubmitRestProtocolResponse
-       功能: 处理信息提交,返回服务器响应
-       
-       def doPost(
-         requestServlet: HttpServletRequest,
-         responseServlet: HttpServletResponse): Unit
-       功能: 将消息提交到master,使用给定的请求参数
-       val responseMessage =
-         try {
-           val requestMessageJson = Source.fromInputStream(requestServlet.getInputStream).mkString
-           val requestMessage = SubmitRestProtocolMessage.fromJson(requestMessageJson)
-           requestMessage.validate()
-           handleSubmit(requestMessageJson, requestMessage, responseServlet)
-         } catch {
-           case e @ (_: JsonProcessingException | _: SubmitRestProtocolException) =>
-             responseServlet.setStatus(HttpServletResponse.SC_BAD_REQUEST)
-             handleError("Malformed request: " + formatException(e))
-         }
-       sendResponse(responseMessage, responseServlet)
-   }
-   ```
+```scala
+private[rest] abstract class SubmitRequestServlet extends RestServlet {
+    介绍: 用于将请求提交给服务器的服务程序
+    操作集:
+    def handleSubmit(
+      requestMessageJson: String,
+      requestMessage: SubmitRestProtocolMessage,
+      responseServlet: HttpServletResponse): SubmitRestProtocolResponse
+    功能: 处理信息提交,返回服务器响应
+    
+    def doPost(
+      requestServlet: HttpServletRequest,
+      responseServlet: HttpServletResponse): Unit
+    功能: 将消息提交到master,使用给定的请求参数
+    val responseMessage =
+      try {
+        val requestMessageJson = Source.fromInputStream(requestServlet.getInputStream).mkString
+        val requestMessage = SubmitRestProtocolMessage.fromJson(requestMessageJson)
+        requestMessage.validate()
+        handleSubmit(requestMessageJson, requestMessage, responseServlet)
+      } catch {
+        case e @ (_: JsonProcessingException | _: SubmitRestProtocolException) =>
+          responseServlet.setStatus(HttpServletResponse.SC_BAD_REQUEST)
+          handleError("Malformed request: " + formatException(e))
+      }
+    sendResponse(responseMessage, responseServlet)
+}
+```
 
-   ```scala
-   private class ErrorServlet extends RestServlet {
-       介绍: 错误服务程序,用于返回给用户缺省的错误信息
-       def service(
-         request: HttpServletRequest,
-         response: HttpServletResponse): Unit 
-       功能: 返回合适的错误信息给用户
-       val path = request.getPathInfo
-       val parts = path.stripPrefix("/").split("/").filter(_.nonEmpty).toList
-       var versionMismatch = false
-       var msg =
-         parts match {
-           case Nil =>
-             "Missing protocol version."
-           case `serverVersion` :: Nil =>
-             "Missing the /submissions prefix."
-           case `serverVersion` :: "submissions" :: tail =>
-             "Missing an action: please specify one of /create, /kill, or /status."
-           case unknownVersion :: tail =>
-             versionMismatch = true
-             s"Unknown protocol version '$unknownVersion'."
-           case _ =>
-             "Malformed path."
-         }
-       msg += s" Please submit requests through http://[host]:[port]/$serverVersion/submissions/..."
-       val error = handleError(msg)
-       if (versionMismatch) {
-         error.highestProtocolVersion = serverVersion
-         response.setStatus(RestSubmissionServer.SC_UNKNOWN_PROTOCOL_VERSION)
-       } else {
-         response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
-       }
-       sendResponse(error, response)
-   }
-   ```
+```scala
+private class ErrorServlet extends RestServlet {
+    介绍: 错误服务程序,用于返回给用户缺省的错误信息
+    def service(
+      request: HttpServletRequest,
+      response: HttpServletResponse): Unit 
+    功能: 返回合适的错误信息给用户
+    val path = request.getPathInfo
+    val parts = path.stripPrefix("/").split("/").filter(_.nonEmpty).toList
+    var versionMismatch = false
+    var msg =
+      parts match {
+        case Nil =>
+          "Missing protocol version."
+        case `serverVersion` :: Nil =>
+          "Missing the /submissions prefix."
+        case `serverVersion` :: "submissions" :: tail =>
+          "Missing an action: please specify one of /create, /kill, or /status."
+        case unknownVersion :: tail =>
+          versionMismatch = true
+          s"Unknown protocol version '$unknownVersion'."
+        case _ =>
+          "Malformed path."
+      }
+    msg += s" Please submit requests through http://[host]:[port]/$serverVersion/submissions/..."
+    val error = handleError(msg)
+    if (versionMismatch) {
+      error.highestProtocolVersion = serverVersion
+      response.setStatus(RestSubmissionServer.SC_UNKNOWN_PROTOCOL_VERSION)
+    } else {
+      response.setStatus(HttpServletResponse.SC_BAD_REQUEST)
+    }
+    sendResponse(error, response)
+}
+```
 
-3. [StandaloneRestServer.scala](# StandaloneRestServer)
+##### StandaloneRestServer
 
-   ```markdown
-   介绍:
-    	独立REST服务器,用于响应@RestSubmissionClient 的响应,可以嵌入到独立的master中,且只能在集群模式情况下使用.这个模式根据不同的情况给出不同的响应码:
-       200 	OK	请求成功的执行了
-   	400		BAD REQUEST		请求形式不正确,或者形式错误
-   	468		UNKNOWN PROTOCOL VERSION	位置协议版本,服务器不能识别
-   	500		INTERNAL SERVER ERROR 	服务器内部错误
-   	服务器总是包含一个json表示的相关于@SubmitRestProtocolResponse 的内容在请求体中,如果发送了错误,则会对错误信息进行包装,形成@ErrorResponse,将其置于请求体中,若果形成错误信息失败,请求体则会返回空,此时返回服务器内部错误的错误码.
-   	构造器参数
-   		host	主机地址
-   		requestedPort	请求端口
-   		masterConf	master的配置信息
-   		masterEndpoint	master的RPC端点引用
-   		masterUrl	master地址
-   ```
+```markdown
+介绍:
+ 	独立REST服务器,用于响应@RestSubmissionClient 的响应,可以嵌入到独立的master中,且只能在集群模式情况下使用.这个模式根据不同的情况给出不同的响应码:
+    200 	OK	请求成功的执行了
+	400		BAD REQUEST		请求形式不正确,或者形式错误
+	468		UNKNOWN PROTOCOL VERSION	位置协议版本,服务器不能识别
+	500		INTERNAL SERVER ERROR 	服务器内部错误
+	服务器总是包含一个json表示的相关于@SubmitRestProtocolResponse 的内容在请求体中,如果发送了错误,则会对错误信息进行包装,形成@ErrorResponse,将其置于请求体中,若果形成错误信息失败,请求体则会返回空,此时返回服务器内部错误的错误码.
+	构造器参数
+		host	主机地址
+		requestedPort	请求端口
+		masterConf	master的配置信息
+		masterEndpoint	master的RPC端点引用
+		masterUrl	master地址
+```
 
-   ```scala
-   private[deploy] class StandaloneRestServer(
-       host: String,
-       requestedPort: Int,
-       masterConf: SparkConf,
-       masterEndpoint: RpcEndpointRef,
-       masterUrl: String)
-   extends RestSubmissionServer(host, requestedPort, masterConf) {
-       
-   }
-   ```
+```scala
+private[deploy] class StandaloneRestServer(
+    host: String,
+    requestedPort: Int,
+    masterConf: SparkConf,
+    masterEndpoint: RpcEndpointRef,
+    masterUrl: String)
+extends RestSubmissionServer(host, requestedPort, masterConf) {
+    属性: 
+    #Name @submitRequestServlet	提交请求服务程序
+    val= new StandaloneSubmitRequestServlet(masterEndpoint, masterUrl, masterConf)
+    #name @killRequestServlet	kill任务服务程序
+    val= new StandaloneKillRequestServlet(masterEndpoint, masterConf)
+    #name @statusRequestServlet	状态请求服务器
+    val= new StandaloneStatusRequestServlet(masterEndpoint, masterConf)
+}
+```
 
-   
+```scala
+private[rest] class StandaloneKillRequestServlet(masterEndpoint: RpcEndpointRef, conf: SparkConf)
+extends KillRequestServlet {
+    介绍: 独立kill请求的服务程序
+    def handleKill(submissionId: String): KillSubmissionResponse
+    功能: 处理kill指定提交的处理方式,并返回响应
+    val k = new KillSubmissionResponse
+    k.serverSparkVersion = sparkVersion
+    k.message = response.message
+    k.submissionId = submissionId
+    k.success = response.success
+    val= k
+}
+```
 
-4.  [SubmitRestProtocolException.scala](# SubmitRestProtocolException)
+```scala
+private[rest] class StandaloneStatusRequestServlet(
+    masterEndpoint: RpcEndpointRef, conf: SparkConf)
+extends StatusRequestServlet {
+    介绍: 独立状态请求服务程序
+    def handleStatus(submissionId: String): SubmissionStatusResponse 
+    功能: 处理状态并获取响应
+    val response = masterEndpoint.askSync[DeployMessages.DriverStatusResponse](
+      DeployMessages.RequestDriverStatus(submissionId))
+    val message = response.exception.map { s"Exception from the cluster:\n" + formatException(_) }
+    val d = new SubmissionStatusResponse
+    d.serverSparkVersion = sparkVersion
+    d.submissionId = submissionId
+    d.success = response.found
+    d.driverState = response.state.map(_.toString).orNull
+    d.workerId = response.workerId.orNull
+    d.workerHostPort = response.workerHostPort.orNull
+    d.message = message.orNull
+    val= d
+}
+```
 
-5. [SubmitRestProtocolMessage.scala](# SubmitRestProtocolMessage)
+```scala
+private[rest] class StandaloneSubmitRequestServlet(
+    masterEndpoint: RpcEndpointRef,
+    masterUrl: String,
+    conf: SparkConf)
+extends SubmitRequestServlet {
+    介绍: 独立提交请求服务程序
+    操作集:
+    def handleSubmit(
+      requestMessageJson: String,
+      requestMessage: SubmitRestProtocolMessage,
+      responseServlet: HttpServletResponse): SubmitRestProtocolResponse
+    功能: 处理提交,并获取响应
+    val= requestMessage match {
+      case submitRequest: CreateSubmissionRequest =>
+        val driverDescription = buildDriverDescription(submitRequest)
+        val response = masterEndpoint.askSync[DeployMessages.SubmitDriverResponse](
+          DeployMessages.RequestSubmitDriver(driverDescription))
+        val submitResponse = new CreateSubmissionResponse
+        submitResponse.serverSparkVersion = sparkVersion
+        submitResponse.message = response.message
+        submitResponse.success = response.success
+        submitResponse.submissionId = response.driverId.orNull
+        val unknownFields = findUnknownFields(requestMessageJson, requestMessage)
+        if (unknownFields.nonEmpty) {
+          submitResponse.unknownFields = unknownFields
+        }
+        submitResponse
+      case unexpected =>
+        responseServlet.setStatus(HttpServletResponse.SC_BAD_REQUEST)
+        handleError(s"Received message of unexpected type ${unexpected.messageType}.")
+    }
+    
+    def buildDriverDescription(request: CreateSubmissionRequest): DriverDescription
+    功能: 建立driver的描述
+    1. 获取驱动器属性
+    val appResource = Option(request.appResource).getOrElse {
+      throw new SubmitRestMissingFieldException("Application jar is missing.")
+    }
+    val mainClass = Option(request.mainClass).getOrElse {
+      throw new SubmitRestMissingFieldException("Main class is missing.")
+    }
+    val sparkProperties = request.sparkProperties
+    val driverMemory = sparkProperties.get(config.DRIVER_MEMORY.key)
+    val driverCores = sparkProperties.get(config.DRIVER_CORES.key)
+    val driverDefaultJavaOptions = sparkProperties.get(SparkLauncher.DRIVER_DEFAULT_JAVA_OPTIONS)
+    val driverExtraJavaOptions = sparkProperties.get(config.DRIVER_JAVA_OPTIONS.key)
+    val driverExtraClassPath = sparkProperties.get(config.DRIVER_CLASS_PATH.key)
+    val driverExtraLibraryPath = sparkProperties.get(config.DRIVER_LIBRARY_PATH.key)
+    val superviseDriver = sparkProperties.get(config.DRIVER_SUPERVISE.key)
+    val masters = sparkProperties.get("spark.master")
+    val (_, masterPort) = Utils.extractHostPortFromSparkUrl(masterUrl)
+    val masterRestPort = this.conf.get(config.MASTER_REST_SERVER_PORT)
+    val updatedMasters = masters.map(
+      _.replace(s":$masterRestPort", s":$masterPort")).getOrElse(masterUrl)
+    val appArgs = request.appArgs
+    val environmentVariables =
+      request.environmentVariables.filterNot(x => x._1.matches("SPARK_LOCAL_(IP|HOSTNAME)"))
+    val conf = new SparkConf(false)
+      .setAll(sparkProperties)
+      .set("spark.master", updatedMasters)
+    val extraClassPath = driverExtraClassPath.toSeq.flatMap(_.split(File.pathSeparator))
+    val extraLibraryPath = driverExtraLibraryPath.toSeq.flatMap(_.split(File.pathSeparator))
+    val defaultJavaOpts = driverDefaultJavaOptions.map(Utils.splitCommandString)
+      .getOrElse(Seq.empty)
+    val extraJavaOpts = driverExtraJavaOptions.map(Utils.splitCommandString).getOrElse(Seq.empty)
+    val sparkJavaOpts = Utils.sparkJavaOpts(conf)
+    val javaOpts = sparkJavaOpts ++ defaultJavaOpts ++ extraJavaOpts
+    val command = new Command(
+      "org.apache.spark.deploy.worker.DriverWrapper",
+      Seq("{{WORKER_URL}}", "{{USER_JAR}}", mainClass) ++ appArgs, // args to the DriverWrapper
+      environmentVariables, extraClassPath, extraLibraryPath, javaOpts)
+    val actualDriverMemory = driverMemory.map(Utils.memoryStringToMb).getOrElse(DEFAULT_MEMORY)
+    val actualDriverCores = driverCores.map(_.toInt).getOrElse(DEFAULT_CORES)
+    val actualSuperviseDriver = superviseDriver.map(_.toBoolean).getOrElse(DEFAULT_SUPERVISE)
+    val driverResourceReqs = ResourceUtils.parseResourceRequirements(conf,
+      config.SPARK_DRIVER_PREFIX)
+    val= new DriverDescription(
+      appResource, actualDriverMemory, actualDriverCores, actualSuperviseDriver, command,
+      driverResourceReqs)
+}
+```
 
-6. [SubmitRestProtocolRequest.scala](# SubmitRestProtocolRequest)
+##### SubmitRestProtocolException
 
-7.  [SubmitRestProtocolResponse.scala](# SubmitRestProtocolResponse)
+```scala
+private[rest] class SubmitRestProtocolException(message: String, cause: Throwable = null)
+extends Exception(message, cause)
+介绍: REST应用协议错误
+
+private[rest] class SubmitRestMissingFieldException(message: String)
+extends SubmitRestProtocolException(message)
+介绍: @SubmitRestProtocolMessage	缺少属性引发的异常
+
+private[deploy] class SubmitRestConnectionException(message: String, cause: Throwable)
+extends SubmitRestProtocolException(message, cause)
+介绍: 客户端接收不到服务端的信息异常
+```
+
+##### SubmitRestProtocolMessage
+
+```scala
+@JsonInclude(Include.NON_ABSENT)
+@JsonAutoDetect(getterVisibility = Visibility.ANY, setterVisibility = Visibility.ANY)
+@JsonPropertyOrder(alphabetic = true)
+private[rest] abstract class SubmitRestProtocolMessage {
+    介绍: REST应用提交协议中用于抽象交换的消息
+    在数据交换的过程中,按照json的形式进行序列化/反序列化,每个请求或是响应可以使用如下三个属性构成:
+    1. 动作,用于指定消息的类型
+    2. 客户端/服务器的spark版本号
+    3. 可配置信息
+    属性:
+    #name @messageType = Utils.getFormattedClassName(this)	消息类型
+    #name @action: String = messageType	动作名称
+    #name @message: String = null	消息名称
+    操作集:
+    def setAction(a: String): Unit = { }
+    功能: 设置动作,用于json的反序列化
+    
+    def toJson: String 
+    功能: 转化为json(序列化信息为json)
+    validate()
+    SubmitRestProtocolMessage.mapper.writeValueAsString(this)
+    
+    final def validate(): Unit
+    功能: 消息格式断言
+    try {
+      doValidate()
+    } catch {
+      case e: Exception =>
+        throw new SubmitRestProtocolException(
+            s"Validation of message $messageType failed!", e)
+    }
+    
+    def doValidate(): Unit
+    功能: 断言消息的可用性
+    if (action == null) {
+      throw new SubmitRestMissingFieldException(s"The action field 
+      is missing in $messageType")
+    }
+    
+    def assertFieldIsSet[T](value: T, name: String): Unit
+    功能: 断言指定属性在消息中设定了
+     if (value == null) {
+      throw new SubmitRestMissingFieldException(s"'$name' is 
+      missing in message $messageType.")
+    }
+    
+    def assert(condition: Boolean, failMessage: String): Unit
+    功能: 验证消息信息时断言条件
+    if (!condition) { throw new SubmitRestProtocolException(failMessage) }
+}
+```
+
+```scala
+private[spark] object SubmitRestProtocolMessage {
+    介绍: 提供一些辅助方法,用于启动序列化的@SubmitRestProtocolMessage
+    属性:
+    #name @packagePrefix = this.getClass.getPackage.getName	包前缀
+    #name @mapper = new ObjectMapper()	对象映射器
+    val= new ObjectMapper()
+    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+    .enable(SerializationFeature.INDENT_OUTPUT)
+    .registerModule(DefaultScalaModule)
+    
+    操作集:
+    def parseAction(json: String): String
+    功能: 转换指定json对应的动作属性值,如果没有找到对应的动作,抛出@SubmitRestMissingFieldException
+    val value: Option[String] = parse(json) match {
+      case JObject(fields) =>
+        fields.collectFirst { case ("action", v) => v }.collect { case JString(s) => s }
+      case _ => None
+    }
+    val= value.getOrElse {
+      throw new SubmitRestMissingFieldException(s"Action 
+      field not found in JSON:\n$json")
+    }
+    
+    def fromJson(json: String): SubmitRestProtocolMessage
+    功能: 根据指定的json,构造一条REST提交消息
+    方法首先转化json的动作,使用它去转换信息类型,注意到动作必须代表定义在包内的@SubmitRestProtocolMessage,否则会抛出@ClassNotFoundException
+    val className = parseAction(json)
+    val clazz = Utils.classForName(packagePrefix + "." + className)
+      .asSubclass[SubmitRestProtocolMessage](classOf[SubmitRestProtocolMessage])
+    fromJson(json, clazz)
+    
+    def fromJson[T <: SubmitRestProtocolMessage](json: String, clazz: Class[T]): T
+    功能: 由指定的json数据构造出一个@SubmitRestProtocolMessage
+    这个方法决定消息的类型,有利于反序列化数据
+    val= mapper.readValue(json, clazz)
+}
+```
+
+##### SubmitRestProtocolRequest
+
+```scala
+private[rest] abstract class SubmitRestProtocolRequest extends SubmitRestProtocolMessage {
+    介绍: 代表着由客户端在REST提交协议中发送的请求
+    属性:
+    #name @clientSparkVersion: String = null	客户端spark版本
+    操作集:
+    def doValidate(): Unit
+    功能: 参数验证
+    super.doValidate()
+    assertFieldIsSet(clientSparkVersion, "clientSparkVersion")
+}
+```
+
+```scala
+private[rest] class CreateSubmissionRequest extends SubmitRestProtocolRequest {
+    介绍: 用于在REST应用中运行新的应用请求
+    属性:
+    #name @appResource: String = null	应用资源
+    #name @mainClass: String = null	主类
+    #name @appArgs: Array[String] = null	应用参数列表
+    #name @sparkProperties: Map[String, String] = null	spark属性列表
+    #name @environmentVariables: Map[String, String] = null	环境变量表
+    操作集:
+    def doValidate(): Unit
+    功能: 参数合法性校验
+    super.doValidate()
+    assert(sparkProperties != null, "No Spark properties set!")
+    assertFieldIsSet(appResource, "appResource")
+    assertFieldIsSet(appArgs, "appArgs")
+    assertFieldIsSet(environmentVariables, "environmentVariables")
+    assertPropertyIsSet("spark.app.name")
+    assertPropertyIsBoolean(config.DRIVER_SUPERVISE.key)
+    assertPropertyIsNumeric(config.DRIVER_CORES.key)
+    assertPropertyIsNumeric(config.CORES_MAX.key)
+    assertPropertyIsMemory(config.DRIVER_MEMORY.key)
+    assertPropertyIsMemory(config.EXECUTOR_MEMORY.key)
+    
+    def assertPropertyIsSet(key: String): Unit
+    功能: 断言属性已经设置完毕
+    assertFieldIsSet(sparkProperties.getOrElse(key, null), key)
+    
+    def assertPropertyIsBoolean(key: String): Unit
+    功能: 断言属性是boolean类型
+    assertProperty[Boolean](key, "boolean", _.toBoolean)
+    
+    def assertPropertyIsNumeric(key: String): Unit
+    功能: 断言属性为数字类型
+    assertProperty[Double](key, "numeric", _.toDouble)
+    
+    def assertPropertyIsMemory(key: String): Unit
+    功能: 断言属性时内存计量值
+    assertProperty[Int](key, "memory", Utils.memoryStringToMb)
+    
+    def assertProperty[T](key: String, valueType: String, convert: (String => T)): Unit
+    功能: 属性断言
+    sparkProperties.get(key).foreach { value =>
+      Try(convert(value)).getOrElse {
+        throw new SubmitRestProtocolException(
+          s"Property '$key' expected $valueType value: actual was '$value'.")
+      }
+    }
+}
+```
+
+##### SubmitRestProtocolResponse
+
+```scala
+private[rest] abstract class SubmitRestProtocolResponse extends SubmitRestProtocolMessage {
+    介绍: 响应的抽象,在REST应用的提交协议中用于发送到客户端
+    属性: 
+    #name @serverSparkVersion: String = null	服务器spark版本
+    #name @success: Boolean = null	响应成功标记
+    #name @unknownFields: Array[String] = null	未知属性
+    操作集:
+    def doValidate(): Unit
+    功能: 参数验证
+    super.doValidate()
+    assertFieldIsSet(serverSparkVersion, "serverSparkVersion")
+}
+```
+
+```scala
+private[spark] class CreateSubmissionResponse extends SubmitRestProtocolResponse{
+    介绍: 发送给客户端的一个REST应用提交协议
+    属性:
+    #name @submissionId: String = null	提交ID
+    操作集:
+    def doValidate(): Unit
+    功能: 参数验证
+    super.doValidate()
+    assertFieldIsSet(success, "success")
+}
+```
+
+```scala
+private[spark] class KillSubmissionResponse extends SubmitRestProtocolResponse {
+    介绍: 在REST应用中kill请求的响应
+    属性:
+    #name @submissionId: String = null	提交ID
+    操作集:
+    def doValidate(): Unit
+    功能: 参数验证
+    super.doValidate()
+    assertFieldIsSet(submissionId, "submissionId")
+    assertFieldIsSet(success, "success")
+}
+```
+
+```scala
+private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse{
+    介绍: REST应用中用于请求状态的响应
+    属性:
+    #name @submissionId: String = null	提交ID
+    #name @driverState: String = null	driver状态
+    #name @workerId: String = null	workerID
+    #name @workerHostPort: String = null	worker主机端口号
+    操作集:
+    def doValidate(): Unit
+    功能: 参数验证
+    super.doValidate()
+    assertFieldIsSet(submissionId, "submissionId")
+    assertFieldIsSet(success, "success")
+}
+```
+
+```scala
 
 #### security
 
@@ -972,7 +2283,7 @@ private[spark] trait StandaloneAppClientListener {
     		sparkConf	spark配置
     		hadoopConf	hadoop配置
     		schedulerRef	调度的RPC端点(驱动器)
-   ```
+```
 
    ```scala
    private[spark] class HadoopDelegationTokenManager(
@@ -3870,6 +5181,160 @@ private[spark] object SparkCuratorUtil extends Logging {
 ```
 
 #### SparkHadoopUtil
+
+```scala
+private[spark] class SparkHadoopUtil extends Logging {
+    介绍: spark用于和hadoop进行交互的方法类
+    属性:
+    #name @sparkConf = new SparkConf(false).loadFromSystemProperties(true) spark配置
+    #name @conf: Configuration = newConfiguration(sparkConf)	hadoop配置
+    操作集:
+    def runAsSparkUser(func: () => Unit): Unit
+    功能: 使用hadoop用户组信息作为一个线程池变量,用于授权HDFS和YARN的调用
+    注意: 如果函数需要在进程中重复的调用,请参考<https://issues.apache.org/jira/browse/HDFS-3545>,很有可能创建一个文件系统(通过调用FileSystem.closeAllForUGI ),主要是防止内存泄漏.
+    createSparkUser().doAs(new PrivilegedExceptionAction[Unit] {
+      def run: Unit = func()
+    })
+    
+    def createSparkUser(): UserGroupInformation
+    功能: 创建spark user,返回hadoop的用户组信息
+    val user = Utils.getCurrentUserName()
+    logDebug("creating UGI for user: " + user)
+    val ugi = UserGroupInformation.createRemoteUser(user)
+    transferCredentials(UserGroupInformation.getCurrentUser(), ugi)
+    val= ugi
+    
+    def transferCredentials(source: UserGroupInformation, 
+                            dest: UserGroupInformation): Unit
+    功能: 转换证书(将源用户组的证书添加到目标组中)
+    dest.addCredentials(source.getCredentials())
+    
+    def appendS3AndSparkHadoopHiveConfigurations(
+      conf: SparkConf,
+      hadoopConf: Configuration): Unit
+    功能: 添加S3-specific,spark.hadoop.*,以及spark.buffer.size的配置到hadoop配置中
+    SparkHadoopUtil.appendS3AndSparkHadoopHiveConfigurations(conf, hadoopConf)
+    
+    def appendSparkHadoopConfigs(conf: SparkConf, hadoopConf: Configuration): Unit
+    功能: 添加spark.hadoop.*配置到hadoop配置中(来自spark配置)
+    SparkHadoopUtil.appendSparkHadoopConfigs(conf, hadoopConf)
+    
+    def appendSparkHadoopConfigs(
+      srcMap: Map[String, String],
+      destMap: HashMap[String, String]): Unit
+    功能: 从源配置@srcMap加入到目标位置在@destMap中
+    for ((key, value) <- srcMap if key.startsWith("spark.hadoop.")) {
+      destMap.put(key.substring("spark.hadoop.".length), value)
+    }
+    
+    def appendSparkHiveConfigs(
+      srcMap: Map[String, String],
+      destMap: HashMap[String, String]): Unit
+    功能: 添加spark.hive.foo=bar属性到hive.foo=bar中
+    for ((key, value) <- srcMap if key.startsWith("spark.hive.")) {
+      destMap.put(key.substring("spark.".length), value)
+    }
+    
+    def newConfiguration(conf: SparkConf): Configuration 
+    功能: 返回一个合适的配置,这个配置可以初始化hadoop子系统
+    val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+    hadoopConf.addResource(SparkHadoopUtil.SPARK_HADOOP_CONF_FILE)
+    val= hadoopConf
+    
+    def addCredentials(conf: JobConf): Unit
+    功能: 添加证书
+    val jobCreds = conf.getCredentials()
+    jobCreds.mergeAll(UserGroupInformation.getCurrentUser().getCredentials())
+    
+    def addCurrentUserCredentials(creds: Credentials): Unit
+    功能: 将指定证书@creds添加到当前用户的证书中
+    UserGroupInformation.getCurrentUser.addCredentials(creds)
+    
+    def loginUserFromKeytab(principalName: String, keytabFilename: String): Unit
+    功能: 从密钥表中登录用户
+    输入参数:
+    	principalName	原理名称
+    	keytabFilename	密钥表文件名称
+    if (!new File(keytabFilename).exists()) {
+      throw new SparkException(s"Keytab file: ${keytabFilename} does not exist")
+    } else {
+      logInfo("Attempting to login to Kerberos " +
+        s"using principal: ${principalName} and keytab: ${keytabFilename}")
+      UserGroupInformation.loginUserFromKeytab(principalName, keytabFilename)
+    }
+    
+    def addDelegationTokens(tokens: Array[Byte], sparkConf: SparkConf): Unit
+    功能: 添加授权密钥
+    添加和覆盖当前用户证书(使用序列化的授权密钥),也会确认是否进行正确的hadoop配置.
+    UserGroupInformation.setConfiguration(newConfiguration(sparkConf))
+    val creds = deserialize(tokens)
+    logInfo("Updating delegation tokens for current user.")
+    logDebug(s"Adding/updating delegation tokens ${dumpTokens(creds)}")
+    addCurrentUserCredentials(creds)
+    
+    def getFSBytesReadOnThreadCallback(): () => Long 
+    功能: 获取可以寻找hadoop文件系统的函数
+    1. 计算文件系统读取字节总量
+    val f = () => FileSystem.getAllStatistics.asScala.map(
+        _.getThreadStatistics.getBytesRead).sum
+    val baseline = (Thread.currentThread().getId, f())
+    // 这个函数在子线程和父线程中都可能调用,hadoop文件系统使用本地线程变量去追踪统计值,
+    // 因此需要去追踪父子线程读取的字节量,计算任务读取字节量和
+    val= new Function0[Long] {
+      private val bytesReadMap = new mutable.HashMap[Long, Long]()
+      override def apply(): Long = {
+        bytesReadMap.synchronized {
+          bytesReadMap.put(Thread.currentThread().getId, f())
+          bytesReadMap.map { case (k, v) =>
+            v - (if (k == baseline._1) baseline._2 else 0)
+          }.sum
+        }
+      }
+    }
+    
+    def getFSBytesWrittenOnThreadCallback(): () => Long 
+    功能: 获取计算写入到hadoop文件系统的字节量
+    val threadStats = FileSystem.getAllStatistics.asScala.map(_.getThreadStatistics)
+    val f = () => threadStats.map(_.getBytesWritten).sum
+    val baselineBytesWritten = f()
+    val= () => f() - baselineBytesWritten
+    
+    def listLeafStatuses(fs: FileSystem, basePath: Path): Seq[FileStatus]
+    功能: 获取给定路径@basePath的叶子节点的文件状态@FileStatus
+    val= listLeafStatuses(fs, fs.getFileStatus(basePath))
+    
+    def recurse(status: FileStatus): Seq[FileStatus]
+    功能: 迭代获取当前文件下叶子节点的文件状态
+    val (directories, leaves) = fs.listStatus(status.getPath).partition(_.isDirectory)
+    leaves ++ directories.flatMap(f => listLeafStatuses(fs, f))
+    
+    def listLeafStatuses(fs: FileSystem, baseStatus: FileStatus): Seq[FileStatus]
+    功能: 获取给定路径@basePath的叶子节点的文件状态@FileStatus,如果给定目录指向的是一个文件,返回单个元素的集合
+    val=  if (baseStatus.isDirectory) recurse(baseStatus) else Seq(baseStatus)
+    
+    def listLeafDirStatuses(fs: FileSystem, basePath: Path): Seq[FileStatus]
+    功能: 列举给出目录子目录的状态
+    val= listLeafDirStatuses(fs, fs.getFileStatus(basePath))
+    
+    def listLeafDirStatuses(fs: FileSystem, baseStatus: FileStatus): Seq[FileStatus]
+    功能: 列举叶子目录的状态信息
+    def recurse(status: FileStatus): Seq[FileStatus] = {
+      val (directories, files) = fs.listStatus(status.getPath).partition(_.isDirectory)
+      val leaves = if (directories.isEmpty) Seq(status) else Seq.empty[FileStatus]
+      leaves ++ directories.flatMap(dir => listLeafDirStatuses(fs, dir))
+    }
+    assert(baseStatus.isDirectory)
+    recurse(baseStatus)
+    
+    def isGlobPath(pattern: Path): Boolean
+    功能: 确定是否为全局目录
+    val= pattern.toString.exists("{}[]*?\\".toSet.contains)
+    
+    
+}
+```
+
+
 
 #### SparkSubmit
 
