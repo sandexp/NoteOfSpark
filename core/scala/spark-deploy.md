@@ -631,6 +631,1024 @@ extends LeaderElectionAgent {
 
 ##### master
 
+```scala
+private[deploy] class Master(
+    override val rpcEnv: RpcEnv,
+    address: RpcAddress,
+    webUiPort: Int,
+    val securityMgr: SecurityManager,
+    val conf: SparkConf)
+extends ThreadSafeRpcEndpoint with Logging with LeaderElectable {
+    构造器属性:
+    	rpcEnv	rpc环境
+    	address	RPC地址
+    	webUIPort	web端口
+    	securityMgr	安全管理器
+    	conf	spark配置
+    属性:
+    #name @forwardMessageThread	转发消息的线程
+    val= ThreadUtils.newDaemonSingleThreadScheduledExecutor(
+        "master-forward-message-thread")
+    #name @hadoopConf = SparkHadoopUtil.get.newConfiguration(conf)	hadoop配置
+    #name @workerTimeoutMs = conf.get(WORKER_TIMEOUT) * 1000	worker超时时间
+    #name @retainedApplications = conf.get(RETAINED_APPLICATIONS)	保存的应用数量
+    #name @retainedDrivers = conf.get(RETAINED_DRIVERS)	保存的driver数量
+    #name @reaperIterations = conf.get(REAPER_ITERATIONS)	弃用的worker数量
+    #name @recoveryMode = conf.get(RECOVERY_MODE)	恢复模式
+    #name @maxExecutorRetries = conf.get(MAX_EXECUTOR_RETRIES)	最大尝试次数
+    #name @workers = new HashSet[WorkerInfo]	worker列表
+    #name @idToApp = new HashMap[String, ApplicationInfo]	id与应用映射表
+    #name @waitingApps = new ArrayBuffer[ApplicationInfo]	等待应用列表
+    #name @apps = new HashSet[ApplicationInfo]	应用数量
+    #name @idToWorker = new HashMap[String, WorkerInfo]	id与worker的映射表
+    #name @addressToWorker = new HashMap[RpcAddress, WorkerInfo]	worker的RPC地址表
+    #name @endpointToApp = new HashMap[RpcEndpointRef, ApplicationInfo]	端点引用-->应用映射
+    #name @addressToApp = new HashMap[RpcAddress, ApplicationInfo]	RPC地址与应用的映射表
+    #name @completedApps = new ArrayBuffer[ApplicationInfo]	完成的应用列表
+    #name @nextAppNumber = 0	应用编号
+    #name @drivers = new HashSet[DriverInfo]	驱动器列表
+    #name @completedDrivers = new ArrayBuffer[DriverInfo]	已经完成的驱动器
+    #name @waitingDrivers = new ArrayBuffer[DriverInfo]	正在等待的驱动器
+    #name @nextDriverNumber = 0	驱动器编号
+    #name @masterMetricsSystem	master度量系统
+    val= MetricsSystem.createMetricsSystem(
+        MetricsSystemInstances.MASTER, conf, securityMgr)
+    #name @applicationMetricsSystem	应用度量系统
+    val= MetricsSystem.createMetricsSystem(
+        MetricsSystemInstances.APPLICATIONS, conf, securityMgr)
+    #name @masterSource = new MasterSource(this)	master资源
+    #name @webUi: MasterWebUI = null	web端口,启动时会设置
+    #name @masterPublicAddress	master公用地址
+    val= {
+        val envVar = conf.getenv("SPARK_PUBLIC_DNS")
+        if (envVar != null) envVar else address.host
+      }
+    #name @masterUrl = address.toSparkURL	master地址
+    #name @masterWebUiUrl: String = _	webUI地址
+    #name @state = RecoveryState.STANDBY	恢复状态(备用)
+    #name @persistenceEngine: PersistenceEngine = _	持久化引擎
+    #name @leaderElectionAgent: LeaderElectionAgent = _	选举代理
+    #name @recoveryCompletionTask: ScheduledFuture[_] = _	恢复完成的任务
+    #name @checkForWorkerTimeOutTask: ScheduledFuture[_] = _	检查worker超时的线程
+    #name @spreadOutApps = conf.get(SPREAD_OUT_APPS)	传递的应用
+    #name @defaultCores = conf.get(DEFAULT_CORES)	默认核心数量
+    #name @reverseProxy = conf.get(UI_REVERSE_PROXY)	UI反向代理
+    #name @restServerEnabled = conf.get(MASTER_REST_SERVER_ENABLED)	rest服务器启动标记
+    #name @restServer: Option[StandaloneRestServer] = None	rest服务器
+    #name @restServerBoundPort: Option[Int] = None	rest服务器绑定端口
+    初始化操作:
+    Utils.checkHost(address.host)
+    功能: 检查主机信息
+    
+    if (defaultCores < 1) {
+        throw new SparkException(s"${DEFAULT_CORES.key} must be positive")
+      }
+    功能: 核心数量校验
+    
+    {
+    val authKey = SecurityManager.SPARK_AUTH_SECRET_CONF
+    require(conf.getOption(authKey).isEmpty || !restServerEnabled,
+      s"The RestSubmissionServer does not support authentication via 
+      ${authKey}.  Either turn " +
+      "off the RestSubmissionServer with spark.master.rest.enabled=false,
+      or do not use " +
+      "authentication.")
+    }
+    功能: 授权密钥断言
+
+    
+    操作集:
+    def createDateFormat = new SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
+    功能: 创建日志形式
+    
+    def onStart(): Unit
+    功能: 启动master
+    1. 设置并绑定webUI
+    logInfo("Starting Spark master at " + masterUrl)
+    logInfo(s"Running Spark version ${org.apache.spark.SPARK_VERSION}")
+    webUi = new MasterWebUI(this, webUiPort)
+    webUi.bind()
+    masterWebUiUrl = s"${webUi.scheme}$masterPublicAddress:${webUi.boundPort}"
+    2. 进行可能的反向代理配置
+    if (reverseProxy) {
+      masterWebUiUrl = conf.get(UI_REVERSE_PROXY_URL).orElse(Some(masterWebUiUrl)).get
+      webUi.addProxy()
+      logInfo(s"Spark Master is acting as a reverse proxy. Master, Workers and " +
+       s"Applications UIs are available at $masterWebUiUrl")
+    }
+    3. 设置检查worker超时线程的执行内容
+    checkForWorkerTimeOutTask = forwardMessageThread.scheduleAtFixedRate(
+      () => Utils.tryLogNonFatalError { self.send(CheckForWorkerTimeOut) },
+      0, workerTimeoutMs, TimeUnit.MILLISECONDS)
+    4. 启动rest服务器
+    if (restServerEnabled) {
+      val port = conf.get(MASTER_REST_SERVER_PORT)
+      restServer = Some(new StandaloneRestServer(
+          address.host, port, conf, self, masterUrl))
+    }
+    restServerBoundPort = restServer.map(_.start())
+    5. 设置度量系统参数
+    masterMetricsSystem.registerSource(masterSource)
+    masterMetricsSystem.start()
+    applicationMetricsSystem.start()
+    masterMetricsSystem.getServletHandlers.foreach(webUi.attachHandler)
+    applicationMetricsSystem.getServletHandlers.foreach(webUi.attachHandler)
+    6. 设置持久化和master选举信息
+    val serializer = new JavaSerializer(conf)
+    val (persistenceEngine_, leaderElectionAgent_) = recoveryMode match {
+      case "ZOOKEEPER" =>
+        logInfo("Persisting recovery state to ZooKeeper")
+        val zkFactory =
+          new ZooKeeperRecoveryModeFactory(conf, serializer)
+        (zkFactory.createPersistenceEngine(), zkFactory.createLeaderElectionAgent(this))
+      case "FILESYSTEM" =>
+        val fsFactory =
+          new FileSystemRecoveryModeFactory(conf, serializer)
+        (fsFactory.createPersistenceEngine(), fsFactory.createLeaderElectionAgent(this))
+      case "CUSTOM" =>
+        val clazz = Utils.classForName(conf.get(RECOVERY_MODE_FACTORY))
+        val factory = clazz.getConstructor(classOf[SparkConf], classOf[Serializer])
+          .newInstance(conf, serializer)
+          .asInstanceOf[StandaloneRecoveryModeFactory]
+        (factory.createPersistenceEngine(), factory.createLeaderElectionAgent(this))
+      case _ =>
+        (new BlackHolePersistenceEngine(), new MonarchyLeaderAgent(this))
+    }
+    persistenceEngine = persistenceEngine_
+    leaderElectionAgent = leaderElectionAgent_
+    
+    def onStop(): Unit
+    功能: 停止master
+    1. 汇报度量信息
+    masterMetricsSystem.report()
+    applicationMetricsSystem.report()
+    2. 取消辅助线程
+    if (recoveryCompletionTask != null) {
+      recoveryCompletionTask.cancel(true)
+    }
+    if (checkForWorkerTimeOutTask != null) {
+      checkForWorkerTimeOutTask.cancel(true)
+    }
+    forwardMessageThread.shutdownNow()
+    3. 关闭WEB,REST,度量系统
+    webUi.stop()
+    restServer.foreach(_.stop())
+    masterMetricsSystem.stop()
+    applicationMetricsSystem.stop()
+    persistenceEngine.close()
+    leaderElectionAgent.stop()
+    
+    def electedLeader(): Unit= self.send(ElectedLeader)
+    功能: 通过RPC发送leader选举消息@ElectedLeader
+    
+    def revokedLeadership(): Unit = self.send(RevokedLeadership)
+    功能: 撤销leader,通过发送取消消息@RevokedLeadership
+    
+    def receive: PartialFunction[Any, Unit]
+    功能: 接受并处理RPC消息
+    case ElectedLeader => // 处理leader的选举的消息
+      val (storedApps, storedDrivers, storedWorkers) =
+    	persistenceEngine.readPersistedData(rpcEnv)
+      state = if (storedApps.isEmpty && storedDrivers.isEmpty && storedWorkers.isEmpty) {
+        RecoveryState.ALIVE
+      } else {
+        RecoveryState.RECOVERING
+      }
+      logInfo("I have been elected leader! New state: " + state)
+      if (state == RecoveryState.RECOVERING) {
+        beginRecovery(storedApps, storedDrivers, storedWorkers)
+        recoveryCompletionTask = forwardMessageThread.schedule(new Runnable {
+          override def run(): Unit = Utils.tryLogNonFatalError {
+            self.send(CompleteRecovery)
+          }
+        }, workerTimeoutMs, TimeUnit.MILLISECONDS)
+      }
+    case CompleteRecovery => completeRecovery() // 处理完全恢复消息
+    case RevokedLeadership => // 取消leader消息
+      logError("Leadership has been revoked -- master shutting down.")
+      System.exit(0)
+    case RegisterWorker( // 注册worker的消息
+      id, workerHost, workerPort, workerRef, cores, memory, workerWebUiUrl,
+      masterAddress, resources) =>
+      logInfo("Registering worker %s:%d with %d cores, %s RAM".format(
+        workerHost, workerPort, cores, Utils.megabytesToString(memory)))
+      if (state == RecoveryState.STANDBY) {
+        workerRef.send(MasterInStandby)
+      } else if (idToWorker.contains(id)) {
+        workerRef.send(RegisteredWorker(self, masterWebUiUrl, masterAddress, true))
+      } else {
+        val workerResources = resources.map(r => r._1 -> WorkerResourceInfo(
+            r._1, r._2.addresses))
+        val worker = new WorkerInfo(id, workerHost, workerPort, cores, memory,
+          workerRef, workerWebUiUrl, workerResources)
+        if (registerWorker(worker)) {
+          persistenceEngine.addWorker(worker)
+          workerRef.send(RegisteredWorker(self, masterWebUiUrl, masterAddress, false))
+          schedule()
+        } else {
+          val workerAddress = worker.endpoint.address
+          logWarning("Worker registration failed. Attempted to 
+          re-register worker at same " +
+            "address: " + workerAddress)
+          workerRef.send(RegisterWorkerFailed("Attempted to re-register 
+          worker at same address: "
+            + workerAddress))
+        }
+      }
+    
+    case RegisterApplication(description, driver) => // 注册应用的消息
+      if (state == RecoveryState.STANDBY) {
+        // ignore, don't send response
+      } else {
+        logInfo("Registering app " + description.name)
+        val app = createApplication(description, driver)
+        registerApplication(app)
+        logInfo("Registered app " + description.name + " with ID " + app.id)
+        persistenceEngine.addApplication(app)
+        driver.send(RegisteredApplication(app.id, self))
+        schedule()
+      }
+    
+    case ExecutorStateChanged(appId, execId, state, message, exitStatus) =>
+      // 执行器状态改变的消息
+      1. 获取执行器属性
+   	  val execOption = idToApp.get(appId).flatMap(app => app.executors.get(execId))
+      execOption match {
+        case Some(exec) =>
+          val appInfo = idToApp(appId)
+          val oldState = exec.state
+          exec.state = state
+          if (state == ExecutorState.RUNNING) {
+            assert(oldState == ExecutorState.LAUNCHING,
+              s"executor $execId state transfer from $oldState to RUNNING is illegal")
+            appInfo.resetRetryCount()
+          }
+          exec.application.driver.send(ExecutorUpdated(execId, state, message,
+                                                       exitStatus, false))
+          if (ExecutorState.isFinished(state)) {
+            logInfo(s"Removing executor ${exec.fullId} because it is $state")
+            if (!appInfo.isFinished) {
+              appInfo.removeExecutor(exec)
+            }
+            exec.worker.removeExecutor(exec)
+            val normalExit = exitStatus == Some(0)
+            if (!normalExit
+                && appInfo.incrementRetryCount() >= maxExecutorRetries
+                && maxExecutorRetries >= 0) {
+              val execs = appInfo.executors.values
+              if (!execs.exists(_.state == ExecutorState.RUNNING)) {
+                logError(s"Application ${appInfo.desc.name} 
+                with ID ${appInfo.id} failed " +
+                  s"${appInfo.retryCount} times; removing it")
+                removeApplication(appInfo, ApplicationState.FAILED)
+              }
+            }
+          }
+          schedule()
+        case None =>
+          logWarning(s"Got status update for unknown executor $appId/$execId")
+      }
+    
+    case DriverStateChanged(driverId, state, exception) => // 驱动器状态改变
+      state match {
+        case DriverState.ERROR | DriverState.FINISHED | 
+          DriverState.KILLED | DriverState.FAILED =>
+          removeDriver(driverId, state, exception)
+        case _ =>
+          throw new Exception(s"Received unexpected state update 
+          for driver $driverId: $state")
+      }
+    
+    case Heartbeat(workerId, worker) => // 接受worker发送过来的心跳信息
+      idToWorker.get(workerId) match {
+        case Some(workerInfo) =>
+          workerInfo.lastHeartbeat = System.currentTimeMillis()
+        case None =>
+          if (workers.map(_.id).contains(workerId)) {
+            logWarning(s"Got heartbeat from unregistered worker $workerId." +
+              " Asking it to re-register.")
+            worker.send(ReconnectWorker(masterUrl))
+          } else {
+            logWarning(s"Got heartbeat from unregistered worker $workerId." +
+              " This worker was never registered, so ignoring the heartbeat.")
+          }
+      }
+    
+    case MasterChangeAcknowledged(appId) => // 接受或者master的消息
+      idToApp.get(appId) match {
+        case Some(app) =>
+          logInfo("Application has been re-registered: " + appId)
+          app.state = ApplicationState.WAITING
+        case None =>
+          logWarning("Master change ack from unknown app: " + appId)
+      }
+      if (canCompleteRecovery) { completeRecovery() }
+    
+    case WorkerSchedulerStateResponse(workerId, execResponses, driverResponses) =>
+    	// 接受worker调度状态响应消息
+      idToWorker.get(workerId) match {
+        case Some(worker) =>
+          logInfo("Worker has been re-registered: " + workerId)
+          worker.state = WorkerState.ALIVE
+          val validExecutors = execResponses.filter(
+            exec => idToApp.get(exec.desc.appId).isDefined)
+          for (exec <- validExecutors) {
+            val (execDesc, execResources) = (exec.desc, exec.resources)
+            val app = idToApp(execDesc.appId)
+            val execInfo = app.addExecutor(
+              worker, execDesc.cores, execResources, Some(execDesc.execId))
+            worker.addExecutor(execInfo)
+            worker.recoverResources(execResources)
+            execInfo.copyState(execDesc)
+          }
+          for (driver <- driverResponses) {
+            val (driverId, driverResource) = (driver.driverId, driver.resources)
+            drivers.find(_.id == driverId).foreach { driver =>
+              driver.worker = Some(worker)
+              driver.state = DriverState.RUNNING
+              driver.withResources(driverResource)
+              worker.recoverResources(driverResource)
+              worker.addDriver(driver)
+            }
+          }
+        case None =>
+          logWarning("Scheduler state from unknown worker: " + workerId)
+      }
+      if (canCompleteRecovery) { completeRecovery() }
+    
+    case UnregisterApplication(applicationId) => // 解除应用的注册消息
+      logInfo(s"Received unregister request from application $applicationId")
+      idToApp.get(applicationId).foreach(finishApplication)
+    
+    case CheckForWorkerTimeOut => // 检查worker超时消息
+      timeOutDeadWorkers()
+    
+    case WorkerLatestState(workerId, executors, driverIds) =>
+    // 接受worker最新状态的消息
+      idToWorker.get(workerId) match {
+        case Some(worker) =>
+          for (exec <- executors) {
+            val executorMatches = worker.executors.exists {
+              case (_, e) => e.application.id == exec.appId && e.id == exec.execId
+            }
+            if (!executorMatches) {
+              worker.endpoint.send(KillExecutor(masterUrl, exec.appId, exec.execId))
+            }
+          }
+          for (driverId <- driverIds) {
+            val driverMatches = worker.drivers.exists { case (id, _) => id == driverId }
+            if (!driverMatches) {
+              // master doesn't recognize this driver. So just tell worker to kill it.
+              worker.endpoint.send(KillDriver(driverId))
+            }
+          }
+        case None =>
+          logWarning("Worker state from unknown worker: " + workerId)
+      }
+    
+    def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit]
+    功能: 接受并回应RPC消息
+    case RequestSubmitDriver(description) =>
+    // master请求提交驱动器的消息
+      if (state != RecoveryState.ALIVE) {
+        val msg = s"${Utils.BACKUP_STANDALONE_MASTER_PREFIX}: $state. " +
+          "Can only accept driver submissions in ALIVE state."
+        context.reply(SubmitDriverResponse(self, false, None, msg))
+      } else {
+        logInfo("Driver submitted " + description.command.mainClass)
+        val driver = createDriver(description)
+        persistenceEngine.addDriver(driver)
+        waitingDrivers += driver
+        drivers.add(driver)
+        schedule()
+        context.reply(SubmitDriverResponse(self, true, Some(driver.id),
+          s"Driver successfully submitted as ${driver.id}"))
+      }
+    
+    case RequestKillDriver(driverId) =>
+    	// 请求kill驱动器的消息
+      if (state != RecoveryState.ALIVE) {
+        val msg = s"${Utils.BACKUP_STANDALONE_MASTER_PREFIX}: $state. " +
+          s"Can only kill drivers in ALIVE state."
+        context.reply(KillDriverResponse(self, driverId, success = false, msg))
+      } else {
+        logInfo("Asked to kill driver " + driverId)
+        val driver = drivers.find(_.id == driverId)
+        driver match {
+          case Some(d) =>
+            if (waitingDrivers.contains(d)) {
+              waitingDrivers -= d
+              self.send(DriverStateChanged(driverId, DriverState.KILLED, None))
+            } else {
+              d.worker.foreach { w =>
+                w.endpoint.send(KillDriver(driverId))
+              }
+            }
+            val msg = s"Kill request for $driverId submitted"
+            logInfo(msg)
+            context.reply(KillDriverResponse(self, driverId, success = true, msg))
+          case None =>
+            val msg = s"Driver $driverId has already finished or does not exist"
+            logWarning(msg)
+            context.reply(KillDriverResponse(self, driverId, success = false, msg))
+        }
+      }
+    
+    case RequestDriverStatus(driverId) =>
+    	// 回应请求驱动器状态的消息
+      if (state != RecoveryState.ALIVE) {
+        val msg = s"${Utils.BACKUP_STANDALONE_MASTER_PREFIX}: $state. " +
+          "Can only request driver status in ALIVE state."
+        context.reply(
+          DriverStatusResponse(found = false, None, None, None,
+                               Some(new Exception(msg))))
+      } else {
+        (drivers ++ completedDrivers).find(_.id == driverId) match {
+          case Some(driver) =>
+            context.reply(DriverStatusResponse(found = true, Some(driver.state),
+              driver.worker.map(_.id), driver.worker.map(_.hostPort), driver.exception))
+          case None =>
+            context.reply(DriverStatusResponse(found = false, None, None, None, None))
+        }
+      }
+    
+    case RequestMasterState => // 请求master状态的消息
+      context.reply(MasterStateResponse(
+        address.host, address.port, restServerBoundPort,
+        workers.toArray, apps.toArray, completedApps.toArray,
+        drivers.toArray, completedDrivers.toArray, state))
+    
+    case BoundPortsRequest =>  // 请求绑定端口的消息
+      context.reply(
+          BoundPortsResponse(address.port, webUi.boundPort, restServerBoundPort))
+    
+    case RequestExecutors(appId, requestedTotal) => // 请求执行器消息
+      context.reply(handleRequestExecutors(appId, requestedTotal))
+    
+    case KillExecutors(appId, executorIds) => // kill执行器消息
+      val formattedExecutorIds = formatExecutorIds(executorIds)
+      context.reply(handleKillExecutors(appId, formattedExecutorIds))
+    
+    def onDisconnected(address: RpcAddress): Unit
+    功能: 断开连接处理
+    logInfo(s"$address got disassociated, removing it.")
+    addressToWorker.get(address).foreach(removeWorker(_, s"${address} 
+    got disassociated"))
+    addressToApp.get(address).foreach(finishApplication)
+    if (state == RecoveryState.RECOVERING && canCompleteRecovery) { completeRecovery() }
+    
+    def canCompleteRecovery
+    功能: 确定是否能够完全恢复
+    val= workers.count(_.state == WorkerState.UNKNOWN) == 0 &&
+      apps.count(_.state == ApplicationState.UNKNOWN) == 0
+    
+    def beginRecovery(storedApps: Seq[ApplicationInfo], storedDrivers: Seq[DriverInfo],
+      storedWorkers: Seq[WorkerInfo]): Unit
+    功能: 启动恢复工作
+    1. 恢复应用信息
+    for (app <- storedApps) {
+      logInfo("Trying to recover app: " + app.id)
+      try {
+        registerApplication(app)
+        app.state = ApplicationState.UNKNOWN
+        app.driver.send(MasterChanged(self, masterWebUiUrl))
+      } catch {
+        case e: Exception => logInfo("App " + app.id + " had exception on reconnect")
+      }
+    }
+    2. 恢复执行器和驱动器
+    for (driver <- storedDrivers) {
+      drivers += driver
+    }
+
+    for (worker <- storedWorkers) {
+      logInfo("Trying to recover worker: " + worker.id)
+      try {
+        registerWorker(worker)
+        worker.state = WorkerState.UNKNOWN
+        worker.endpoint.send(MasterChanged(self, masterWebUiUrl))
+      } catch {
+        case e: Exception => logInfo("Worker " + worker.id + 
+                                     " had exception on reconnect")
+      }
+    }
+    
+    def completeRecovery(): Unit
+    功能: 完全恢复master
+    1. 使用短期同步,确保只有一次恢复
+    if (state != RecoveryState.RECOVERING) { return }
+    state = RecoveryState.COMPLETING_RECOVERY
+    2. kill所有不回应的worker和应用
+    workers.filter(_.state == WorkerState.UNKNOWN).foreach(
+      removeWorker(_, "Not responding for recovery"))
+    apps.filter(_.state == ApplicationState.UNKNOWN).foreach(finishApplication)
+    3. 更新恢复的应用状态为RUNNING
+    apps.filter(_.state == ApplicationState.WAITING).foreach(
+        _.state = ApplicationState.RUNNING)
+    4. 重新调度没有执行器的驱动器
+    drivers.filter(_.worker.isEmpty).foreach { d =>
+      logWarning(s"Driver ${d.id} was not found after master recovery")
+      if (d.desc.supervise) {
+        logWarning(s"Re-launching ${d.id}")
+        relaunchDriver(d)
+      } else {
+        removeDriver(d.id, DriverState.ERROR, None)
+        logWarning(s"Did not re-launch ${d.id} because it was not supervised")
+      }
+    }
+    5. 修改恢复状态，并启动调度
+    state = RecoveryState.ALIVE
+    schedule()
+    logInfo("Recovery complete - resuming operations!")
+    
+    def startExecutorsOnWorkers(): Unit
+    功能: 启动worker上的执行器
+    1. 使用FIFO调度策略，使用等待队列中的应用
+    for (app <- waitingApps) {
+      val coresPerExecutor = app.desc.coresPerExecutor.getOrElse(1)
+      if (app.coresLeft >= coresPerExecutor) {
+        val usableWorkers = workers.toArray.filter(_.state == WorkerState.ALIVE)
+          .filter(canLaunchExecutor(_, app.desc))
+          .sortBy(_.coresFree).reverse
+        if (waitingApps.length == 1 && usableWorkers.isEmpty) {
+          logWarning(s"App ${app.id} requires more resource than 
+          any of Workers could have.")
+        }
+        val assignedCores = scheduleExecutorsOnWorkers(app, usableWorkers, spreadOutApps)
+        for (pos <- 0 until usableWorkers.length if assignedCores(pos) > 0) {
+          allocateWorkerResourceToExecutors(
+            app, assignedCores(pos), app.desc.coresPerExecutor, usableWorkers(pos))
+        }
+      }
+    }
+    
+    def allocateWorkerResourceToExecutors(
+      app: ApplicationInfo,
+      assignedCores: Int,
+      coresPerExecutor: Option[Int],
+      worker: WorkerInfo): Unit
+    功能： 分配worker的资源到执行器上
+    如果执行器的核心数量已经分配了，那么对剩余的执行器进行均分
+    1. 获取执行数量，确定需要分配的核心数量
+    val numExecutors = coresPerExecutor.map { assignedCores / _ }.getOrElse(1)
+    val coresToAssign = coresPerExecutor.getOrElse(assignedCores)
+    2. 分配执行器资源
+    for (i <- 1 to numExecutors) {
+       // 分配资源--> 添加到执行器列表中 --> 运行执行器 --> 设置应用状态
+      val allocated = worker.acquireResources(app.desc.resourceReqsPerExecutor)
+      val exec = app.addExecutor(worker, coresToAssign, allocated)
+      launchExecutor(worker, exec)
+      app.state = ApplicationState.RUNNING
+    }
+    
+    def canLaunch(
+      worker: WorkerInfo,
+      memoryReq: Int,
+      coresReq: Int,
+      resourceRequirements: Seq[ResourceRequirement])
+    : Boolean
+    功能: 确定master是否可以被启动
+    输入参数:
+    	worker	worker信息
+    	memoryReq	内存请求量
+    	coresReq	请求核心数量
+    	resourceRequirements	资源列表
+    1. 确定内存是否足够
+    val enoughMem = worker.memoryFree >= memoryReq
+    2. 确定核心数量是否足够
+    val enoughCores = worker.coresFree >= coresReq
+    3. 确定资源是否足够
+    val enoughResources = ResourceUtils.resourcesMeetRequirements(
+      worker.resourcesAmountFree, resourceRequirements)
+    val=  enoughMem && enoughCores && enoughResources
+    
+    def canLaunchDriver(worker: WorkerInfo, desc: DriverDescription): Boolean
+    功能: 确定是否可以运行驱动器
+    val= canLaunch(worker, desc.mem, desc.cores, desc.resourceReqs)
+    
+    def canLaunchExecutor(worker: WorkerInfo, desc: ApplicationDescription): Boolean
+    功能: 确定是否可以运行执行器
+    val= canLaunch(
+      worker,
+      desc.memoryPerExecutorMB,
+      desc.coresPerExecutor.getOrElse(1),
+      desc.resourceReqsPerExecutor)
+    
+    def schedule(): Unit 
+    功能: 调度当前可用资源,用于分配给等待的应用.当新的应用添加的时候或者有新的可用资源的时候就会调用.
+    1. 状态校验
+    if (state != RecoveryState.ALIVE) {
+      return
+    }
+    2. worker顺序随机化
+    val shuffledAliveWorkers = Random.shuffle(workers.toSeq.filter(
+        _.state == WorkerState.ALIVE))
+    val numWorkersAlive = shuffledAliveWorkers.size
+    var curPos = 0
+    3. 对驱动器中的执行器分配资源,假设等待驱动器的执行器按照round-robin的格式进行等待,对于每个驱动器来说,开始于上一个分配驱动器的worker,继续直到所有的存活worker全部访问完毕.
+    for (driver <- waitingDrivers.toList) {
+      var launched = false
+      var isClusterIdle = true
+      var numWorkersVisited = 0
+      while (numWorkersVisited < numWorkersAlive && !launched) {
+        val worker = shuffledAliveWorkers(curPos)
+        isClusterIdle = worker.drivers.isEmpty && worker.executors.isEmpty
+        numWorkersVisited += 1
+        if (canLaunchDriver(worker, driver.desc)) {
+            // 满足分配条件,分配内存等资源,并更新资源列表
+          val allocated = worker.acquireResources(driver.desc.resourceReqs)
+          driver.withResources(allocated)
+          launchDriver(worker, driver)
+          waitingDrivers -= driver
+          launched = true
+        }
+        // round-robin 访问下一个驱动器
+        curPos = (curPos + 1) % numWorkersAlive
+      }
+      if (!launched && isClusterIdle) {
+        logWarning(s"Driver ${driver.id} requires more
+        resource than any of Workers could have.")
+      }
+    }
+    4. 启动worker上的执行器
+    startExecutorsOnWorkers()
+    
+    def launchExecutor(worker: WorkerInfo, exec: ExecutorDesc): Unit
+    功能: 运行执行器
+    1. 添加执行器
+    logInfo("Launching executor " + exec.fullId + " on worker " + worker.id)
+    worker.addExecutor(exec)
+    2. worker端发送运行执行器消息
+    worker.endpoint.send(LaunchExecutor(masterUrl, exec.application.id, exec.id,
+      exec.application.desc, exec.cores, exec.memory, exec.resources))
+    3. 驱动器发送添加当前执行器的消息
+    exec.application.driver.send(
+      ExecutorAdded(exec.id, worker.id, worker.hostPort, exec.cores, exec.memory))
+    
+    def registerWorker(worker: WorkerInfo): Boolean
+    功能: 注册worker(注意在一个节点上可能有一个或者多个指向死亡worker的应用,需要移除)
+    1. 过滤死亡的worker
+    workers.filter { w =>
+      (w.host == worker.host && w.port == worker.port) && (w.state == WorkerState.DEAD)
+    }.foreach { w =>
+      workers -= w
+    }
+    2. 处理旧worker
+    val workerAddress = worker.endpoint.address
+    if (addressToWorker.contains(workerAddress)) {
+      val oldWorker = addressToWorker(workerAddress)
+      if (oldWorker.state == WorkerState.UNKNOWN) {
+        removeWorker(oldWorker, "Worker replaced by a new worker with same address")
+      } else {
+        logInfo("Attempted to re-register worker at same address: " + workerAddress)
+        return false
+      }
+    }
+    3. 设置并注册新的worker
+    workers += worker
+    idToWorker(worker.id) = worker
+    addressToWorker(workerAddress) = worker
+    val= true
+    
+    def removeWorker(worker: WorkerInfo, msg: String): Unit
+    功能: 移除指定worker
+    1. 修改指定worker的状态为dead,并从注册表中移除
+    logInfo("Removing worker " + worker.id + " on " + worker.host + ":" + worker.port)
+    worker.setState(WorkerState.DEAD)
+    idToWorker -= worker.id
+    addressToWorker -= worker.endpoint.address
+    2. 告知应用执行器丢失
+    for (exec <- worker.executors.values) {
+      logInfo("Telling app of lost executor: " + exec.id)
+        // 发送执行器状态更新消息
+      exec.application.driver.send(ExecutorUpdated(
+        exec.id, ExecutorState.LOST, Some("worker lost"), None, workerLost = true))
+        // 修改并移除执行器
+      exec.state = ExecutorState.LOST
+      exec.application.removeExecutor(exec)
+    }
+    3. 处理驱动器,驱动器处于监视状态下,则重启驱动器即可,否则需要移除驱动器
+    for (driver <- worker.drivers.values) {
+      if (driver.desc.supervise) {
+        logInfo(s"Re-launching ${driver.id}")
+        relaunchDriver(driver)
+      } else {
+        logInfo(s"Not re-launching ${driver.id} because it was not supervised")
+        removeDriver(driver.id, DriverState.ERROR, None)
+      }
+    }
+    4. 告知应用丢失的worker
+    logInfo(s"Telling app of lost worker: " + worker.id)
+    apps.filterNot(completedApps.contains(_)).foreach { app =>
+      app.driver.send(WorkerRemoved(worker.id, worker.host, msg))
+    }
+    5. 从持久化引擎中移除丢失worker
+    persistenceEngine.removeWorker(worker)
+    
+    def relaunchDriver(driver: DriverInfo): Unit
+    功能: 重新运行driver
+    必须要使用新的driver编号创建driver,因为原始的驱动器可能仍旧在运行.考虑到worker与master是网络连接,master重启使用drverID1,需要使用driverID2,然后worker就可以连接到master.如果ID1=ID2,master就无法分辨出是状态更新还是重启一个驱动器了.请参考SPARK-19900.
+    1. 移除原来的驱动器
+    removeDriver(driver.id, DriverState.RELAUNCHING, None)
+    2. 新建驱动器,并注册到注册表中
+    val newDriver = createDriver(driver.desc)
+    persistenceEngine.addDriver(newDriver)
+    drivers.add(newDriver)
+    waitingDrivers += newDriver
+    3. 重新调度
+    schedule()
+    
+    def createApplication(desc: ApplicationDescription, driver: RpcEndpointRef):
+      ApplicationInfo
+    功能: 创建应用
+    val now = System.currentTimeMillis()
+    val date = new Date(now)
+    val appId = newApplicationId(date)
+    val= new ApplicationInfo(now, appId, desc, date, driver, defaultCores)
+    
+    def registerApplication(app: ApplicationInfo): Unit
+    功能: 注册应用
+    val appAddress = app.driver.address
+    if (addressToApp.contains(appAddress)) {
+      logInfo("Attempted to re-register application at same address: " + appAddress)
+      return
+    }
+    applicationMetricsSystem.registerSource(app.appSource)
+    apps += app
+    idToApp(app.id) = app
+    endpointToApp(app.driver) = app
+    addressToApp(appAddress) = app
+    waitingApps += app
+    
+    def finishApplication(app: ApplicationInfo): Unit
+    功能: 结束应用
+    removeApplication(app, ApplicationState.FINISHED)
+    
+    def removeApplication(app: ApplicationInfo, state: ApplicationState.Value): Unit
+    功能: 移除应用
+    if (apps.contains(app)) {
+      logInfo("Removing app " + app.id)
+      apps -= app
+      idToApp -= app.id
+      endpointToApp -= app.driver
+      addressToApp -= app.driver.address
+      if (completedApps.size >= retainedApplications) {
+        val toRemove = math.max(retainedApplications / 10, 1)
+        completedApps.take(toRemove).foreach { a =>
+          applicationMetricsSystem.removeSource(a.appSource)
+        }
+        completedApps.trimStart(toRemove)
+      }
+      completedApps += app // Remember it in our history
+      waitingApps -= app
+
+      for (exec <- app.executors.values) {
+        killExecutor(exec)
+      }
+      app.markFinished(state)
+      if (state != ApplicationState.FINISHED) {
+        app.driver.send(ApplicationRemoved(state.toString))
+      }
+      persistenceEngine.removeApplication(app)
+      schedule()
+      // worker告知master应用以及结束
+      workers.foreach { w =>
+        w.endpoint.send(ApplicationFinished(app.id))
+      }
+    }
+    
+    def handleRequestExecutors(appId: String, requestedTotal: Int): Boolean
+    功能: 处理请求执行器
+    输入参数:
+    	appId	应用编号
+    	requestTotal	请求执行器总量
+    idToApp.get(appId) match {
+      case Some(appInfo) =>
+        logInfo(s"Application $appId requested to 
+        set total executors to $requestedTotal.")
+        appInfo.executorLimit = requestedTotal
+        schedule()
+        true
+      case None =>
+        logWarning(s"Unknown application $appId requested 
+        $requestedTotal total executors.")
+        false
+    }
+    
+    def handleKillExecutors(appId: String, executorIds: Seq[Int]): Boolean
+    功能: 处理执行器的kill
+    idToApp.get(appId) match {
+      case Some(appInfo) =>
+        logInfo(s"Application $appId requests to kill executors:
+        " + executorIds.mkString(", "))
+        val (known, unknown) = executorIds.partition(appInfo.executors.contains)
+        known.foreach { executorId =>
+          val desc = appInfo.executors(executorId)
+          appInfo.removeExecutor(desc)
+          killExecutor(desc)
+        }
+        if (unknown.nonEmpty) {
+          logWarning(s"Application $appId attempted to kill non-existent executors: "
+            + unknown.mkString(", "))
+        }
+        schedule()
+        true
+      case None =>
+        logWarning(s"Unregistered application $appId requested us to kill executors!")
+        false
+    }
+    
+    def formatExecutorIds(executorIds: Seq[String]): Seq[Int]
+    功能: 格式化执行器ID
+    val= executorIds.flatMap { executorId =>
+      try {
+        Some(executorId.toInt)
+      } catch {
+        case e: NumberFormatException =>
+          logError(s"Encountered executor with a non-integer ID: $executorId. Ignoring")
+          None
+      }
+    }
+    
+    def killExecutor(exec: ExecutorDesc): Unit 
+    功能: kill执行器,询问worker去kill指定执行器
+    exec.worker.removeExecutor(exec)
+    exec.worker.endpoint.send(KillExecutor(masterUrl, exec.application.id, exec.id))
+    exec.state = ExecutorState.KILLED
+    
+    def newApplicationId(submitDate: Date): String
+    功能: 先进应用ID
+    val appId = "app-%s-%04d".format(createDateFormat.format(submitDate), nextAppNumber)
+    nextAppNumber += 1
+    val= appId
+    
+    def timeOutDeadWorkers(): Unit 
+    功能: 检查,移除任何超时的worker
+    val currentTime = System.currentTimeMillis()
+    val toRemove = workers.filter(_.lastHeartbeat < currentTime -
+                                  workerTimeoutMs).toArray
+    for (worker <- toRemove) {
+      if (worker.state != WorkerState.DEAD) {
+        val workerTimeoutSecs = TimeUnit.MILLISECONDS.toSeconds(workerTimeoutMs)
+        logWarning("Removing %s because we got no heartbeat in %d seconds".format(
+          worker.id, workerTimeoutSecs))
+        removeWorker(worker, s"Not receiving heartbeat for $workerTimeoutSecs seconds")
+      } else {
+        if (worker.lastHeartbeat < currentTime - 
+            ((reaperIterations + 1) * workerTimeoutMs)) {
+          workers -= worker 
+        }
+      }
+    }
+    
+    def newDriverId(submitDate: Date): String
+    功能: 新建驱动器ID
+    val appId = "driver-%s-%04d".format(createDateFormat.format(submitDate),
+                                        nextDriverNumber)
+    nextDriverNumber += 1
+    val= appId
+    
+    def createDriver(desc: DriverDescription): DriverInfo
+    功能: 创建驱动器
+    val now = System.currentTimeMillis()
+    val date = new Date(now)
+    val= new DriverInfo(now, newDriverId(date), desc, date)
+    
+    def launchDriver(worker: WorkerInfo, driver: DriverInfo): Unit
+    功能: 运行驱动器
+    logInfo("Launching driver " + driver.id + " on worker " + worker.id)
+    worker.addDriver(driver)
+    driver.worker = Some(worker)
+    worker.endpoint.send(LaunchDriver(driver.id, driver.desc, driver.resources))
+    driver.state = DriverState.RUNNING
+    
+    def removeDriver(
+      driverId: String,
+      finalState: DriverState,
+      exception: Option[Exception]): Unit
+    功能: 移除驱动器
+    drivers.find(d => d.id == driverId) match {
+      case Some(driver) =>
+        logInfo(s"Removing driver: $driverId")
+        drivers -= driver
+        if (completedDrivers.size >= retainedDrivers) {
+          val toRemove = math.max(retainedDrivers / 10, 1)
+          completedDrivers.trimStart(toRemove)
+        }
+        completedDrivers += driver
+        persistenceEngine.removeDriver(driver)
+        driver.state = finalState
+        driver.exception = exception
+        driver.worker.foreach(w => w.removeDriver(driver))
+        schedule()
+      case None =>
+        logWarning(s"Asked to remove unknown driver: $driverId")
+    }
+    
+    def canLaunchExecutorForApp(pos: Int): Boolean
+    功能: 确定是否可以运行执行器
+    val keepScheduling = coresToAssign >= minCoresPerExecutor
+      val enoughCores = usableWorkers(pos).coresFree - assignedCores(
+          pos) >= minCoresPerExecutor
+      val assignedExecutorNum = assignedExecutors(pos)
+      val launchingNewExecutor = !oneExecutorPerWorker || assignedExecutorNum == 0
+      if (launchingNewExecutor) {
+        val assignedMemory = assignedExecutorNum * memoryPerExecutor
+        val enoughMemory = usableWorkers(pos).memoryFree - assignedMemory 
+          >= memoryPerExecutor
+        val assignedResources = resourceReqsPerExecutor.map {
+          req => req.resourceName -> req.amount * assignedExecutorNum
+        }.toMap
+        val resourcesFree = usableWorkers(pos).resourcesAmountFree.map {
+          case (rName, free) => rName -> (free - assignedResources.getOrElse(rName, 0))
+        }
+        val enoughResources = ResourceUtils.resourcesMeetRequirements(
+          resourcesFree, resourceReqsPerExecutor)
+        val underLimit = assignedExecutors.sum + app.executors.size < app.executorLimit
+        keepScheduling && enoughCores && enoughMemory && enoughResources && underLimit
+      } else {
+        keepScheduling && enoughCores
+      }
+    
+    def scheduleExecutorsOnWorkers(
+      app: ApplicationInfo,
+      usableWorkers: Array[WorkerInfo],
+      spreadOutApps: Boolean): Array[Int]
+    功能: 调度worker上的执行器
+    调度执行器,用于运行在worker上,返回一个数组,这个数组包含分配到每个worker上的核心的数量.
+    有两种运行执行器的模式,第一种尝试尽可能多的传送应用的执行器.而第二种需要越少越好.前者适合与数据本地化且是默认配置.
+    分配到执行器的核心数量已经配置,来自同一个应用的多个执行器可以运行在一个worker上.(只要这个worker拥有足够多的核心和内存).否则每个执行器按照默认配置获取核心数量.在这种情况下,每个应用的一个执行器可以在单个调度中运行.
+    既然`spark.executor.cores`没有设置,人就在同一个worker上运行多个执行器,考虑到两个应用A,B.在worker1上,A的剩余核心数量大于0.B完成且释放所有worker1的核心.因此A运行的时候可以利用所有的核心.因此可以使得A在worker1上运行.
+    同时为每个worker分配每个执行器的核心数量是重要的.考虑到下述案例:
+   	用户需要3个执行器, (spark.cores.max = 48, spark.executor.cores = 16)
+    集群含有4个worker,使用16个核心,需要同时分配,12个核心会被分配到执行器,因为12<16.没有执行器可以运行.
+    1. 获取基本参数
+    val coresPerExecutor = app.desc.coresPerExecutor
+    val minCoresPerExecutor = coresPerExecutor.getOrElse(1)
+    val oneExecutorPerWorker = coresPerExecutor.isEmpty
+    val memoryPerExecutor = app.desc.memoryPerExecutorMB
+    val resourceReqsPerExecutor = app.desc.resourceReqsPerExecutor
+    val numUsable = usableWorkers.length
+    val assignedCores = new Array[Int](numUsable) 
+    val assignedExecutors = new Array[Int](numUsable) 
+    var coresToAssign = math.min(app.coresLeft, usableWorkers.map(_.coresFree).sum)
+    2. 保持执行器的运行状态，直到worker中没有足够的执行器可用，或者达到应用的限制
+    var freeWorkers = (0 until numUsable).filter(canLaunchExecutorForApp)
+    while (freeWorkers.nonEmpty) {
+      freeWorkers.foreach { pos =>
+        var keepScheduling = true
+        while (keepScheduling && canLaunchExecutorForApp(pos)) {
+          coresToAssign -= minCoresPerExecutor
+          assignedCores(pos) += minCoresPerExecutor
+          if (oneExecutorPerWorker) {
+            assignedExecutors(pos) = 1
+          } else {
+            assignedExecutors(pos) += 1
+          }
+          if (spreadOutApps) {
+            keepScheduling = false
+          }
+        }
+      }
+      freeWorkers = freeWorkers.filter(canLaunchExecutorForApp)
+    }
+}
+```
+
+```scala
+private[deploy] object Master extends Logging {
+    属性:
+    #name @SYSTEM_NAME = "sparkMaster"	系统名称
+    #name @ENDPOINT_NAME = "Master"	端点名称
+    操作集:
+    def startRpcEnvAndEndpoint(
+      host: String,
+      port: Int,
+      webUiPort: Int,
+      conf: SparkConf): (RpcEnv, Int, Option[Int])
+    功能: 启动master并返回三元组(master RPC环境,webUI端口,rest服务器)
+    val securityMgr = new SecurityManager(conf)
+    val rpcEnv = RpcEnv.create(SYSTEM_NAME, host, port, conf, securityMgr)
+    val masterEndpoint = rpcEnv.setupEndpoint(ENDPOINT_NAME,
+      new Master(rpcEnv, rpcEnv.address, webUiPort, securityMgr, conf))
+    val portsResponse = masterEndpoint.askSync[BoundPortsResponse](BoundPortsRequest)
+    val= (rpcEnv, portsResponse.webUIPort, portsResponse.restPort)
+    
+    def main(argStrings: Array[String]): Unit 
+    功能: 启动函数
+    Thread.setDefaultUncaughtExceptionHandler(new SparkUncaughtExceptionHandler(
+      exitOnUncaughtException = false))
+    Utils.initDaemon(log)
+    val conf = new SparkConf
+    val args = new MasterArguments(argStrings, conf)
+    val (rpcEnv, _, _) = startRpcEnvAndEndpoint(
+        args.host, args.port, args.webUiPort, conf)
+    rpcEnv.awaitTermination()
+}
+```
+
+
+
 ##### MasterArguments
 
 ```scala
@@ -2255,7 +3273,6 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
 }
 ```
 
-```scala
 
 #### security
 
@@ -2283,9 +3300,10 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
     		sparkConf	spark配置
     		hadoopConf	hadoop配置
     		schedulerRef	调度的RPC端点(驱动器)
-```
+   ```
 
-   ```scala
+
+```scala
    private[spark] class HadoopDelegationTokenManager(
        protected val sparkConf: SparkConf,
        protected val hadoopConf: Configuration,
@@ -2491,7 +3509,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
          .map { p => (p.serviceName, p) }
          .toMap
    }
-   ```
+```
 
    #### HadoopFSDelegationTokenProvider
 
@@ -3249,8 +4267,148 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
 
    #### Worker
 
+   ```scala
+private[deploy] class Worker(
+       override val rpcEnv: RpcEnv, // rpc环境
+       webUiPort: Int, // webUI端口
+       cores: Int, // 核心数
+       memory: Int, // 内存量
+       masterRpcAddresses: Array[RpcAddress], // master的RPC地址列表
+       endpointName: String, // 端点名称
+       workDirPath: String = null, // 工作目录
+       val conf: SparkConf, // spark配置
+       val securityMgr: SecurityManager, // 安全管理器
+       resourceFileOpt: Option[String] = None, // 资源文件名称
+       // 外部shuffle服务
+       externalShuffleServiceSupplier: Supplier[ExternalShuffleService] = null,
+       pid: Int = Utils.getProcessId) // 进程ID
+   extends ThreadSafeRpcEndpoint with Logging {
+       属性:
+       #name @host = rpcEnv.address.host	主机名称
+       #name @port = rpcEnv.address.port	端口号
+       #name @forwardMessageScheduler	发送消息的调度线程
+       val= ThreadUtils.newDaemonSingleThreadScheduledExecutor("worker-forward-message-scheduler")
+       #name @cleanupThreadExecutor	清理完成的工作目录和完成应用的独立线程
+       val= ThreadUtils.newDaemonSingleThreadExecutor("worker-cleanup-thread"))
+       #name @HEARTBEAT_MILLIS = conf.get(WORKER_TIMEOUT) * 1000 / 4	心跳周期
+       #name @INITIAL_REGISTRATION_RETRIES = 6	初始化注册尝试次数
+       #name @TOTAL_REGISTRATION_RETRIES = INITIAL_REGISTRATION_RETRIES + 10	总计注册的尝试次数
+       #name @FUZZ_MULTIPLIER_INTERVAL_LOWER_BOUND = 0.500	模数乘法间隔下限
+       #name @REGISTRATION_RETRY_FUZZ_MULTIPLIER	模数乘法的注册尝试次数
+       val= {
+           val randomNumberGenerator = new Random(UUID.randomUUID.getMostSignificantBits)
+           randomNumberGenerator.nextDouble + FUZZ_MULTIPLIER_INTERVAL_LOWER_BOUND
+         }
+       #name @INITIAL_REGISTRATION_RETRY_INTERVAL_SECONDS	初始化注册尝试时间间隔
+       val= (math.round(10 *REGISTRATION_RETRY_FUZZ_MULTIPLIER))
+       #name @PROLONGED_REGISTRATION_RETRY_INTERVAL_SECONDS	延长注册尝试时间间隔
+       val= (math.round(60* REGISTRATION_RETRY_FUZZ_MULTIPLIER))
+       #name @CLEANUP_ENABLED = conf.get(WORKER_CLEANUP_ENABLED)	是否允许清理
+       #name @CLEANUP_INTERVAL_MILLIS = conf.get(WORKER_CLEANUP_INTERVAL) * 1000	清理时间间隔
+       #name @APP_DATA_RETENTION_SECONDS = conf.get(APP_DATA_RETENTION)	应用数据保留时间
+       #name @CLEANUP_FILES_AFTER_EXECUTOR_EXIT	是否在执行器退出之后清理文件(非shuffle)
+       val= conf.get(config.STORAGE_CLEANUP_FILES_AFTER_EXECUTOR_EXIT)
+       #name @master: Option[RpcEndpointRef] = None	master RPC端点引用
+       #name @preferConfiguredMasterAddress = conf.get(PREFER_CONFIGURED_MASTER_ADDRESS)
+       	是否使用master的地址,选false,仅仅会使用master发送过来的地址,不会使用master RPC地址
+       #name @masterAddressToConnect: Option[RpcAddress] = None	master需要连接的地址
+       #name @activeMasterUrl: String = ""	激活的master地址
+       #name @activeMasterWebUiUrl : String = ""	激活的webUI地址
+       #name @workerWebUiUrl: String = ""	worker的webUI地址
+       #name @workerUri = RpcEndpointAddress(rpcEnv.address, endpointName).toString worker的RPC地址
+       #name @registered = false	worker是否注册
+       #name @connected = false	worker是否已经连接
+       #name @workerId = generateWorkerId()	workerID
+       #name @sparkHome	sparkHome
+       val= if (sys.props.contains(IS_TESTING.key)) {
+         assert(sys.props.contains("spark.test.home"), "spark.test.home is not set!")
+         new File(sys.props("spark.test.home"))
+       } else {
+         new File(sys.env.getOrElse("SPARK_HOME", "."))
+       }
+       #name @workDir: File = null	工作目录
+       #name @finishedExecutors = new LinkedHashMap[String, ExecutorRunner]	完成的执行器列表
+       #name @drivers = new HashMap[String, DriverRunner]	驱动器列表
+       #name @executors = new HashMap[String, ExecutorRunner]	执行器列表
+       #name @finishedDrivers = new LinkedHashMap[String, DriverRunner]	完成的驱动器列表
+       #name @appDirectories = new HashMap[String, Seq[String]]	应用目录表
+       #name @finishedApps = new HashSet[String]	完成的应用列表
+       #name @retainedExecutors = conf.get(WORKER_UI_RETAINED_EXECUTORS)	剩余的执行数量
+       #name @retainedDrivers = conf.get(WORKER_UI_RETAINED_DRIVERS)	剩余的驱动器数量
+       #name @shuffleService 外部shuffle服务
+       val=  if (externalShuffleServiceSupplier != null) {
+           externalShuffleServiceSupplier.get()
+         } else {
+           new ExternalShuffleService(conf, securityMgr)
+         }
+       #name @publicAddress	公用地址
+       val= {
+           val envVar = conf.getenv("SPARK_PUBLIC_DNS")
+           if (envVar != null) envVar else host
+         }
+       #name @webUi: WorkerWebUI = null	worker的WEBUI
+       #name @connectionAttemptCount = 0	连接请求计数器
+       #name @metricsSystem	度量系统
+       val= MetricsSystem.createMetricsSystem(MetricsSystemInstances.WORKER, conf, securityMgr)
+       #name @workerSource = new WorkerSource(this)	worker的资源
+       #name @reverseProxy = conf.get(UI_REVERSE_PROXY)	是否开启反向代理
+       #name @registerMasterFutures: Array[JFuture[_]] = null	注册的master任务表
+       #name @registrationRetryTimer: Option[JScheduledFuture[_]] = None	注册的调度任务(用于重试计时)
+       #name @registerMasterThreadPool	注册的master线程池
+       val= ThreadUtils.newDaemonCachedThreadPool(
+           "worker-register-master-threadpool",
+           masterRpcAddresses.length // Make sure we can register with all masters at the same time
+         )
+       #name @resources: Map[String, ResourceInformation] = Map.empty	资源列表(测试可见)
+       #name @coresUsed = 0	核心使用量
+       #name @memoryUsed = 0	内存使用量
+       #name @resourcesUsed = new HashMap[String, MutableResourceInfo]()	使用资源表
+       操作集:
+       def createDateFormat = new SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
+       功能: 创建日期形式
+       
+       def coresFree: Int = cores - coresUsed
+       功能: 获取空闲核心数量
+       
+       def memoryFree: Int = memory - memoryUsed
+       功能: 获取空闲内存量
+       
+       def createWorkDir(): Unit
+       功能: 创建工作目录
+       workDir = Option(workDirPath).map(new File(_)).getOrElse(new File(sparkHome, "work"))
+       if (!Utils.createDirectory(workDir)) {
+         System.exit(1)
+       }
+       
+       def onStart(): Unit
+       功能: 启动worker
+       1. 创建工作目录
+       assert(!registered)
+       logInfo("Starting Spark worker %s:%d with %d cores, %s RAM".format(
+         host, port, cores, Utils.megabytesToString(memory)))
+       logInfo(s"Running Spark version ${org.apache.spark.SPARK_VERSION}")
+       logInfo("Spark home: " + sparkHome)
+       createWorkDir()
+       2. 启动外部shuffle服务,创建工作资源表
+       startExternalShuffleService()
+       releaseResourcesOnInterrupt()
+       setupWorkerResources()
+       3. 设置UI信息
+       webUi = new WorkerWebUI(this, workDir, webUiPort)
+       webUi.bind()
+       workerWebUiUrl = s"${webUi.scheme}$publicAddress:${webUi.boundPort}"
+       registerWithMaster()
+       4. 设置度量系统
+       metricsSystem.registerSource(workerSource)
+    metricsSystem.start()
+       metricsSystem.getServletHandlers.foreach(webUi.attachHandler)
+}
+   ```
+   
+   
+   
    #### WorkerArguments
-
+   
    ```scala
    private[worker] class WorkerArguments(args: Array[String], conf: SparkConf){
        介绍: worker的命令行转换器
@@ -3279,9 +4437,9 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
        if (System.getenv("SPARK_WORKER_DIR") != null) {
            workDir = System.getenv("SPARK_WORKER_DIR")
        }
-       介绍: 检查环境变量
+    介绍: 检查环境变量
        
-       @tailrec
+    @tailrec
        private def parse(args: List[String]): Unit
        功能: 参数转换
        args match {
@@ -3382,9 +4540,9 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
        }
    }
    ```
-
+   
    #### WorkerSource
-
+   
    ```scala
    private[worker] class WorkerSource(val worker: Worker) extends Source {
        介绍:
@@ -3419,9 +4577,9 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
        功能: 注册空闲内存量
    }
    ```
-
+   
    #### WorkerWatcher
-
+   
    ```scala
    private[spark] class WorkerWatcher(
        override val rpcEnv: RpcEnv, workerUrl: String, isTesting: Boolean = false)
@@ -5188,6 +6346,9 @@ private[spark] class SparkHadoopUtil extends Logging {
     属性:
     #name @sparkConf = new SparkConf(false).loadFromSystemProperties(true) spark配置
     #name @conf: Configuration = newConfiguration(sparkConf)	hadoop配置
+    #name @HADOOP_CONF_PATTERN = "(\\$\\{hadoopconf-[^\\}\\$\\s]+\\})".r.unanchored
+    	hadoop配置形式
+    
     操作集:
     def runAsSparkUser(func: () => Unit): Unit
     功能: 使用hadoop用户组信息作为一个线程池变量,用于授权HDFS和YARN的调用
@@ -5330,11 +6491,212 @@ private[spark] class SparkHadoopUtil extends Logging {
     功能: 确定是否为全局目录
     val= pattern.toString.exists("{}[]*?\\".toSet.contains)
     
+    def globPath(pattern: Path): Seq[Path]
+    功能： 获取全局路径
+    val fs = pattern.getFileSystem(conf)
+    globPath(fs, pattern)
     
+    def globPath(fs: FileSystem, pattern: Path): Seq[Path]
+    功能： 获取全局路径，指定文件系统@fs
+    val= Option(fs.globStatus(pattern)).map { statuses =>
+      statuses.map(_.getPath.makeQualified(fs.getUri, fs.getWorkingDirectory)).toSeq
+    }.getOrElse(Seq.empty[Path])
+    
+    def globPathIfNecessary(pattern: Path): Seq[Path]
+    功能: 获取可能的全局路径
+    val= if (isGlobPath(pattern)) globPath(pattern) else Seq(pattern)
+    
+    def globPathIfNecessary(fs: FileSystem, pattern: Path): Seq[Path]
+    功能: 获取可能的全局路径,指定文件系统
+    val= if (isGlobPath(pattern)) globPath(fs, pattern) else Seq(pattern)
+    
+    def listFilesSorted(
+      remoteFs: FileSystem,
+      dir: Path,
+      prefix: String,
+      exclusionSuffix: String): Array[FileStatus]
+    功能: 列举目录中所有带有指定前缀@prefix的文件,返回的文件状态列表是按照修改时间排序的
+    try {
+      // 获取指定文件系统下指定目录的文件状态列表
+      val fileStatuses = remoteFs.listStatus(dir,
+        new PathFilter {
+          override def accept(path: Path): Boolean = {
+            val name = path.getName
+            name.startsWith(prefix) && !name.endsWith(exclusionSuffix)
+          }
+        })
+      // 对文件状态列表进行排序
+      Arrays.sort(fileStatuses, (o1: FileStatus, o2: FileStatus) =>
+        Longs.compare(o1.getModificationTime, o2.getModificationTime))
+      fileStatuses
+    } catch {
+      case NonFatal(e) =>
+        logWarning("Error while attempting to list files 
+        from application staging dir", e)
+        Array.empty
+    }
+    
+    def getSuffixForCredentialsPath(credentialsPath: Path): Int
+    功能: 获取指定授权路径的前缀长度
+    val fileName = credentialsPath.getName
+    fileName.substring(
+      fileName.lastIndexOf(SparkHadoopUtil.SPARK_YARN_CREDS_COUNTER_DELIM) + 1).toInt
+    
+    def substituteHadoopVariables(text: String, hadoopConf: Configuration): String 
+    功能: 替代hadoop变量
+    text match {
+      case HADOOP_CONF_PATTERN(matched) =>
+        logDebug(text + " matched " + HADOOP_CONF_PATTERN)
+        val key = matched.substring(13, matched.length() - 1) 
+        val eval = Option[String](hadoopConf.get(key))
+          .map { value =>
+            logDebug("Substituted " + matched + " with " + value)
+            text.replace(matched, value)
+          }
+        if (eval.isEmpty) {
+          text
+        } else {
+          substituteHadoopVariables(eval.get, hadoopConf)
+        }
+      case _ =>
+        logDebug(text + " didn't match " + HADOOP_CONF_PATTERN)
+        text
+    }
+    
+    def dumpTokens(credentials: Credentials): Iterable[String]
+    功能: 转储标记,转储证书标识符为string形式
+    val= if (credentials != null) {
+      credentials.getAllTokens.asScala.map(tokenToString)
+    } else {
+      Seq.empty
+    }
+    
+    def tokenToString(token: Token[_ <: TokenIdentifier]): String 
+    功能: 将标识符转换为string，用于标识
+    如果是一个抽象的证书标识，会对数据进行解组并打印更多的细节，包括人可识别的形式
+    val df = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT,
+                                            Locale.US)
+    val buffer = new StringBuilder(128)
+    buffer.append(token.toString)
+    try {
+      val ti = token.decodeIdentifier
+      buffer.append("; ").append(ti)
+      ti match {
+        case dt: AbstractDelegationTokenIdentifier =>
+          // include human times and the renewer, which the HDFS tokens toString omits
+          buffer.append("; Renewer: ").append(dt.getRenewer)
+          buffer.append("; Issued: ").append(df.format(new Date(dt.getIssueDate)))
+          buffer.append("; Max Date: ").append(df.format(new Date(dt.getMaxDate)))
+        case _ =>
+      }
+    } catch {
+      case e: IOException =>
+        logDebug(s"Failed to decode $token: $e", e)
+    }
+    val= buffer.toString
+    
+    def serialize(creds: Credentials): Array[Byte]
+    功能: 序列化证书
+    val byteStream = new ByteArrayOutputStream
+    val dataStream = new DataOutputStream(byteStream)
+    creds.writeTokenStorageToStream(dataStream)
+    val= byteStream.toByteArray
+    
+    def deserialize(tokenBytes: Array[Byte]): Credentials 
+    功能: 反序列化证书
+    val tokensBuf = new ByteArrayInputStream(tokenBytes)
+    val creds = new Credentials()
+    creds.readTokenStorageStream(new DataInputStream(tokensBuf))
+    val= creds
+    
+    def isProxyUser(ugi: UserGroupInformation): Boolean
+    功能: 确定是否为代理用户
+    val= ugi.getAuthenticationMethod() == UserGroupInformation.AuthenticationMethod.PROXY
 }
 ```
 
-
+```scala
+private[spark] object SparkHadoopUtil {
+    属性:
+    #name @instance=new SparkHadoopUtil	lazy	实例
+    #name @SPARK_YARN_CREDS_TEMP_EXTENSION = ".tmp"	spark yarn临时证书扩展
+    #name @SPARK_YARN_CREDS_COUNTER_DELIM = "-"	spark yarn证书计数分隔符
+    #name @UPDATE_INPUT_METRICS_INTERVAL_RECORDS = 1000	读取HadoopRDD更新输入度量的间隔记录数
+    #name @SPARK_HADOOP_CONF_FILE = "__spark_hadoop_conf__.xml"	spark hadoop配置文件
+    	用于配置网关信息,覆盖在hadoop集群配置之上
+    操作集:
+    def get: SparkHadoopUtil = instance
+    功能: 获取实例
+    
+    def newConfiguration(conf: SparkConf): Configuration
+    功能: 基于指定spark配置@conf 创建一个hadoop配置
+    val hadoopConf = new Configuration()
+    appendS3AndSparkHadoopHiveConfigurations(conf, hadoopConf)
+    val= hadoopConf
+    
+    def appendS3AndSparkHadoopHiveConfigurations(
+      conf: SparkConf,
+      hadoopConf: Configuration): Unit
+    功能: 添加S3和spark配置到hadoop配置中,空值检查超过conf,原因是由于代码的旧实现的原因,为了向后兼容.
+    if (conf != null) {
+      val keyId = System.getenv("AWS_ACCESS_KEY_ID")
+      val accessKey = System.getenv("AWS_SECRET_ACCESS_KEY")
+      if (keyId != null && accessKey != null) {
+        hadoopConf.set("fs.s3.awsAccessKeyId", keyId)
+        hadoopConf.set("fs.s3n.awsAccessKeyId", keyId)
+        hadoopConf.set("fs.s3a.access.key", keyId)
+        hadoopConf.set("fs.s3.awsSecretAccessKey", accessKey)
+        hadoopConf.set("fs.s3n.awsSecretAccessKey", accessKey)
+        hadoopConf.set("fs.s3a.secret.key", accessKey)
+        val sessionToken = System.getenv("AWS_SESSION_TOKEN")
+        if (sessionToken != null) {
+          hadoopConf.set("fs.s3a.session.token", sessionToken)
+        }
+      }
+      appendSparkHadoopConfigs(conf, hadoopConf)
+      appendSparkHiveConfigs(conf, hadoopConf)
+      val bufferSize = conf.get(BUFFER_SIZE).toString
+      hadoopConf.set("io.file.buffer.size", bufferSize)
+    }
+    
+    def appendSparkHadoopConfigs(conf: SparkConf, hadoopConf: Configuration): Uni
+    功能: 添加spark对hadoop的配置
+    for ((key, value) <- conf.getAll if key.startsWith("spark.hadoop.")) {
+      hadoopConf.set(key.substring("spark.hadoop.".length), value)
+    }
+    
+    def appendSparkHiveConfigs(conf: SparkConf, hadoopConf: Configuration): Unit 
+    功能: 添加spark对hive的配置
+    for ((key, value) <- conf.getAll if key.startsWith("spark.hive.")) {
+      hadoopConf.set(key.substring("spark.".length), value)
+    }
+    
+    def createFile(fs: FileSystem, path: Path, allowEC: Boolean): FSDataOutputStream
+    功能: 创建文件,关闭EC可以有助于HDFS EC支持hflush(),hsync(),或者append()方法,参考
+    <https://hadoop.apache.org/docs/r3.0.0/hadoop-project-dist/hadoop-
+    hdfs/HDFSErasureCoding.html#Limitations>
+    if (allowEC) {
+      fs.create(path)
+    } else {
+      try {
+        val builderMethod = fs.getClass().getMethod("createFile", classOf[Path])
+        if (!fs.mkdirs(path.getParent())) {
+          throw new IOException(s"Failed to create parents of $path")
+        }
+        val qualifiedPath = fs.makeQualified(path)
+        val builder = builderMethod.invoke(fs, qualifiedPath)
+        val builderCls = builder.getClass()
+        val replicateMethod = builderCls.getMethod("replicate")
+        val buildMethod = builderCls.getMethod("build")
+        val b2 = replicateMethod.invoke(builder)
+        buildMethod.invoke(b2).asInstanceOf[FSDataOutputStream]
+      } catch {
+        case  _: NoSuchMethodException =>
+          fs.create(path)
+      }
+    }
+}
+```
 
 #### SparkSubmit
 
