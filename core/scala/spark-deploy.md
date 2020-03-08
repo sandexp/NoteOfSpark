@@ -4402,10 +4402,558 @@ private[deploy] class Worker(
        metricsSystem.registerSource(workerSource)
     metricsSystem.start()
        metricsSystem.getServletHandlers.foreach(webUi.attachHandler)
-}
+    
+       def releaseResourcesOnInterrupt(): Unit
+       功能: 捕捉中断信号(sbin/stop-slave.sh),在worker退出前释放资源
+       SignalUtils.register("TERM") {
+         releaseResources(conf, SPARK_WORKER_PREFIX, resources, pid)
+         false
+       }
+       
+       def setupWorkerResources(): Unit
+       功能: 创建worker的资源
+       try {
+         val allResources = getOrDiscoverAllResources(conf, SPARK_WORKER_PREFIX, resourceFileOpt)
+         resources = acquireResources(conf, SPARK_WORKER_PREFIX, allResources, pid)
+         logResourceInfo(SPARK_WORKER_PREFIX, resources)
+       } catch {
+         case e: Exception =>
+           logError("Failed to setup worker resources: ", e)
+           releaseResources(conf, SPARK_WORKER_PREFIX, resources, pid)
+           if (!Utils.isTesting) {
+             System.exit(1)
+           }
+       }
+       resources.keys.foreach { rName =>
+         resourcesUsed(rName) = MutableResourceInfo(rName, new HashSet[String])
+       }
+       
+       def addResourcesUsed(deltaInfo: Map[String, ResourceInformation]): Unit
+       功能: 增量式注册到已使用资源列表中
+       deltaInfo.foreach { case (rName, rInfo) =>
+         resourcesUsed(rName) = resourcesUsed(rName) + rInfo
+       }
+       
+       def removeResourcesUsed(deltaInfo: Map[String, ResourceInformation]): Unit
+       功能: 增量式移除已经使用资源
+       deltaInfo.foreach { case (rName, rInfo) =>
+      resourcesUsed(rName) = resourcesUsed(rName) - rInfo
+       }
+    
+       def changeMaster(masterRef: RpcEndpointRef, uiUrl: String,
+         masterAddress: RpcAddress): Unit
+       功能: 切换到新的master
+       activeMasterUrl = masterRef.address.toSparkURL
+       activeMasterWebUiUrl = uiUrl
+       masterAddressToConnect = Some(masterAddress)
+       master = Some(masterRef)
+       connected = true
+       if (reverseProxy) {
+         logInfo(s"WorkerWebUI is available at $activeMasterWebUiUrl/proxy/$workerId")
+       }
+       cancelLastRegistrationRetry()
+       
+       def tryRegisterAllMasters(): Array[JFuture[_]]
+       功能: 尝试注册所有master信息
+       masterRpcAddresses.map { masterAddress =>
+         registerMasterThreadPool.submit(new Runnable {
+           override def run(): Unit = {
+             try {
+               logInfo("Connecting to master " + masterAddress + "...")
+               val masterEndpoint = rpcEnv.setupEndpointRef(masterAddress, Master.ENDPOINT_NAME)
+               sendRegisterMessageToMaster(masterEndpoint)
+             } catch {
+               case ie: InterruptedException => // Cancelled
+               case NonFatal(e) => logWarning(s"Failed to connect to master $masterAddress", e)
+             }
+           }
+         })
+       }
+       
+       def cancelLastRegistrationRetry(): Unit
+       功能: 放弃最后一次重试注册,不重试的话nop
+       if (registerMasterFutures != null) {
+         registerMasterFutures.foreach(_.cancel(true))
+         registerMasterFutures = null
+       }
+       registrationRetryTimer.foreach(_.cancel(true))
+       registrationRetryTimer = None
+       
+       def registerWithMaster(): Unit 
+       功能: 使用master进行注册
+       registrationRetryTimer match {
+         case None =>
+           registered = false
+           registerMasterFutures = tryRegisterAllMasters()
+           connectionAttemptCount = 0
+           registrationRetryTimer = Some(forwardMessageScheduler.scheduleAtFixedRate(
+             () => Utils.tryLogNonFatalError {
+                 Option(self).foreach(_.send(ReregisterWithMaster)) },
+             INITIAL_REGISTRATION_RETRY_INTERVAL_SECONDS,
+             INITIAL_REGISTRATION_RETRY_INTERVAL_SECONDS,
+             TimeUnit.SECONDS))
+         case Some(_) =>
+           logInfo("Not spawning another attempt to register with the master,
+           since there is an" +
+           " attempt scheduled already.")
+       }
+       
+       def startExternalShuffleService(): Unit
+       功能: 启动外部shuffle服务
+       try {
+         shuffleService.startIfEnabled()
+       } catch {
+         case e: Exception =>
+           logError("Failed to start external shuffle service", e)
+           System.exit(1)
+       }
+       
+       def sendRegisterMessageToMaster(masterEndpoint: RpcEndpointRef): Unit
+       功能: 发送注册消息给master
+       masterEndpoint.send(RegisterWorker(
+         workerId,
+         host,
+         port,
+         self,
+         cores,
+         memory,
+         workerWebUiUrl,
+         masterEndpoint.address,
+         resources))
+       
+       def handleRegisterResponse(msg: RegisterWorkerResponse): Unit 
+       功能: 处理注册响应@msg
+       msg match {
+         case RegisteredWorker(masterRef, masterWebUiUrl, masterAddress, duplicate) =>
+           val preferredMasterAddress = if (preferConfiguredMasterAddress) {
+             masterAddress.toSparkURL
+           } else {
+             masterRef.address.toSparkURL
+           }
+           if (duplicate) {
+             logWarning(s"Duplicate registration at master $preferredMasterAddress")
+           }
+           logInfo(s"Successfully registered with master $preferredMasterAddress")
+           registered = true
+           changeMaster(masterRef, masterWebUiUrl, masterAddress)
+           forwardMessageScheduler.scheduleAtFixedRate(
+             () => Utils.tryLogNonFatalError { self.send(SendHeartbeat) },
+             0, HEARTBEAT_MILLIS, TimeUnit.MILLISECONDS)
+           if (CLEANUP_ENABLED) {
+             logInfo(
+               s"Worker cleanup enabled; old application directories 
+               will be deleted in: $workDir")
+             forwardMessageScheduler.scheduleAtFixedRate(
+               () => Utils.tryLogNonFatalError { self.send(WorkDirCleanup) },
+               CLEANUP_INTERVAL_MILLIS, CLEANUP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS)
+           }
+   
+           val execs = executors.values.map { e =>
+             new ExecutorDescription(e.appId, e.execId, e.cores, e.state)
+           }
+           masterRef.send(WorkerLatestState(workerId, execs.toList, drivers.keys.toSeq))
+         case RegisterWorkerFailed(message) =>
+           if (!registered) {
+             logError("Worker registration failed: " + message)
+             releaseResources(conf, SPARK_WORKER_PREFIX, resources, pid)
+             System.exit(1)
+           }
+         case MasterInStandby =>
+       }
+       
+       def receive: PartialFunction[Any, Unit]
+       功能: 接受远端发送的RPC消息
+       // 接受并处理worker的注册
+       case msg: RegisterWorkerResponse =>
+         handleRegisterResponse(msg)
+       // 发送心跳信息
+       case SendHeartbeat =>
+         if (connected) { sendToMaster(Heartbeat(workerId, self)) }
+       // 处理工作目录清理的消息
+       val appIds = (executors.values.map(_.appId) ++
+                     drivers.values.map(_.driverId)).toSet
+         try {
+           val cleanupFuture: concurrent.Future[Unit] = concurrent.Future {
+             val appDirs = workDir.listFiles()
+             if (appDirs == null) {
+               throw new IOException("ERROR: Failed to list files in " + appDirs)
+             }
+             appDirs.filter { dir =>
+               val appIdFromDir = dir.getName
+               val isAppStillRunning = appIds.contains(appIdFromDir)
+               dir.isDirectory && !isAppStillRunning &&
+                 !Utils.doesDirectoryContainAnyNewFiles(dir, APP_DATA_RETENTION_SECONDS)
+             }.foreach { dir =>
+               logInfo(s"Removing directory: ${dir.getPath}")
+               Utils.deleteRecursively(dir)
+               if (conf.get(config.SHUFFLE_SERVICE_DB_ENABLED) &&
+                   conf.get(config.SHUFFLE_SERVICE_ENABLED)) {
+                 shuffleService.applicationRemoved(dir.getName)
+               }
+             }
+           }(cleanupThreadExecutor)
+           cleanupFuture.failed.foreach(e =>
+             logError("App dir cleanup failed: " + e.getMessage, e)
+           )(cleanupThreadExecutor)
+         } catch {
+           case _: RejectedExecutionException if cleanupThreadExecutor.isShutdown =>
+             logWarning("Failed to cleanup work dir as executor pool was shutdown")
+         }
+       // 接受master改变,并处理
+       case MasterChanged(masterRef, masterWebUiUrl) =>
+         logInfo("Master has changed, new master is at " + masterRef.address.toSparkURL)
+         changeMaster(masterRef, masterWebUiUrl, masterRef.address)
+         val executorResponses = executors.values.map { e =>
+           WorkerExecutorStateResponse(new ExecutorDescription(
+             e.appId, e.execId, e.cores, e.state), e.resources)
+         }
+         val driverResponses = drivers.keys.map { id =>
+           WorkerDriverStateResponse(id, drivers(id).resources)}
+         masterRef.send(WorkerSchedulerStateResponse(
+           workerId, executorResponses.toList, driverResponses.toSeq))
+       // 重连worker
+       case ReconnectWorker(masterUrl) =>
+         logInfo(s"Master with url $masterUrl requested this worker to reconnect.")
+         registerWithMaster()
+       // 运行执行器
+       case LaunchExecutor(masterUrl, appId, execId, appDesc, cores_, memory_, resources_) =>
+         if (masterUrl != activeMasterUrl) {
+           logWarning("Invalid Master (" + masterUrl + ") attempted to launch executor.")
+         } else {
+           try {
+             logInfo("Asked to launch executor %s/%d for %s".format(appId, execId, appDesc.name))
+   
+             // Create the executor's working directory
+             val executorDir = new File(workDir, appId + "/" + execId)
+             if (!executorDir.mkdirs()) {
+               throw new IOException("Failed to create directory " + executorDir)
+             }
+             val appLocalDirs = appDirectories.getOrElse(appId, {
+               val localRootDirs = Utils.getOrCreateLocalRootDirs(conf)
+               val dirs = localRootDirs.flatMap { dir =>
+                 try {
+                   val appDir = Utils.createDirectory(dir, namePrefix = "executor")
+                   Utils.chmod700(appDir)
+                   Some(appDir.getAbsolutePath())
+                 } catch {
+                   case e: IOException =>
+                     logWarning(s"${e.getMessage}. Ignoring this directory.")
+                     None
+                 }
+               }.toSeq
+               if (dirs.isEmpty) {
+                 throw new IOException("No subfolder can be created in " +
+                   s"${localRootDirs.mkString(",")}.")
+               }
+               dirs
+             })
+             appDirectories(appId) = appLocalDirs
+             val manager = new ExecutorRunner(
+               appId,
+               execId,
+               appDesc.copy(command = Worker.maybeUpdateSSLSettings(
+                   appDesc.command, conf)),
+               cores_,
+               memory_,
+               self,
+               workerId,
+               webUi.scheme,
+               host,
+               webUi.boundPort,
+               publicAddress,
+               sparkHome,
+               executorDir,
+               workerUri,
+               conf,
+               appLocalDirs,
+               ExecutorState.LAUNCHING,
+               resources_)
+             executors(appId + "/" + execId) = manager
+             manager.start()
+             coresUsed += cores_
+             memoryUsed += memory_
+             addResourcesUsed(resources_)
+           } catch {
+             case e: Exception =>
+               logError(s"Failed to launch executor $appId/$execId 
+               for ${appDesc.name}.", e)
+               if (executors.contains(appId + "/" + execId)) {
+                 executors(appId + "/" + execId).kill()
+                 executors -= appId + "/" + execId
+               }
+               sendToMaster(ExecutorStateChanged(appId, execId, ExecutorState.FAILED,
+                 Some(e.toString), None))
+           }
+         }
+       // 改变state状态
+       case executorStateChanged: ExecutorStateChanged =>
+         handleExecutorStateChanged(executorStateChanged)
+       // kill执行器
+       case KillExecutor(masterUrl, appId, execId) =>
+         if (masterUrl != activeMasterUrl) {
+           logWarning("Invalid Master (" + masterUrl + 
+                      ") attempted to kill executor " + execId)
+         } else {
+           val fullId = appId + "/" + execId
+           executors.get(fullId) match {
+             case Some(executor) =>
+               logInfo("Asked to kill executor " + fullId)
+               executor.kill()
+             case None =>
+               logInfo("Asked to kill unknown executor " + fullId)
+           }
+         }
+       // 运行驱动器
+       case LaunchDriver(driverId, driverDesc, resources_) =>
+         logInfo(s"Asked to launch driver $driverId")
+         val driver = new DriverRunner(
+           conf,
+           driverId,
+           workDir,
+           sparkHome,
+           driverDesc.copy(
+               command = Worker.maybeUpdateSSLSettings(driverDesc.command, conf)),
+           self,
+           workerUri,
+           securityMgr,
+           resources_)
+         drivers(driverId) = driver
+         driver.start()
+         coresUsed += driverDesc.cores
+         memoryUsed += driverDesc.mem
+         addResourcesUsed(resources_)
+       // kill驱动器
+       case KillDriver(driverId) =>
+         logInfo(s"Asked to kill driver $driverId")
+         drivers.get(driverId) match {
+           case Some(runner) =>
+             runner.kill()
+           case None =>
+             logError(s"Asked to kill unknown driver $driverId")
+         }
+       // 驱动器状态改变消息
+       case driverStateChanged @ DriverStateChanged(driverId, state, exception) =>
+         handleDriverStateChanged(driverStateChanged)
+       // 使用master注册worker
+       case ReregisterWithMaster =>
+         reregisterWithMaster()
+       // 应用结束消息
+       case ApplicationFinished(id) =>
+         finishedApps += id
+         maybeCleanupApplication(id)
+       
+       def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit]
+       功能: 接受和回复远端消息
+       case RequestWorkerState =>
+         context.reply(WorkerStateResponse(host, port, workerId, executors.values.toList,
+           finishedExecutors.values.toList, drivers.values.toList,
+           finishedDrivers.values.toList, activeMasterUrl, cores, memory,
+           coresUsed, memoryUsed, activeMasterWebUiUrl, resources,
+           resourcesUsed.toMap.map { case (k, v) => (k, v.toResourceInformation)}))
+       
+       def onDisconnected(remoteAddress: RpcAddress): Unit 
+       功能: 断开连接处理
+       if (master.exists(_.address == remoteAddress) ||
+           masterAddressToConnect.contains(remoteAddress)) {
+         logInfo(s"$remoteAddress Disassociated !")
+         masterDisconnected()
+       }
+       
+       def masterDisconnected(): Unit
+       功能: 断开master连接处理
+       logError("Connection to master failed! Waiting for master to reconnect...")
+       connected = false
+       registerWithMaster()
+       
+       def maybeCleanupApplication(id: String): Unit
+       功能: 清除可能的应用
+       val shouldCleanup = finishedApps.contains(id) && 
+       !executors.values.exists(_.appId == id)
+       if (shouldCleanup) {
+         finishedApps -= id
+         try {
+           appDirectories.remove(id).foreach { dirList =>
+             concurrent.Future {
+               logInfo(s"Cleaning up local directories for application $id")
+               dirList.foreach { dir =>
+                 Utils.deleteRecursively(new File(dir))
+               }
+             }(cleanupThreadExecutor).failed.foreach(e =>
+               logError(s"Clean up app dir $dirList failed: ${e.getMessage}", e)
+             )(cleanupThreadExecutor)
+           }
+         } catch {
+           case _: RejectedExecutionException if cleanupThreadExecutor.isShutdown =>
+             logWarning("Failed to cleanup application as executor pool was shutdown")
+         }
+         shuffleService.applicationRemoved(id)
+       }
+       
+       def sendToMaster(message: Any): Unit
+       功能: 发送消息给当前的master
+       master match {
+         case Some(masterRef) => masterRef.send(message)
+         case None =>
+           logWarning(
+             s"Dropping $message because the connection to master 
+             has not yet been established")
+       }
+       
+       def generateWorkerId(): String
+       功能: 产生workerID
+       val= "worker-%s-%s-%d".format(createDateFormat.format(new Date), host, port)
+       
+       def onStop(): Unit
+       功能: 停止worker
+       releaseResources(conf, SPARK_WORKER_PREFIX, resources, pid)
+       cleanupThreadExecutor.shutdownNow()
+       metricsSystem.report()
+       cancelLastRegistrationRetry()
+       forwardMessageScheduler.shutdownNow()
+       registerMasterThreadPool.shutdownNow()
+       executors.values.foreach(_.kill())
+       drivers.values.foreach(_.kill())
+       shuffleService.stop()
+       webUi.stop()
+       metricsSystem.stop()
+       
+       def trimFinishedExecutorsIfNecessary(): Unit
+       功能: 从完成的执行器中移除1/10
+       if (finishedExecutors.size > retainedExecutors) {
+         finishedExecutors.take(math.max(finishedExecutors.size / 10, 1)).foreach {
+           case (executorId, _) => finishedExecutors.remove(executorId)
+         }
+       }
+       
+       def trimFinishedDriversIfNecessary(): Unit
+       功能: 移除完成驱动器的1/10
+       if (finishedDrivers.size > retainedDrivers) {
+         finishedDrivers.take(math.max(finishedDrivers.size / 10, 1)).foreach {
+           case (driverId, _) => finishedDrivers.remove(driverId)
+         }
+       }
+       
+       def handleDriverStateChanged(driverStateChanged: DriverStateChanged): Unit
+       功能: 处理driver状态的变化
+       1. 获取驱动器状态
+       val driverId = driverStateChanged.driverId
+       val exception = driverStateChanged.exception
+       val state = driverStateChanged.state
+       2. 日志记录驱动器状态
+       state match {
+         case DriverState.ERROR =>
+           logWarning(s"Driver $driverId failed with unrecoverable exception: ${exception.get}")
+         case DriverState.FAILED =>
+           logWarning(s"Driver $driverId exited with failure")
+         case DriverState.FINISHED =>
+           logInfo(s"Driver $driverId exited successfully")
+         case DriverState.KILLED =>
+           logInfo(s"Driver $driverId was killed by user")
+         case _ =>
+           logDebug(s"Driver $driverId changed state to $state")
+       }
+       3. 发送状态改变的消息到master
+       sendToMaster(driverStateChanged)
+       4. 更新度量信息值
+       val driver = drivers.remove(driverId).get
+       finishedDrivers(driverId) = driver
+       trimFinishedDriversIfNecessary()
+       memoryUsed -= driver.driverDesc.mem
+       coresUsed -= driver.driverDesc.cores
+       removeResourcesUsed(driver.resources)
+       
+       def handleExecutorStateChanged(executorStateChanged: ExecutorStateChanged):Unit
+       功能: 处理执行器状态改变
+       1. 发送消息到master
+       sendToMaster(executorStateChanged)
+       2. 获取状态
+       val state = executorStateChanged.state
+       3. 对完成状态进行处理
+       if (ExecutorState.isFinished(state)) {
+         val appId = executorStateChanged.appId
+         val fullId = appId + "/" + executorStateChanged.execId
+         val message = executorStateChanged.message
+         val exitStatus = executorStateChanged.exitStatus
+         executors.get(fullId) match {
+           case Some(executor) =>
+             logInfo("Executor " + fullId + " finished with state " + state +
+               message.map(" message " + _).getOrElse("") +
+               exitStatus.map(" exitStatus " + _).getOrElse(""))
+             executors -= fullId
+             finishedExecutors(fullId) = executor
+             trimFinishedExecutorsIfNecessary()
+             coresUsed -= executor.cores
+             memoryUsed -= executor.memory
+             removeResourcesUsed(executor.resources)
+             if (CLEANUP_FILES_AFTER_EXECUTOR_EXIT) {
+               shuffleService.executorRemoved(
+                   executorStateChanged.execId.toString, appId)
+             }
+           case None =>
+             logInfo("Unknown Executor " + fullId + " finished with state " + state +
+               message.map(" message " + _).getOrElse("") +
+               exitStatus.map(" exitStatus " + _).getOrElse(""))
+         }
+         maybeCleanupApplication(appId)
+       }
+   }
    ```
    
-   
+   ```scala
+   private[deploy] object Worker extends Logging {
+       属性:
+       #name @SYSTEM_NAME = "sparkWorker"	系统名称
+       #name @ENDPOINT_NAME = "Worker"	端点名称
+       #name @SSL_NODE_LOCAL_CONFIG_PATTERN 	SSL本地节点配置
+       val= """\-Dspark\.ssl\.useNodeLocalConf\=(.+)""".r
+       操作集:
+       def isUseLocalNodeSSLConfig(cmd: Command): Boolean
+       功能: 确定是否使用本地节点SSL配置
+       val result = cmd.javaOpts.collectFirst {
+         case SSL_NODE_LOCAL_CONFIG_PATTERN(_result) => _result.toBoolean
+       }
+       val= result.getOrElse(false)
+       
+       def startRpcEnvAndEndpoint(
+         host: String,
+         port: Int,
+         webUiPort: Int,
+         cores: Int,
+         memory: Int,
+         masterUrls: Array[String],
+         workDir: String,
+         workerNumber: Option[Int] = None,
+         conf: SparkConf = new SparkConf,
+         resourceFileOpt: Option[String] = None): RpcEnv
+       功能: 启动RPC环境和后台
+       val systemName = SYSTEM_NAME + workerNumber.map(_.toString).getOrElse("")
+       val securityMgr = new SecurityManager(conf)
+       val rpcEnv = RpcEnv.create(systemName, host, port, conf, securityMgr)
+       val masterAddresses = masterUrls.map(RpcAddress.fromSparkURL)
+       val pid = if (Utils.isTesting) workerNumber.get else Utils.getProcessId
+       rpcEnv.setupEndpoint(ENDPOINT_NAME, new Worker(rpcEnv, webUiPort, cores, memory,
+         masterAddresses,ENDPOINT_NAME,workDir,conf,securityMgr,resourceFileOpt,pid=pid))
+       val= rpcEnv
+       
+       def maybeUpdateSSLSettings(cmd: Command, conf: SparkConf): Command
+       功能: 更新可能的SSL配置
+       val prefix = "spark.ssl."
+       val useNLC = "spark.ssl.useNodeLocalConf"
+       if (isUseLocalNodeSSLConfig(cmd)) {
+         val newJavaOpts = cmd.javaOpts
+             .filter(opt => !opt.startsWith(s"-D$prefix")) ++
+             conf.getAll.collect { case (key, value) if key.startsWith(prefix) 
+                                  => s"-D$key=$value" } :+
+             s"-D$useNLC=true"
+         cmd.copy(javaOpts = newJavaOpts)
+       } else {
+         cmd
+       }
+       
+       def main(argStrings: Array[String]): Unit
+       功能: 启动函数
+   }
+   ```
    
    #### WorkerArguments
    
@@ -4437,9 +4985,9 @@ private[deploy] class Worker(
        if (System.getenv("SPARK_WORKER_DIR") != null) {
            workDir = System.getenv("SPARK_WORKER_DIR")
        }
-    介绍: 检查环境变量
+       介绍: 检查环境变量
        
-    @tailrec
+       @tailrec
        private def parse(args: List[String]): Unit
        功能: 参数转换
        args match {
@@ -6700,9 +7248,1707 @@ private[spark] object SparkHadoopUtil {
 
 #### SparkSubmit
 
+```scala
+private[deploy] object SparkSubmitAction extends Enumeration {
+    介绍: 是否去提交,kill,请求应用状态信息,后两个操作只支持独立运行模式和mesos集群下的运行模式
+    type SparkSubmitAction = Value
+    val SUBMIT, KILL, REQUEST_STATUS, PRINT_VERSION = Value
+    动作列表:
+    submit	提交
+    kill	中断
+    REQUEST_STATUS	请求状态
+    PRINT_VERSION	打印版本信息
+}
+```
+
+```scala
+private[spark] class SparkSubmit extends Logging {
+    介绍: 运行spark应用的主要网关,这个程序处理创建相关的类路径(携带有相关spark依赖,提供不同的集群管理,部署spark支持的模式)
+    操作集:
+    def doSubmit(args: Array[String]): Unit
+    功能: 提交
+    输入参数: args	提交参数
+    1. 初始化日志记录处理,保证应用开始之前日志重置完成
+    val uninitLog = initializeLogIfNecessary(true, silent = true)
+    2. 获取应用参数
+    val appArgs = parseArguments(args)
+    if (appArgs.verbose) {
+      logInfo(appArgs.toString)
+    }
+    3. 进行相关的操作
+    appArgs.action match {
+      case SparkSubmitAction.SUBMIT => submit(appArgs, uninitLog)
+      case SparkSubmitAction.KILL => kill(appArgs)
+      case SparkSubmitAction.REQUEST_STATUS => requestStatus(appArgs)
+      case SparkSubmitAction.PRINT_VERSION => printVersion()
+    }
+    
+    def parseArguments(args: Array[String]): SparkSubmitArguments 
+    功能: 转换参数
+    val= new SparkSubmitArguments(args)
+    
+    def kill(args: SparkSubmitArguments): Unit
+    功能: kill存在的提交
+    if (RestSubmissionClient.supportsRestClient(args.master)) {
+      new RestSubmissionClient(args.master)
+        .killSubmission(args.submissionToKill)
+    } else {
+      val sparkConf = args.toSparkConf()
+      sparkConf.set("spark.master", args.master)
+      SparkSubmitUtils
+        .getSubmitOperations(args.master)
+        .kill(args.submissionToKill, sparkConf)
+    }
+    
+    def requestStatus(args: SparkSubmitArguments): Unit
+    功能: 请求存在提交的状态
+    if (RestSubmissionClient.supportsRestClient(args.master)) {
+      new RestSubmissionClient(args.master)
+        .requestSubmissionStatus(args.submissionToRequestStatusFor)
+    } else {
+      val sparkConf = args.toSparkConf()
+      sparkConf.set("spark.master", args.master)
+      SparkSubmitUtils
+        .getSubmitOperations(args.master)
+        .printSubmissionStatus(args.submissionToRequestStatusFor, sparkConf)
+    }
+    
+    def printVersion(): Unit
+    功能: 打印版本信息
+    logInfo("""Welcome to
+      ____              __
+     / __/__  ___ _____/ /__
+    _\ \/ _ \/ _ `/ __/  '_/
+   /___/ .__/\_,_/_/ /_/\_\   version %s
+      /_/
+                        """.format(SPARK_VERSION))
+    logInfo("Using Scala %s, %s, %s".format(
+      Properties.versionString, Properties.javaVmName, Properties.javaVersion))
+    logInfo(s"Branch $SPARK_BRANCH")
+    logInfo(s"Compiled by user $SPARK_BUILD_USER on $SPARK_BUILD_DATE")
+    logInfo(s"Revision $SPARK_REVISION")
+    logInfo(s"Url $SPARK_REPO_URL")
+    logInfo("Type --help for more information.")
+    
+    def doRunMain(): Unit
+    功能: 启动主函数,需要有用户代理信息才能正常运行函数
+    if (args.proxyUser != null) {
+        val proxyUser = UserGroupInformation.createProxyUser(args.proxyUser,
+          UserGroupInformation.getCurrentUser())
+        try {
+          proxyUser.doAs(new PrivilegedExceptionAction[Unit]() {
+            override def run(): Unit = {
+              runMain(args, uninitLog)
+            }
+          })
+        } catch {
+          case e: Exception =>
+            if (e.getStackTrace().length == 0) {
+              error(s"ERROR: ${e.getClass().getName()}: ${e.getMessage()}")
+            } else {
+              throw e
+            }
+        }
+      } else {
+        runMain(args, uninitLog)
+      }
+    
+    def submit(args: SparkSubmitArguments, uninitLog: Boolean): Unit
+    功能: 使用提供的操作提交任务,确保首次包装@doAs
+    在独立运行模式中，含有两个提交的网关
+    1. 传统的RPC网关(使用deploy.Client作为包装)
+    2. 新的基于REST的网关,开始于spark 1.3
+    后者时1.3版本以后的默认提交网关,但是当master服务器不是REST服务器的时候,就会使用另一种提交方式.
+    if (args.isStandaloneCluster && args.useRest) {
+      try {
+        logInfo("Running Spark using the REST application submission protocol.")
+        doRunMain()
+      } catch {
+        case e: SubmitRestConnectionException =>
+          logWarning(s"Master endpoint ${args.master} was not a REST server. " +
+            "Falling back to legacy submission gateway instead.")
+          args.useRest = false
+          submit(args, false)
+      }
+    } else {
+      doRunMain()
+    }
+    
+    def prepareSubmitEnvironment(
+      args: SparkSubmitArguments,
+      conf: Option[HadoopConfiguration] = None)
+      : (Seq[String], Seq[String], SparkConf, String)
+    功能: 准备提交参数,用于提交应用
+    输入参数:
+    	args	用于准备环境变量的参数转换
+    	conf	hadoop配置,只会在单元测试中使用
+    返回一个四元组
+    	1. 子进程参数
+    	2. 类路径列表
+    	3. 系统参数映射表
+    	4. 主类
+    测试可见
+    1. 设定返回值
+    val childArgs = new ArrayBuffer[String]()
+    val childClasspath = new ArrayBuffer[String]()
+    val sparkConf = args.toSparkConf()
+    var childMainClass = ""
+    2. 设置集群管理器
+    val clusterManager: Int = args.master match {
+      case "yarn" => YARN
+      case m if m.startsWith("spark") => STANDALONE
+      case m if m.startsWith("mesos") => MESOS
+      case m if m.startsWith("k8s") => KUBERNETES
+      case m if m.startsWith("local") => LOCAL
+      case _ =>
+        error("Master must either be yarn or start with spark, mesos, k8s, or local")
+        -1
+    }
+    3. 设置部署模式,默认情况下为客户端模式
+    var deployMode: Int = args.deployMode match {
+      case "client" | null => CLIENT
+      case "cluster" => CLUSTER
+      case _ =>
+        error("Deploy mode must be either client or cluster")
+        -1
+    }
+    // yarn模式处理
+    if (clusterManager == YARN) {
+      // Make sure YARN is included in our build if we're trying to use it
+      if (!Utils.classIsLoadable(YARN_CLUSTER_SUBMIT_CLASS) && !Utils.isTesting) {
+        error(
+          "Could not load YARN classes. " +
+          "This copy of Spark may not have been compiled with YARN support.")
+      }
+    }
+ 	// kubernetes集群模式除了
+    if (clusterManager == KUBERNETES) {
+      args.master = Utils.checkAndGetK8sMasterUrl(args.master)
+      // Make sure KUBERNETES is included in our build if we're trying to use it
+      if (!Utils.classIsLoadable(KUBERNETES_CLUSTER_SUBMIT_CLASS) && !Utils.isTesting) {
+        error(
+          "Could not load KUBERNETES classes. " +
+            "This copy of Spark may not have been compiled with KUBERNETES support.")
+      }
+    }
+    4. 不支持相关模式,则快速失败
+    (clusterManager, deployMode) match {
+      case (STANDALONE, CLUSTER) if args.isPython =>
+        error("Cluster deploy mode is currently not supported for python " +
+          "applications on standalone clusters.")
+      case (STANDALONE, CLUSTER) if args.isR =>
+        error("Cluster deploy mode is currently not supported for R " +
+          "applications on standalone clusters.")
+      case (LOCAL, CLUSTER) =>
+        error("Cluster deploy mode is not compatible with master \"local\"")
+      case (_, CLUSTER) if isShell(args.primaryResource) =>
+        error("Cluster deploy mode is not applicable to Spark shells.")
+      case (_, CLUSTER) if isSqlShell(args.mainClass) =>
+        error("Cluster deploy mode is not applicable to Spark SQL shell.")
+      case (_, CLUSTER) if isThriftServer(args.mainClass) =>
+        error("Cluster deploy mode is not applicable to Spark Thrift server.")
+      case _ =>
+    }
+    5. 更新空值部署信息
+    (args.deployMode, deployMode) match {
+      case (null, CLIENT) => args.deployMode = "client"
+      case (null, CLUSTER) => args.deployMode = "cluster"
+      case _ =>
+    }
+    6. 获取部署属性
+    val isYarnCluster = clusterManager == YARN && deployMode == CLUSTER
+    val isMesosCluster = clusterManager == MESOS && deployMode == CLUSTER
+    val isStandAloneCluster = clusterManager == STANDALONE && deployMode == CLUSTER
+    val isKubernetesCluster = clusterManager == KUBERNETES && deployMode == CLUSTER
+    val isKubernetesClient = clusterManager == KUBERNETES && deployMode == CLIENT
+    val isKubernetesClusterModeDriver = isKubernetesClient &&
+      sparkConf.getBoolean("spark.kubernetes.submitInDriver", false)
+    7. 非独立和mesos集群处理
+    if (!isMesosCluster && !isStandAloneCluster) {
+      // 处理maven依赖
+      val resolvedMavenCoordinates = DependencyUtils.resolveMavenDependencies(
+        args.packagesExclusions, args.packages, args.repositories, args.ivyRepoPath,
+        args.ivySettingsPath)
+      // 非空依赖处理
+      if (!StringUtils.isBlank(resolvedMavenCoordinates)) {
+        if (isKubernetesClusterModeDriver) {
+          val loader = getSubmitClassLoader(sparkConf)
+          for (jar <- resolvedMavenCoordinates.split(",")) {
+            addJarToClasspath(jar, loader)
+          }
+        } else if (isKubernetesCluster) {
+          childClasspath ++= resolvedMavenCoordinates.split(",")
+        } else {
+          args.jars = mergeFileLists(args.jars, resolvedMavenCoordinates)
+          if (args.isPython || isInternal(args.primaryResource)) {
+            args.pyFiles = mergeFileLists(args.pyFiles, resolvedMavenCoordinates)
+          }
+        }
+      }
+      if (args.isR && !StringUtils.isBlank(args.jars)) {
+        RPackageUtils.checkAndBuildRPackage(args.jars, printStream, args.verbose)
+      }
+    }
+    8. 更新spark配置
+    args.toSparkConf(Option(sparkConf))
+    val hadoopConf = conf.getOrElse(SparkHadoopUtil.newConfiguration(sparkConf))
+    val targetDir = Utils.createTempDir()
+    9. 在独立部署中不支持kerberos,密钥在mesos集群中也不可用
+    if (clusterManager != STANDALONE
+        && !isMesosCluster
+        && args.principal != null
+        && args.keytab != null) {
+      if (deployMode == CLIENT && Utils.isLocalUri(args.keytab)) {
+        args.keytab = new URI(args.keytab).getPath()
+      }
+
+      if (!Utils.isLocalUri(args.keytab)) {
+        require(new File(args.keytab).exists(), s"Keytab file: 
+        ${args.keytab} does not exist")
+        UserGroupInformation.loginUserFromKeytab(args.principal, args.keytab)
+      }
+    }
+    10. 解决不同资源的全局属性
+    args.jars = Option(args.jars).map(resolveGlobPaths(_, hadoopConf)).orNull
+    args.files = Option(args.files).map(resolveGlobPaths(_, hadoopConf)).orNull
+    args.pyFiles = Option(args.pyFiles).map(resolveGlobPaths(_, hadoopConf)).orNull
+    args.archives = Option(args.archives).map(resolveGlobPaths(_, hadoopConf)).orNull
+    11. 客户端模式下,下载远端文件
+    var localPrimaryResource: String = null
+    var localJars: String = null
+    var localPyFiles: String = null
+    if (deployMode == CLIENT) {
+      localPrimaryResource = Option(args.primaryResource).map {
+        downloadFile(_, targetDir, sparkConf, hadoopConf, secMgr)
+      }.orNull
+      localJars = Option(args.jars).map {
+        downloadFileList(_, targetDir, sparkConf, hadoopConf, secMgr)
+      }.orNull
+      localPyFiles = Option(args.pyFiles).map {
+        downloadFileList(_, targetDir, sparkConf, hadoopConf, secMgr)
+      }.orNull
+      if (isKubernetesClusterModeDriver) {
+        args.jars = renameResourcesToLocalFS(args.jars, localJars)
+        val localFiles = Option(args.files).map {
+          downloadFileList(_, targetDir, sparkConf, hadoopConf, secMgr)
+        }.orNull
+        args.files = renameResourcesToLocalFS(args.files, localFiles)
+      }
+    }
+    12. yarn模式下,远端资源的处理,需要schema
+    原因是
+    	1. hadoop文件系统不支持
+    	2. 配置`@spark.yarn.dist.forceDownloadSchemes`,从而绕开hadoop文件系统
+    if (clusterManager == YARN) {
+      val forceDownloadSchemes = sparkConf.get(FORCE_DOWNLOAD_SCHEMES)
+      def shouldDownload(scheme: String): Boolean = {
+        forceDownloadSchemes.contains("*") || forceDownloadSchemes.contains(scheme) ||
+          Try { FileSystem.getFileSystemClass(scheme, hadoopConf) }.isFailure
+      }
+      def downloadResource(resource: String): String = {
+        val uri = Utils.resolveURI(resource)
+        uri.getScheme match {
+          case "local" | "file" => resource
+          case e if shouldDownload(e) =>
+            val file = new File(targetDir, new Path(uri).getName)
+            if (file.exists()) {
+              file.toURI.toString
+            } else {
+              downloadFile(resource, targetDir, sparkConf, hadoopConf, secMgr)
+            }
+          case _ => uri.toString
+        }
+      }
+      args.primaryResource = Option(args.primaryResource).map { downloadResource }.orNull
+      args.files = Option(args.files).map { files =>
+        Utils.stringToSeq(files).map(downloadResource).mkString(",")
+      }.orNull
+      args.pyFiles = Option(args.pyFiles).map { pyFiles =>
+        Utils.stringToSeq(pyFiles).map(downloadResource).mkString(",")
+      }.orNull
+      args.jars = Option(args.jars).map { jars =>
+        Utils.stringToSeq(jars).map(downloadResource).mkString(",")
+      }.orNull
+      args.archives = Option(args.archives).map { archives =>
+        Utils.stringToSeq(archives).map(downloadResource).mkString(",")
+      }.orNull
+    }
+    13. 请求下载所有的远端资源
+    if (args.mainClass == null && !args.isPython && !args.isR) {
+      try {
+        val uri = new URI(
+          Option(localPrimaryResource).getOrElse(args.primaryResource)
+        )
+        val fs = FileSystem.get(uri, hadoopConf)
+        Utils.tryWithResource(new JarInputStream(fs.open(new Path(uri)))) { jar =>
+          args.mainClass = jar.getManifest.getMainAttributes.getValue("Main-Class")
+        }
+      } catch {
+        case e: Throwable =>
+          error(
+            s"Failed to get main class in JAR with error '${e.getMessage}'. " +
+            " Please specify one with --class."
+          )
+      }
+      if (args.mainClass == null) {
+        // If we still can't figure out the main class at this point, blow up.
+        error("No main class set in JAR; please specify one with --class.")
+      }
+    }
+    14. 设置python应用相关
+    if (args.isPython && deployMode == CLIENT) {
+      if (args.primaryResource == PYSPARK_SHELL) {
+        args.mainClass = "org.apache.spark.api.python.PythonGatewayServer"
+      } else {
+        args.mainClass = "org.apache.spark.deploy.PythonRunner"
+        args.childArgs = ArrayBuffer(localPrimaryResource, localPyFiles) ++ args.childArgs
+      }
+      if (clusterManager != YARN) {
+        args.files = mergeFileLists(args.files, args.pyFiles)
+      }
+    }
+    if (localPyFiles != null) {
+      sparkConf.set(SUBMIT_PYTHON_FILES, localPyFiles.split(",").toSeq)
+    }
+    15. yarn 模式下运行R应用
+    if (args.isR && clusterManager == YARN) {
+      val sparkRPackagePath = RUtils.localSparkRPackagePath
+      if (sparkRPackagePath.isEmpty) {
+        error("SPARK_HOME does not exist for R application in YARN mode.")
+      }
+      val sparkRPackageFile = new File(sparkRPackagePath.get, SPARKR_PACKAGE_ARCHIVE)
+      if (!sparkRPackageFile.exists()) {
+        error(s"$SPARKR_PACKAGE_ARCHIVE does not exist for R application in YARN mode.")
+      }
+      val sparkRPackageURI = Utils.resolveURI(sparkRPackageFile.getAbsolutePath).toString
+      args.archives = mergeFileLists(args.archives, sparkRPackageURI + "#sparkr")
+      if (!RUtils.rPackages.isEmpty) {
+        val rPackageFile =
+          RPackageUtils.zipRLibraries(new File(RUtils.rPackages.get), R_PACKAGE_ARCHIVE)
+        if (!rPackageFile.exists()) {
+          error("Failed to zip all the built R packages.")
+        }
+        val rPackageURI = Utils.resolveURI(rPackageFile.getAbsolutePath).toString
+        args.archives = mergeFileLists(args.archives, rPackageURI + "#rpkg")
+      }
+    }
+    16. 度量模式下支持R
+    if (args.isR && clusterManager == STANDALONE && !RUtils.rPackages.isEmpty) {
+      error("Distributing R packages with standalone cluster is not supported.")
+    }
+    17. mesos集群下支持R
+    if (args.isR && clusterManager == MESOS && !RUtils.rPackages.isEmpty) {
+      error("Distributing R packages with mesos cluster is not supported.")
+    }
+    18. 将R的主类添加到运行器中
+    if (args.isR && deployMode == CLIENT) {
+      if (args.primaryResource == SPARKR_SHELL) {
+        args.mainClass = "org.apache.spark.api.r.RBackend"
+      } else {
+        args.mainClass = "org.apache.spark.deploy.RRunner"
+        args.childArgs = ArrayBuffer(localPrimaryResource) ++ args.childArgs
+        args.files = mergeFileLists(args.files, args.primaryResource)
+      }
+    }
+    if (isYarnCluster && args.isR) {
+      args.files = mergeFileLists(args.files, args.primaryResource)
+    }
+    sys.props("SPARK_SUBMIT") = "true"
+    19. 获取系统属性和命令行的配置映射表
+    List[OptionAssigner](
+      // 对于集群管理器
+      OptionAssigner(args.master, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES, confKey = "spark.master"),
+      OptionAssigner(args.deployMode, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
+        confKey = SUBMIT_DEPLOY_MODE.key),
+      OptionAssigner(args.name, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES, confKey = "spark.app.name"),
+      OptionAssigner(args.ivyRepoPath, ALL_CLUSTER_MGRS, CLIENT, confKey = "spark.jars.ivy"),
+      OptionAssigner(args.driverMemory, ALL_CLUSTER_MGRS, CLIENT,
+        confKey = DRIVER_MEMORY.key),
+      OptionAssigner(args.driverExtraClassPath, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
+        confKey = DRIVER_CLASS_PATH.key),
+      OptionAssigner(args.driverExtraJavaOptions, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
+        confKey = DRIVER_JAVA_OPTIONS.key),
+      OptionAssigner(args.driverExtraLibraryPath, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
+        confKey = DRIVER_LIBRARY_PATH.key),
+      OptionAssigner(args.principal, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
+        confKey = PRINCIPAL.key),
+      OptionAssigner(args.keytab, ALL_CLUSTER_MGRS, ALL_DEPLOY_MODES,
+        confKey = KEYTAB.key),
+      OptionAssigner(args.pyFiles, ALL_CLUSTER_MGRS, CLUSTER, confKey = SUBMIT_PYTHON_FILES.key),
+        // 传参到driver侧
+      OptionAssigner(args.packages, STANDALONE | MESOS | KUBERNETES,
+        CLUSTER, confKey = "spark.jars.packages"),
+      OptionAssigner(args.repositories, STANDALONE | MESOS | KUBERNETES,
+        CLUSTER, confKey = "spark.jars.repositories"),
+      OptionAssigner(args.ivyRepoPath, STANDALONE | MESOS | KUBERNETES,
+        CLUSTER, confKey = "spark.jars.ivy"),
+      OptionAssigner(args.packagesExclusions, STANDALONE | MESOS | KUBERNETES,
+        CLUSTER, confKey = "spark.jars.excludes"),
+      // yarn参数
+      OptionAssigner(args.queue, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.queue"),
+      OptionAssigner(args.pyFiles, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.pyFiles",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.jars, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.jars",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.files, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.files",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.archives, YARN, ALL_DEPLOY_MODES, confKey = "spark.yarn.dist.archives",
+        mergeFn = Some(mergeFileLists(_, _))),
+      OptionAssigner(args.numExecutors, YARN | KUBERNETES, ALL_DEPLOY_MODES,
+        confKey = EXECUTOR_INSTANCES.key),
+      OptionAssigner(args.executorCores, STANDALONE | YARN | KUBERNETES, ALL_DEPLOY_MODES,
+        confKey = EXECUTOR_CORES.key),
+      OptionAssigner(args.executorMemory, STANDALONE | MESOS | YARN | KUBERNETES, ALL_DEPLOY_MODES,
+        confKey = EXECUTOR_MEMORY.key),
+      OptionAssigner(args.totalExecutorCores, STANDALONE | MESOS | KUBERNETES, ALL_DEPLOY_MODES,
+        confKey = CORES_MAX.key),
+      OptionAssigner(args.files, LOCAL | STANDALONE | MESOS | KUBERNETES, ALL_DEPLOY_MODES,
+        confKey = FILES.key),
+      OptionAssigner(args.jars, LOCAL, CLIENT, confKey = JARS.key),
+      OptionAssigner(args.jars, STANDALONE | MESOS | KUBERNETES, ALL_DEPLOY_MODES,
+        confKey = JARS.key),
+      OptionAssigner(args.driverMemory, STANDALONE | MESOS | YARN | KUBERNETES, CLUSTER,
+        confKey = DRIVER_MEMORY.key),
+      OptionAssigner(args.driverCores, STANDALONE | MESOS | YARN | KUBERNETES, CLUSTER,
+        confKey = DRIVER_CORES.key),
+      OptionAssigner(args.supervise.toString, STANDALONE | MESOS, CLUSTER,
+        confKey = DRIVER_SUPERVISE.key),
+      OptionAssigner(args.ivyRepoPath, STANDALONE, CLUSTER, confKey = "spark.jars.ivy"),
+      OptionAssigner(localJars, ALL_CLUSTER_MGRS, CLIENT, confKey =
+                     "spark.repl.local.jars"))
+    20. 客户端模式下，直接运行主类，此外的情况下，添加任务jar包到类路径中
+    if (deployMode == CLIENT) {
+      childMainClass = args.mainClass
+      if (localPrimaryResource != null && isUserJar(localPrimaryResource)) {
+        childClasspath += localPrimaryResource
+      }
+      if (localJars != null) { childClasspath ++= localJars.split(",") }
+    }
+    21. yarn模式下添加应用jar和添加的jar到类路径中
+    if (isYarnCluster) {
+      if (isUserJar(args.primaryResource)) {
+        childClasspath += args.primaryResource
+      }
+      if (args.jars != null) { childClasspath ++= args.jars.split(",") }
+    }
+    if (deployMode == CLIENT) {
+      if (args.childArgs != null) { childArgs ++= args.childArgs }
+    }
+    22. 在选定模式下，将所有参数转化为命令行参数或者系统属性
+    for (opt <- options) {
+      if (opt.value != null &&
+          (deployMode & opt.deployMode) != 0 &&
+          (clusterManager & opt.clusterManager) != 0) {
+        if (opt.clOption != null) { childArgs += (opt.clOption, opt.value) }
+        if (opt.confKey != null) {
+          if (opt.mergeFn.isDefined && sparkConf.contains(opt.confKey)) {
+            sparkConf.set(opt.confKey, 
+                          opt.mergeFn.get.apply(sparkConf.get(opt.confKey), opt.value))
+          } else {
+            sparkConf.set(opt.confKey, opt.value)
+          }
+        }
+      }
+    }
+    23. 在shell模式下，@spark.ui.showConsoleProgress 默认状态下为true
+    if (isShell(args.primaryResource) && !sparkConf.contains(UI_SHOW_CONSOLE_PROGRESS)) {
+      sparkConf.set(UI_SHOW_CONSOLE_PROGRESS, true)
+    }
+    24. 自动添加jar包，这样用户就不用调用@sc.addJar去手动调拨.在yarn模式下,jar已经分配到每个节点,作为app.jar,对于Python 或者R程序来说,资源已经作为正常文件分发.
+    if (!isYarnCluster && !args.isPython && !args.isR) {
+      var jars = sparkConf.get(JARS)
+      if (isUserJar(args.primaryResource)) {
+        jars = jars ++ Seq(args.primaryResource)
+      }
+      sparkConf.set(JARS, jars)
+    }
+    25. 在独立模式下,使用REST客户端提交应用.所有spark参数通过系统参数传入
+    if (args.isStandaloneCluster) {
+      if (args.useRest) {
+        childMainClass = REST_CLUSTER_SUBMIT_CLASS
+        childArgs += (args.primaryResource, args.mainClass)
+      } else {
+        childMainClass = STANDALONE_CLUSTER_SUBMIT_CLASS
+        if (args.supervise) { childArgs += "--supervise" }
+        Option(args.driverMemory).foreach { m => childArgs += ("--memory", m) }
+        Option(args.driverCores).foreach { c => childArgs += ("--cores", c) }
+        childArgs += "launch"
+        childArgs += (args.master, args.primaryResource, args.mainClass)
+      }
+      if (args.childArgs != null) {
+        childArgs ++= args.childArgs
+      }
+    }
+    26. 让yarn直到pyspark应用,分配需要的库文件
+    if (clusterManager == YARN) {
+      if (args.isPython) {
+        sparkConf.set("spark.yarn.isPython", "true")
+      }
+    }
+    if ((clusterManager == MESOS || clusterManager == KUBERNETES)
+       && UserGroupInformation.isSecurityEnabled) {
+      setRMPrincipal(sparkConf)
+    }
+    27. yarn模式下,使用yarn客户端包装用户类
+    if (isYarnCluster) {
+      childMainClass = YARN_CLUSTER_SUBMIT_CLASS
+      if (args.isPython) {
+        childArgs += ("--primary-py-file", args.primaryResource)
+        childArgs += ("--class", "org.apache.spark.deploy.PythonRunner")
+      } else if (args.isR) {
+        val mainFile = new Path(args.primaryResource).getName
+        childArgs += ("--primary-r-file", mainFile)
+        childArgs += ("--class", "org.apache.spark.deploy.RRunner")
+      } else {
+        if (args.primaryResource != SparkLauncher.NO_RESOURCE) {
+          childArgs += ("--jar", args.primaryResource)
+        }
+        childArgs += ("--class", args.mainClass)
+      }
+      if (args.childArgs != null) {
+        args.childArgs.foreach { arg => childArgs += ("--arg", arg) }
+      }
+    }
+    28. mesos模式下,包装用户类
+    if (isMesosCluster) {
+      assert(args.useRest, "Mesos cluster mode is only 
+      supported through the REST submission API")
+      childMainClass = REST_CLUSTER_SUBMIT_CLASS
+      if (args.isPython) {
+        childArgs += (args.primaryResource, "")
+        if (args.pyFiles != null) {
+          sparkConf.set(SUBMIT_PYTHON_FILES, args.pyFiles.split(",").toSeq)
+        }
+      } else if (args.isR) {
+        childArgs += (args.primaryResource, "")
+      } else {
+        childArgs += (args.primaryResource, args.mainClass)
+      }
+      if (args.childArgs != null) {
+        childArgs ++= args.childArgs
+      }
+    }
+    29. kubernetes集群中包装用户类
+    if (isKubernetesCluster) {
+      childMainClass = KUBERNETES_CLUSTER_SUBMIT_CLASS
+      if (args.primaryResource != SparkLauncher.NO_RESOURCE) {
+        if (args.isPython) {
+          childArgs ++= Array("--primary-py-file", args.primaryResource)
+          childArgs ++= Array("--main-class", "org.apache.spark.deploy.PythonRunner")
+        } else if (args.isR) {
+          childArgs ++= Array("--primary-r-file", args.primaryResource)
+          childArgs ++= Array("--main-class", "org.apache.spark.deploy.RRunner")
+        }
+        else {
+          childArgs ++= Array("--primary-java-resource", args.primaryResource)
+          childArgs ++= Array("--main-class", args.mainClass)
+        }
+      } else {
+        childArgs ++= Array("--main-class", args.mainClass)
+      }
+      if (args.childArgs != null) {
+        args.childArgs.foreach { arg =>
+          childArgs += ("--arg", arg)
+        }
+      }
+    }
+    30. 加载spark配置
+    for ((k, v) <- args.sparkProperties) {
+      sparkConf.setIfMissing(k, v)
+    }
+    31. 忽略集群节点中失效的节点
+    if (deployMode == CLUSTER) {
+      sparkConf.remove(DRIVER_HOST_ADDRESS)
+    }
+    32. 获取路径配置
+    val pathConfigs = Seq(
+      JARS.key,
+      FILES.key,
+      "spark.yarn.dist.files",
+      "spark.yarn.dist.archives",
+      "spark.yarn.dist.jars")
+    pathConfigs.foreach { config =>
+      sparkConf.getOption(config).foreach { oldValue =>
+        sparkConf.set(config, Utils.resolveURIs(oldValue))
+      }
+    }
+    33. 解决python相关的文件
+    val pyFiles = sparkConf.get(SUBMIT_PYTHON_FILES)
+    val resolvedPyFiles = Utils.resolveURIs(pyFiles.mkString(","))
+    val formattedPyFiles = if (deployMode != CLUSTER) {
+      PythonRunner.formatPaths(resolvedPyFiles).mkString(",")
+    } else {
+      resolvedPyFiles
+    }
+    sparkConf.set(SUBMIT_PYTHON_FILES, formattedPyFiles.split(",").toSeq)
+    val= (childArgs, childClasspath, sparkConf, childMainClass)
+    
+    def renameResourcesToLocalFS(resources: String, localResources: String): String 
+    功能: 重命名资源到本地文件系统中
+     if (resources != null && localResources != null) {
+      val localResourcesSeq = Utils.stringToSeq(localResources)
+      Utils.stringToSeq(resources).map { resource =>
+        val filenameRemote = FilenameUtils.getName(new URI(resource).getPath)
+        localResourcesSeq.find { localUri =>
+          val filenameLocal = FilenameUtils.getName(new URI(localUri).getPath)
+          filenameRemote == filenameLocal
+        }.getOrElse(resource)
+      }.mkString(",")
+    } else {
+      resources
+    }
+    
+    def setRMPrincipal(sparkConf: SparkConf): Unit
+    功能: hadoopRDD调用hadoop库获取授权密钥,并更新Yarn的资源管理器@ResourceManager,由于在mesos或者kubernetes集群模式下没有配置yarn,因此必须定位到yarn模式下.
+    val shortUserName = UserGroupInformation.getCurrentUser.getShortUserName
+    val key = s"spark.hadoop.${YarnConfiguration.RM_PRINCIPAL}"
+    logInfo(s"Setting ${key} to ${shortUserName}")
+    sparkConf.set(key, shortUserName)
+    
+    def getSubmitClassLoader(sparkConf: SparkConf): MutableURLClassLoader 
+    功能: 获取提交的类加载器
+    val loader =
+      if (sparkConf.get(DRIVER_USER_CLASS_PATH_FIRST)) {
+        new ChildFirstURLClassLoader(new Array[URL](0),
+          Thread.currentThread.getContextClassLoader)
+      } else {
+        new MutableURLClassLoader(new Array[URL](0),
+          Thread.currentThread.getContextClassLoader)
+      }
+    Thread.currentThread.setContextClassLoader(loader)
+    val= loader
+    
+    @tailrec
+    def findCause(t: Throwable): Throwable = t match {
+      case e: UndeclaredThrowableException =>
+        if (e.getCause() != null) findCause(e.getCause()) else e
+      case e: InvocationTargetException =>
+        if (e.getCause() != null) findCause(e.getCause()) else e
+      case e: Throwable =>
+        e
+    }
+    功能: 获取异常原因
+    
+    def runMain(args: SparkSubmitArguments, uninitLog: Boolean): Unit 
+    功能: 运行主函数
+    包含两个部分,首先准备运行参数(通过设置相应的类路径,系统参数,应用参数).其次使用这些运行参数调用子类的main方法.
+    1. 加载运行参数
+    val (childArgs, childClasspath, sparkConf, childMainClass) =
+    prepareSubmitEnvironment(args)
+    2. 重启日志系统
+    if (uninitLog) {
+      Logging.uninitialize()
+    }
+	3. 参数可视化
+    if (args.verbose) {
+      logInfo(s"Main class:\n$childMainClass")
+      logInfo(s"Arguments:\n${childArgs.mkString("\n")}")
+      logInfo(s"Spark config:\n${Utils.redact(sparkConf.getAll.toMap).mkString("\n")}")
+      logInfo(s"Classpath elements:\n${childClasspath.mkString("\n")}")
+      logInfo("\n")
+    }
+    4. 加载类路径
+    val loader = getSubmitClassLoader(sparkConf)
+    for (jar <- childClasspath) {
+      addJarToClasspath(jar, loader)
+    }
+    5. 获取主类
+    var mainClass: Class[_] = null
+    try {
+      mainClass = Utils.classForName(childMainClass)
+    } catch {
+      case e: ClassNotFoundException =>
+        logError(s"Failed to load class $childMainClass.")
+        if (childMainClass.contains("thriftserver")) {
+          logInfo(s"Failed to load main class $childMainClass.")
+          logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
+        }
+        throw new SparkUserAppException(CLASS_NOT_FOUND_EXIT_STATUS)
+      case e: NoClassDefFoundError =>
+        logError(s"Failed to load $childMainClass: ${e.getMessage()}")
+        if (e.getMessage.contains("org/apache/hadoop/hive")) {
+          logInfo(s"Failed to load hive class.")
+          logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
+        }
+        throw new SparkUserAppException(CLASS_NOT_FOUND_EXIT_STATUS)
+    }
+    6. 获取spark应用
+    val app: SparkApplication = if (
+        classOf[SparkApplication].isAssignableFrom(mainClass)) {
+      mainClass.getConstructor().newInstance().asInstanceOf[SparkApplication]
+    } else {
+      new JavaMainApplication(mainClass)
+    }
+    7. 启动应用
+    try {
+      app.start(childArgs.toArray, sparkConf)
+    } catch {
+      case t: Throwable =>
+        throw findCause(t)
+    }
+    
+    def error(msg: String): Unit = throw new SparkException(msg)
+    功能: 获取错误信息
+}
+```
+
+```scala
+private[spark] object InProcessSparkSubmit {
+	介绍: 启动进程内的spark应用
+    def main(args: Array[String]): Unit 
+    功能: 主函数
+    val submit = new SparkSubmit()
+    submit.doSubmit(args)
+}
+```
+
+```scala
+object SparkSubmit extends CommandLineUtils with Logging {
+    属性:
+    #name @YARN=1 集群管理yarn模式
+    #name @STANDALONE = 2	集群管理-独立运行模式
+    #name @MESOS = 4	集群管理-mesos集群模式
+    #name @LOCAL = 8	集群管理-本地模式
+    #name @KUBERNETES = 16	集群管理-kubernetes集群模式
+    #name @ALL_CLUSTER_MGRS = YARN | STANDALONE | MESOS | LOCAL | KUBERNETES	所有模式
+    #name @CLIENT = 1	部署模式-客户端模式
+    #name @CLUSTER = 2	部署模式-集群模式
+    #name @ALL_DEPLOY_MODES = CLIENT | CLUSTER	所有部署模式
+    #name @SPARK_SHELL = "spark-shell"	spark-shell
+    #name @PYSPARK_SHELL = "pyspark-shell"	pyspark-shell
+    #name @SPARKR_SHELL = "sparkr-shell"	sparkR-shell
+    #name @SPARKR_PACKAGE_ARCHIVE = "sparkr.zip"	spark打包
+    #name @R_PACKAGE_ARCHIVE = "rpkg.zip"	r打包
+    #name @CLASS_NOT_FOUND_EXIT_STATUS = 101	类找不到退出码
+    #name @YARN_CLUSTER_SUBMIT_CLASS	yarn集群提交类
+    val= "org.apache.spark.deploy.yarn.YarnClusterApplication"
+    #name @REST_CLUSTER_SUBMIT_CLASS = classOf[RestSubmissionClientApp].getName()
+    	REST集群提交类
+    #name @STANDALONE_CLUSTER_SUBMIT_CLASS = classOf[ClientApp].getName()	独立集群提交类
+    #name @KUBERNETES_CLUSTER_SUBMIT_CLASS	k8s集群提交类
+    val= "org.apache.spark.deploy.k8s.submit.KubernetesClientApplication"
+    操作集：
+    def isUserJar(res: String): Boolean
+    功能： 确定是否为用户jar包
+    val= !isShell(res) && !isPython(res) && !isInternal(res) && !isR(res)
+    
+    def isShell(res: String): Boolean
+    功能: 确定是否为shell
+    val= (res == SPARK_SHELL || res == PYSPARK_SHELL || res == SPARKR_SHELL)
+    
+    def isSqlShell(mainClass: String): Boolean
+    功能: 确定是否为sql shell
+    val= mainClass == "org.apache.spark.sql.hive.thriftserver.SparkSQLCLIDriver"
+    
+    def isThriftServer(mainClass: String): Boolean
+    功能: 确定是否为thrift服务器
+    val= mainClass == "org.apache.spark.sql.hive.thriftserver.HiveThriftServer2"
+    
+    def isPython(res: String): Boolean
+    功能: 确定是否为python
+    res != null && res.endsWith(".py") || res == PYSPARK_SHELL
+    
+    def isR(res: String): Boolean
+    功能: 确定是否为R
+    val= res != null && (res.endsWith(".R") || res.endsWith(".r")) || res == SPARKR_SHELL
+    
+    def isInternal(res: String): Boolean
+    功能: 确定是否为内部应用
+    val= res == SparkLauncher.NO_RESOURCE
+    
+    def main(args: Array[String]): Unit
+    功能: 启动函数
+    1. 获取提交信息
+    val submit = new SparkSubmit() {
+      self =>
+      override protected def parseArguments(args: Array[String]): SparkSubmitArguments 
+        = {
+        new SparkSubmitArguments(args) {
+          override protected def logInfo(msg: => String): Unit = self.logInfo(msg)
+          override protected def logWarning(msg: => String): Unit = self.logWarning(msg)
+          override protected def logError(msg: => String): Unit = self.logError(msg)
+        }
+      }
+      override protected def logInfo(msg: => String): Unit = printMessage(msg)
+      override protected def logWarning(msg: => String): Unit = printMessage(s"
+      Warning: $msg")
+      override protected def logError(msg: => String): Unit = printMessage(s"
+      Error: $msg")
+      override def doSubmit(args: Array[String]): Unit = {
+        try {
+          super.doSubmit(args)
+        } catch {
+          case e: SparkUserAppException =>
+            exitFn(e.exitCode)
+        }
+      }
+    }
+    2. 提交应用
+    submit.doSubmit(args)
+}
+```
+
+```scala
+private case class OptionAssigner(
+    value: String,
+    clusterManager: Int,
+    deployMode: Int,
+    clOption: String = null,
+    confKey: String = null,
+    mergeFn: Option[(String, String) => String] = None)
+介绍: 配置指定器
+提供间接的传参方式
+
+private[spark] trait SparkSubmitOperation {
+    介绍: 提交操作
+    def kill(submissionId: String, conf: SparkConf): Unit
+    功能: 中断指定提交
+    
+    def printSubmissionStatus(submissionId: String, conf: SparkConf): Unit
+    功能: 打印提交状态
+    
+    def supports(master: String): Boolean
+    功能: 确定指定master是否支持
+}
+```
+
+```scala
+private[spark] object SparkSubmitUtils {
+    介绍: 提交工具
+    属性:
+    #name @printStream = SparkSubmit.printStream	打印流(用于测试)
+    #name @IVY_DEFAULT_EXCLUDES	ivy默认排除类型(sbt)
+    val= Seq("catalyst_", "core_", "graphx_", "kvstore_", "launcher_", "mllib_",
+    "mllib-local_", "network-common_", "network-shuffle_", "repl_", "sketch_", "sql_",
+    "streaming_","tags_", "unsafe_")
+    操作集:
+    def extractMavenCoordinates(coordinates: String): Seq[MavenCoordinate]
+    功能: 抓取maven依赖信息
+    coordinates.split(",").map { p =>
+      val splits = p.replace("/", ":").split(":")
+      require(splits.length == 3, s"Provided Maven Coordinates must be in the form " +
+        s"'groupId:artifactId:version'. The coordinate provided is: $p")
+      require(splits(0) != null && splits(0).trim.nonEmpty, s"The groupId 
+      cannot be null or " +
+        s"be whitespace. The groupId provided is: ${splits(0)}")
+      require(splits(1) != null && splits(1).trim.nonEmpty, s"The artifactId 
+      cannot be null or " +
+        s"be whitespace. The artifactId provided is: ${splits(1)}")
+      require(splits(2) != null && splits(2).trim.nonEmpty, s"The version cannot 
+      be null or " +
+        s"be whitespace. The version provided is: ${splits(2)}")
+      new MavenCoordinate(splits(0), splits(1), splits(2))
+    }
+    
+    def m2Path: File
+    功能: 获取本地maven缓存的路径
+    if (Utils.isTesting) {
+      new File("dummy", ".m2" + File.separator + "repository")
+    } else {
+      new File(System.getProperty("user.home"), ".m2" + File.separator + "repository")
+    }
+    
+    def createRepoResolvers(defaultIvyUserDir: File): ChainResolver
+    功能: 以逗号为分割符,抓取maven协调者
+    val cr = new ChainResolver
+    cr.setName("spark-list")
+    val localM2 = new IBiblioResolver
+    localM2.setM2compatible(true)
+    localM2.setRoot(m2Path.toURI.toString)
+    localM2.setUsepoms(true)
+    localM2.setName("local-m2-cache")
+    cr.add(localM2)
+    val localIvy = new FileSystemResolver
+    val localIvyRoot = new File(defaultIvyUserDir, "local")
+    localIvy.setLocal(true)
+    localIvy.setRepository(new FileRepository(localIvyRoot))
+    val ivyPattern = Seq(localIvyRoot.getAbsolutePath, "[organisation]", "[module]", "[revision]","ivys", "ivy.xml").mkString(File.separator)
+    localIvy.addIvyPattern(ivyPattern)
+    val artifactPattern = Seq(localIvyRoot.getAbsolutePath, "[organisation]", "[module]",
+      "[revision]", "[type]s", "[artifact](-[classifier]).[ext]").mkString(File.separator)
+    localIvy.addArtifactPattern(artifactPattern)
+    localIvy.setName("local-ivy-cache")
+    cr.add(localIvy)
+    val br: IBiblioResolver = new IBiblioResolver
+    br.setM2compatible(true)
+    br.setUsepoms(true)
+    br.setName("central")
+    cr.add(br)
+    val sp: IBiblioResolver = new IBiblioResolver
+    sp.setM2compatible(true)
+    sp.setUsepoms(true)
+    sp.setRoot("https://dl.bintray.com/spark-packages/maven")
+    sp.setName("spark-packages")
+    cr.add(sp)
+    val= cr
+    
+    def resolveDependencyPaths(
+      artifacts: Array[AnyRef],
+      cacheDirectory: File): String
+    功能: 解决路径依赖问题
+    输出逗号分割的路径列表,和加载到类路径中的jar名称
+    val= artifacts.map { artifactInfo =>
+      val artifact = artifactInfo.asInstanceOf[Artifact].getModuleRevisionId
+      cacheDirectory.getAbsolutePath + File.separator +
+        s"${artifact.getOrganisation}_${artifact.getName}-${artifact.getRevision}.jar"
+    }.mkString(",")
+    
+    def addDependenciesToIvy(
+      md: DefaultModuleDescriptor,
+      artifacts: Seq[MavenCoordinate],
+      ivyConfName: String): Unit
+    功能: 添加依赖到ivy中
+    artifacts.foreach { mvn =>
+      val ri = ModuleRevisionId.newInstance(mvn.groupId, mvn.artifactId, mvn.version)
+      val dd = new DefaultDependencyDescriptor(ri, false, false)
+      dd.addDependencyConfiguration(ivyConfName, ivyConfName + "(runtime)")
+      printStream.println(s"${dd.getDependencyId} added as a dependency")
+      md.addDependency(dd)
+    }
+    
+    def addExclusionRules(
+      ivySettings: IvySettings,
+      ivyConfName: String,
+      md: DefaultModuleDescriptor): Unit
+    功能: 添加排除规则
+    md.addExcludeRule(createExclusion("*:scala-library:*", ivySettings, ivyConfName))
+    IVY_DEFAULT_EXCLUDES.foreach { comp =>
+      md.addExcludeRule(createExclusion(s"org.apache.spark:spark-$comp*:*", ivySettings,
+        ivyConfName))
+    }
+    
+    def buildIvySettings(remoteRepos: Option[String], 
+                         ivyPath: Option[String]): IvySettings
+    功能: 构建ivy配置
+    ivySettings.addMatcher(new GlobPatternMatcher)
+    val repoResolver = createRepoResolvers(ivySettings.getDefaultIvyUserDir)
+    ivySettings.addResolver(repoResolver)
+    ivySettings.setDefaultResolver(repoResolver.getName)
+    processRemoteRepoArg(ivySettings, remoteRepos)
+    val= ivySettings
+    
+    def loadIvySettings(
+      settingsFile: String,
+      remoteRepos: Option[String],
+      ivyPath: Option[String]): IvySettings
+    功能: 加载ivy配置
+    val file = new File(settingsFile)
+    require(file.exists(), s"Ivy settings file $file does not exist")
+    require(file.isFile(), s"Ivy settings file $file is not a normal file")
+    val ivySettings: IvySettings = new IvySettings
+    try {
+      ivySettings.load(file)
+    } catch {
+      case e @ (_: IOException | _: ParseException) =>
+        throw new SparkException(s"Failed when loading Ivy 
+        settings from $settingsFile", e)
+    }
+    processIvyPathArg(ivySettings, ivyPath)
+    processRemoteRepoArg(ivySettings, remoteRepos)
+    val= ivySettings
+    
+    def processIvyPathArg(ivySettings: IvySettings, ivyPath: Option[String]): Unit
+    功能: 设置ivy配置的位置缓存
+    ivyPath.filterNot(_.trim.isEmpty).foreach { alternateIvyDir =>
+      ivySettings.setDefaultIvyUserDir(new File(alternateIvyDir))
+      ivySettings.setDefaultCache(new File(alternateIvyDir, "cache"))
+    }
+    
+    def processRemoteRepoArg(ivySettings: IvySettings, remoteRepos: Option[String]): Unit
+    功能: 添加额外的远程仓库
+    remoteRepos.filterNot(_.trim.isEmpty).map(_.split(",")).foreach { repositoryList =>
+      val cr = new ChainResolver
+      cr.setName("user-list")
+      Option(ivySettings.getDefaultResolver).foreach(cr.add)
+      repositoryList.zipWithIndex.foreach { case (repo, i) =>
+        val brr: IBiblioResolver = new IBiblioResolver
+        brr.setM2compatible(true)
+        brr.setUsepoms(true)
+        brr.setRoot(repo)
+        brr.setName(s"repo-${i + 1}")
+        cr.add(brr)
+        printStream.println(s"$repo added as a remote repository with the 
+        name: ${brr.getName}")
+      }
+      ivySettings.addResolver(cr)
+      ivySettings.setDefaultResolver(cr.getName)
+    }
+    
+    def getModuleDescriptor: DefaultModuleDescriptor
+    功能: 获取模块的描述
+    val= DefaultModuleDescriptor.newDefaultInstance(
+        ModuleRevisionId.newInstance("org.apache.spark",
+      s"spark-submit-parent-${UUID.randomUUID.toString}",
+      "1.0"))
+    
+    def clearIvyResolutionFiles(
+      mdId: ModuleRevisionId,
+      ivySettings: IvySettings,
+      ivyConfName: String): Unit
+    功能: 清理ivy处理文件
+    val currentResolutionFiles = Seq(
+      s"${mdId.getOrganisation}-${mdId.getName}-$ivyConfName.xml",
+      s"resolved-${mdId.getOrganisation}-${mdId.getName}-${mdId.getRevision}.xml",
+      s"resolved-${mdId.getOrganisation}-${mdId.getName}-${mdId.getRevision}.properties"
+    )
+    currentResolutionFiles.foreach { filename =>
+      new File(ivySettings.getDefaultCache, filename).delete()
+    }
+    
+    def resolveMavenCoordinates(
+      coordinates: String,
+      ivySettings: IvySettings,
+      exclusions: Seq[String] = Nil,
+      isTest: Boolean = false): String
+    功能: 处理maven协调者的依赖关系
+    if (coordinates == null || coordinates.trim.isEmpty) {
+      ""
+    } else {
+      val sysOut = System.out
+      try {
+        System.setOut(printStream)
+        val artifacts = extractMavenCoordinates(coordinates)
+        val packagesDirectory: File = new File(ivySettings.getDefaultIvyUserDir, "jars")
+        printStream.println(
+          s"Ivy Default Cache set to: ${ivySettings.getDefaultCache.getAbsolutePath}")
+        printStream.println(s"The jars for the packages stored in: $packagesDirectory")
+        val ivy = Ivy.newInstance(ivySettings)
+        val resolveOptions = new ResolveOptions
+        resolveOptions.setTransitive(true)
+        val retrieveOptions = new RetrieveOptions
+        if (isTest) {
+          resolveOptions.setDownload(false)
+          resolveOptions.setLog(LogOptions.LOG_QUIET)
+          retrieveOptions.setLog(LogOptions.LOG_QUIET)
+        } else {
+          resolveOptions.setDownload(true)
+        }
+        val ivyConfName = "default"
+        val md = getModuleDescriptor
+        md.setDefaultConf(ivyConfName)
+        addExclusionRules(ivySettings, ivyConfName, md)
+        addDependenciesToIvy(md, artifacts, ivyConfName)
+        exclusions.foreach { e =>
+          md.addExcludeRule(createExclusion(e + ":*", ivySettings, ivyConfName))
+        }
+        val rr: ResolveReport = ivy.resolve(md, resolveOptions)
+        if (rr.hasError) {
+          throw new RuntimeException(rr.getAllProblemMessages.toString)
+        }
+        ivy.retrieve(rr.getModuleDescriptor.getModuleRevisionId,
+          packagesDirectory.getAbsolutePath + File.separator +
+            "[organization]_[artifact]-[revision](-[classifier]).[ext]",
+          retrieveOptions.setConfs(Array(ivyConfName)))
+        val paths = resolveDependencyPaths(rr.getArtifacts.toArray, packagesDirectory)
+        val mdId = md.getModuleRevisionId
+        clearIvyResolutionFiles(mdId, ivySettings, ivyConfName)
+        paths
+      } finally {
+        System.setOut(sysOut)
+      }
+    }
+    
+    def createExclusion(
+      coords: String,
+      ivySettings: IvySettings,
+      ivyConfName: String): ExcludeRule 
+    功能: 创建排除规则
+    val c = extractMavenCoordinates(coords)(0)
+    val id = new ArtifactId(new ModuleId(c.groupId, c.artifactId), "*", "*", "*")
+    val rule = new DefaultExcludeRule(id, ivySettings.getMatcher("glob"), null)
+    rule.addConfiguration(ivyConfName)
+    val= rule
+    
+    def parseSparkConfProperty(pair: String): (String, String)
+    功能: 转换sparkConf属性
+    pair.split("=", 2).toSeq match {
+      case Seq(k, v) => (k, v)
+      case _ => throw new SparkException(s"Spark config without '=': $pair")
+    }
+    
+    def getSubmitOperations(master: String): SparkSubmitOperation
+    功能: 获取提交的操作
+    val loader = Utils.getContextOrSparkClassLoader
+    val serviceLoaders =
+      ServiceLoader.load(classOf[SparkSubmitOperation], loader)
+        .asScala
+        .filter(_.supports(master))
+    serviceLoaders.size match {
+      case x if x > 1 =>
+        throw new SparkException(s"Multiple($x) external SparkSubmitOperations " +
+          s"clients registered for master url ${master}.")
+      case 1 => serviceLoaders.headOption.get
+      case _ =>
+        throw new IllegalArgumentException(s"No external SparkSubmitOperations " +
+          s"clients found for master url: '$master'")
+    }
+}
+```
+
 #### SparkSubmitArguments
 
+```scala
+private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, String] = sys.env) extends SparkSubmitArgumentsParser with Logging {
+    介绍: 转换和压缩提交脚本的参数，用于测试
+    属性:
+    #name @master=null	master
+    #name @deployMode: String = null	部署模式
+    #name @executorMemory: String = null	执行器内存
+    #name @executorCores: String = null	执行器核心数量
+    #name @totalExecutorCores: String = null	总计执行器核心数量
+    #name @propertiesFile: String = null	属性文件
+    #name @driverMemory: String = null	执行器内存
+    #name @driverExtraClassPath: String = null	执行器额外类路径
+    #name @driverExtraLibraryPath: String = null	执行器额外库路径
+    #name @driverExtraJavaOptions: String = null	执行器额外java配置
+    #name @queue: String = null	队列
+    #name @numExecutors: String = null	执行器数量
+    #name @files: String = null	文件
+    #name @archives: String = null 打包信息
+    #name @mainClass: String = null	主类
+    #name @primaryResource: String = null	优先资源
+    #name @name: String = null	提交名称
+    #name @childArgs: ArrayBuffer[String] = new ArrayBuffer[String]()	提交子属性
+    #name @jars: String = null	jar包名称
+    #name @packages: String = null	包名称
+    #name @repositories: String = null	库名称
+    #name @ivyRepoPath: String = null	ivy库路径
+    #name @ivySettingsPath: Option[String] = None	ivy配置路径
+    #name @packagesExclusions: String = null	包排除信息
+    #name @verbose: Boolean = false	可见性
+    #name @isPython: Boolean = false	是否是python
+    #name @pyFiles: String = null	python文件
+    #name @isR: Boolean = false 是否为R
+    #name @action: SparkSubmitAction = null	提交动作
+    #name @sparkProperties: HashMap[String, String] = new HashMap[String, String]()	
+    	spark属性表
+    #name @proxyUser: String = null	代理用户
+    #name @principal: String = null	准则
+    #name @keytab: String = null	密钥表
+    #name @dynamicAllocationEnabled: Boolean = false	是否动态分配
+    #name @supervise: Boolean = false	是否监视
+    #name @driverCores: String = null	驱动器核心数量
+    #name @submissionToKill: String = null	需要kill的提交
+    #name @submissionToRequestStatusFor: String = null	需要请求状态的提交
+    #name @useRest: Boolean = false 	是否使用REST服务
+    #name @defaultSparkProperties: HashMap[String, String]	默认spark属性表
+    val= {
+    val defaultProperties = new HashMap[String, String]()
+    if (verbose) {
+      logInfo(s"Using properties file: $propertiesFile")
+    }
+    Option(propertiesFile).foreach { filename =>
+          val properties = Utils.getPropertiesFromFile(filename)
+          properties.foreach { case (k, v) =>
+            defaultProperties(k) = v
+          }
+          if (verbose) {
+            Utils.redact(properties).foreach { case (k, v) =>
+              logInfo(s"Adding default property: $k=$v")
+            }
+          }
+        }
+        defaultProperties
+      }
+    
+    初始化操作:
+    parse(args.asJava)
+    功能: 转换命令行参数
+    
+    mergeDefaultSparkProperties()
+    功能: 合并默认的spark属性
+    
+    ignoreNonSparkProperties()
+    功能: 忽视非spark属性
+    
+    loadEnvironmentArguments()
+    功能: 加载环境变量
+    
+    useRest = sparkProperties.getOrElse("spark.master.rest.enabled", "false").toBoolean
+    功能: 确定是否使用rest服务
+    
+    validateArguments()
+    功能: 参数校验
+    
+    操作集:
+    def ignoreNonSparkProperties(): Unit
+    功能: 忽视非spark属性
+    sparkProperties.keys.foreach { k =>
+      if (!k.startsWith("spark.")) {
+        sparkProperties -= k
+        logWarning(s"Ignoring non-Spark config property: $k")
+      }
+    }
+    
+    def loadEnvironmentArguments(): Unit
+    功能: 加载环境变量
+    master = Option(master)
+      .orElse(sparkProperties.get("spark.master"))
+      .orElse(env.get("MASTER"))
+      .orNull
+    driverExtraClassPath = Option(driverExtraClassPath)
+      .orElse(sparkProperties.get(config.DRIVER_CLASS_PATH.key))
+      .orNull
+    driverExtraJavaOptions = Option(driverExtraJavaOptions)
+      .orElse(sparkProperties.get(config.DRIVER_JAVA_OPTIONS.key))
+      .orNull
+    driverExtraLibraryPath = Option(driverExtraLibraryPath)
+      .orElse(sparkProperties.get(config.DRIVER_LIBRARY_PATH.key))
+      .orNull
+    driverMemory = Option(driverMemory)
+      .orElse(sparkProperties.get(config.DRIVER_MEMORY.key))
+      .orElse(env.get("SPARK_DRIVER_MEMORY"))
+      .orNull
+    driverCores = Option(driverCores)
+      .orElse(sparkProperties.get(config.DRIVER_CORES.key))
+      .orNull
+    executorMemory = Option(executorMemory)
+      .orElse(sparkProperties.get(config.EXECUTOR_MEMORY.key))
+      .orElse(env.get("SPARK_EXECUTOR_MEMORY"))
+      .orNull
+    executorCores = Option(executorCores)
+      .orElse(sparkProperties.get(config.EXECUTOR_CORES.key))
+      .orElse(env.get("SPARK_EXECUTOR_CORES"))
+      .orNull
+    totalExecutorCores = Option(totalExecutorCores)
+      .orElse(sparkProperties.get(config.CORES_MAX.key))
+      .orNull
+    name = Option(name).orElse(sparkProperties.get("spark.app.name")).orNull
+    jars = Option(jars).orElse(sparkProperties.get(config.JARS.key)).orNull
+    files = Option(files).orElse(sparkProperties.get(config.FILES.key)).orNull
+    pyFiles = Option(pyFiles).orElse(sparkProperties.get(config.SUBMIT_PYTHON_FILES.key)).orNull
+    ivyRepoPath = sparkProperties.get("spark.jars.ivy").orNull
+    ivySettingsPath = sparkProperties.get("spark.jars.ivySettings")
+    packages = Option(packages).orElse(sparkProperties.get("spark.jars.packages")).orNull
+    packagesExclusions = Option(packagesExclusions)
+      .orElse(sparkProperties.get("spark.jars.excludes")).orNull
+    repositories = Option(repositories)
+      .orElse(sparkProperties.get("spark.jars.repositories")).orNull
+    deployMode = Option(deployMode)
+      .orElse(sparkProperties.get(config.SUBMIT_DEPLOY_MODE.key))
+      .orElse(env.get("DEPLOY_MODE"))
+      .orNull
+    numExecutors = Option(numExecutors)
+      .getOrElse(sparkProperties.get(config.EXECUTOR_INSTANCES.key).orNull)
+    queue = Option(queue).orElse(sparkProperties.get("spark.yarn.queue")).orNull
+    keytab = Option(keytab)
+      .orElse(sparkProperties.get("spark.kerberos.keytab"))
+      .orElse(sparkProperties.get("spark.yarn.keytab"))
+      .orNull
+    principal = Option(principal)
+      .orElse(sparkProperties.get("spark.kerberos.principal"))
+      .orElse(sparkProperties.get("spark.yarn.principal"))
+      .orNull
+    dynamicAllocationEnabled =
+      sparkProperties.get(DYN_ALLOCATION_ENABLED.key).exists("true".equalsIgnoreCase)
+    master = Option(master).getOrElse("local[*]")
+    if (master.startsWith("yarn")) {
+      name = Option(name).orElse(env.get("SPARK_YARN_APP_NAME")).orNull
+    }
+    name = Option(name).orElse(Option(mainClass)).orNull
+    if (name == null && primaryResource != null) {
+      name = new File(primaryResource).getName()
+    }
+    action = Option(action).getOrElse(SUBMIT)
+    
+    def validateArguments(): Unit
+    功能: 校验参数
+    action match {
+      case SUBMIT => validateSubmitArguments()
+      case KILL => validateKillArguments()
+      case REQUEST_STATUS => validateStatusRequestArguments()
+      case PRINT_VERSION =>
+    }
+    
+    def validateSubmitArguments(): Unit
+    功能: 校验提交参数
+    if (args.length == 0) {
+      printUsageAndExit(-1)
+    }
+    if (primaryResource == null) {
+      error("Must specify a primary resource (JAR or Python or R file)")
+    }
+    if (driverMemory != null
+        && Try(JavaUtils.byteStringAsBytes(driverMemory)).getOrElse(-1L) <= 0) {
+      error("Driver memory must be a positive number")
+    }
+    if (executorMemory != null
+        && Try(JavaUtils.byteStringAsBytes(executorMemory)).getOrElse(-1L) <= 0) {
+      error("Executor memory must be a positive number")
+    }
+    if (executorCores != null && Try(executorCores.toInt).getOrElse(-1) <= 0) {
+      error("Executor cores must be a positive number")
+    }
+    if (totalExecutorCores != null && Try(totalExecutorCores.toInt).getOrElse(-1) <= 0) {
+      error("Total executor cores must be a positive number")
+    }
+    if (!dynamicAllocationEnabled &&
+      numExecutors != null && Try(numExecutors.toInt).getOrElse(-1) <= 0) {
+      error("Number of executors must be a positive number")
+    }
+    if (master.startsWith("yarn")) {
+      val hasHadoopEnv = env.contains("HADOOP_CONF_DIR") || env.contains("YARN_CONF_DIR")
+      if (!hasHadoopEnv && !Utils.isTesting) {
+        error(s"When running with master '$master' " +
+          "either HADOOP_CONF_DIR or YARN_CONF_DIR must be set in the environment.")
+      }
+    }
+    if (proxyUser != null && principal != null) {
+      error("Only one of --proxy-user or --principal can be provided.")
+    }
+    
+    def validateKillArguments(): Unit
+    功能: 校验中断参数
+    if (submissionToKill == null) {
+      error("Please specify a submission to kill.")
+    }
+    
+    def validateStatusRequestArguments(): Unit
+    功能: 校验状态请求参数
+    if (submissionToRequestStatusFor == null) {
+      error("Please specify a submission to request status for.")
+    }
+    
+    def isStandaloneCluster: Boolean
+    功能: 确定是否为独立集群
+    val= master.startsWith("spark://") && deployMode == "cluster"
+    
+    def toString: String
+    功能: 信息显示
+    val= 
+    s"""Parsed arguments:
+    |  master                  $master
+    |  deployMode              $deployMode
+    |  executorMemory          $executorMemory
+    |  executorCores           $executorCores
+    |  totalExecutorCores      $totalExecutorCores
+    |  propertiesFile          $propertiesFile
+    |  driverMemory            $driverMemory
+    |  driverCores             $driverCores
+    |  driverExtraClassPath    $driverExtraClassPath
+    |  driverExtraLibraryPath  $driverExtraLibraryPath
+    |  driverExtraJavaOptions  $driverExtraJavaOptions
+    |  supervise               $supervise
+    |  queue                   $queue
+    |  numExecutors            $numExecutors
+    |  files                   $files
+    |  pyFiles                 $pyFiles
+    |  archives                $archives
+    |  mainClass               $mainClass
+    |  primaryResource         $primaryResource
+    |  name                    $name
+    |  childArgs               [${childArgs.mkString(" ")}]
+    |  jars                    $jars
+    |  packages                $packages
+    |  packagesExclusions      $packagesExclusions
+    |  repositories            $repositories
+    |  verbose                 $verbose
+    |
+    |Spark properties used, including those specified through
+    | --conf and those from the properties file $propertiesFile:
+    |${Utils.redact(sparkProperties).mkString("  ", "\n  ", "\n")}
+    """.stripMargin
+    
+    def handle(opt: String, value: String): Boolean 
+    功能: 处理用户配置
+    opt match {
+      case NAME =>
+        name = value
+      case MASTER =>
+        master = value
+      case CLASS =>
+        mainClass = value
+      case DEPLOY_MODE =>
+        if (value != "client" && value != "cluster") {
+          error("--deploy-mode must be either \"client\" or \"cluster\"")
+        }
+        deployMode = value
+      case NUM_EXECUTORS =>
+        numExecutors = value
+      case TOTAL_EXECUTOR_CORES =>
+        totalExecutorCores = value
+      case EXECUTOR_CORES =>
+        executorCores = value
+      case EXECUTOR_MEMORY =>
+        executorMemory = value
+      case DRIVER_MEMORY =>
+        driverMemory = value
+      case DRIVER_CORES =>
+        driverCores = value
+      case DRIVER_CLASS_PATH =>
+        driverExtraClassPath = value
+      case DRIVER_JAVA_OPTIONS =>
+        driverExtraJavaOptions = value
+      case DRIVER_LIBRARY_PATH =>
+        driverExtraLibraryPath = value
+      case PROPERTIES_FILE =>
+        propertiesFile = value
+      case KILL_SUBMISSION =>
+        submissionToKill = value
+        if (action != null) {
+          error(s"Action cannot be both $action and $KILL.")
+        }
+        action = KILL
+      case STATUS =>
+        submissionToRequestStatusFor = value
+        if (action != null) {
+          error(s"Action cannot be both $action and $REQUEST_STATUS.")
+        }
+        action = REQUEST_STATUS
+      case SUPERVISE =>
+        supervise = true
+      case QUEUE =>
+        queue = value
+      case FILES =>
+        files = Utils.resolveURIs(value)
+      case PY_FILES =>
+        pyFiles = Utils.resolveURIs(value)
+      case ARCHIVES =>
+        archives = Utils.resolveURIs(value)
+      case JARS =>
+        jars = Utils.resolveURIs(value)
+      case PACKAGES =>
+        packages = value
+      case PACKAGES_EXCLUDE =>
+        packagesExclusions = value
+      case REPOSITORIES =>
+        repositories = value
+      case CONF =>
+        val (confName, confValue) = SparkSubmitUtils.parseSparkConfProperty(value)
+        sparkProperties(confName) = confValue
+      case PROXY_USER =>
+        proxyUser = value
+      case PRINCIPAL =>
+        principal = value
+      case KEYTAB =>
+        keytab = value
+      case HELP =>
+        printUsageAndExit(0)
+      case VERBOSE =>
+        verbose = true
+      case VERSION =>
+        action = SparkSubmitAction.PRINT_VERSION
+      case USAGE_ERROR =>
+        printUsageAndExit(1)
+      case _ =>
+        error(s"Unexpected argument '$opt'.")
+    }
+    action != SparkSubmitAction.PRINT_VERSION
+    
+    def handleUnknown(opt: String): Boolean
+    功能: 处理位置命令行配置
+    if (opt.startsWith("-")) {
+      error(s"Unrecognized option '$opt'.")
+    }
+    primaryResource =
+      if (!SparkSubmit.isShell(opt) && !SparkSubmit.isInternal(opt)) {
+        Utils.resolveURI(opt).toString
+      } else {
+        opt
+      }
+    isPython = SparkSubmit.isPython(opt)
+    isR = SparkSubmit.isR(opt)
+    false
+    
+    def handleExtraArgs(extra: JList[String]): Unit
+    功能: 处理额外的参数
+    childArgs ++= extra.asScala
+    
+    def printUsageAndExit(exitCode: Int, unknownParam: Any = null): Unit 
+    功能: 打印使用信息
+    if (unknownParam != null) {
+      logInfo("Unknown/unsupported param " + unknownParam)
+    }
+    val command = sys.env.getOrElse("_SPARK_CMD_USAGE",
+      """Usage: spark-submit [options] <app jar | python file | R file> [app arguments]
+        |Usage: spark-submit --kill [submission ID] --master [spark://...]
+        |Usage: spark-submit --status [submission ID] --master [spark://...]
+        |Usage: spark-submit run-example [options] example-class [example args]""".stripMargin)
+    logInfo(command)
+    val mem_mb = Utils.DEFAULT_DRIVER_MEM_MB
+    logInfo(
+      s"""
+        |Options:
+        |  --master MASTER_URL         spark://host:port, mesos://host:port, yarn,
+        |                              k8s://https://host:port, or local 
+        (Default: local[*]).
+        |  --deploy-mode DEPLOY_MODE   Whether to launch the driver 
+        program locally ("client") or
+        |                              on one of the worker machines 
+        inside the cluster ("cluster")
+        |                              (Default: client).
+        |  --class CLASS_NAME          Your application's main class 
+        (for Java / Scala apps).
+        |  --name NAME                 A name of your application.
+        |  --jars JARS                 Comma-separated list of jars to 
+        include on the driver
+        |                              and executor classpaths.
+        |  --packages                  Comma-separated list of maven coordinates 
+        of jars to include
+        |                              on the driver and executor classpaths. 
+        Will search the local
+        |                              maven repo, then maven central and any 
+        additional remote
+        |                              repositories given by --repositories. 
+        The format for the
+        |                              coordinates should be groupId:artifactId:version.
+        |  --exclude-packages          Comma-separated list of groupId:artifactId, 
+        to exclude while
+        |                              resolving the dependencies provided in 
+        --packages to avoid
+        |                              dependency conflicts.
+        |  --repositories              Comma-separated list of additional 
+        remote repositories to
+        |                              search for the maven coordinates given 
+        with --packages.
+        |  --py-files PY_FILES         Comma-separated list of .zip, .egg, or .py 
+        files to place
+        |                              on the PYTHONPATH for Python apps.
+        |  --files FILES               Comma-separated list of files to 
+        be placed in the working
+        |                              directory of each executor. 
+        File paths of these files
+        |                              in executors can be accessed 
+        via SparkFiles.get(fileName).
+        |
+        |  --conf PROP=VALUE           Arbitrary Spark configuration property.
+        |  --properties-file FILE      Path to a file from which to load 
+        extra properties. If not
+        |                              specified, this will look for 
+        conf/spark-defaults.conf.
+        |
+        |  --driver-memory MEM         Memory for driver (e.g. 1000M, 2G) 
+        (Default: ${mem_mb}M).
+        |  --driver-java-options       Extra Java options to pass to the driver.
+        |  --driver-library-path       Extra library path entries to pass to the driver.
+        |  --driver-class-path         Extra class path entries to pass to the 
+        driver. Note that
+        |                              jars added with --jars are automatically 
+        included in the
+        |                              classpath.
+        |
+        |  --executor-memory MEM       Memory per executor (e.g. 1000M, 2G)
+        (Default: 1G).
+        |
+        |  --proxy-user NAME           User to impersonate when submitting 
+        the application.
+        |                              This argument does not work with 
+        --principal / --keytab.
+        |
+        |  --help, -h                  Show this help message and exit.
+        |  --verbose, -v               Print additional debug output.
+        |  --version,                  Print the version of current Spark.
+        |
+        | Cluster deploy mode only:
+        |  --driver-cores NUM          Number of cores used by the driver, 
+        only in cluster mode
+        |                              (Default: 1).
+        |
+        | Spark standalone or Mesos with cluster deploy mode only:
+        |  --supervise                 If given, restarts the driver on failure.
+        |
+        | Spark standalone, Mesos or K8s with cluster deploy mode only:
+        |  --kill SUBMISSION_ID        If given, kills the driver specified.
+        |  --status SUBMISSION_ID      If given, requests the status of 
+        the driver specified.
+        |
+        | Spark standalone, Mesos and Kubernetes only:
+        |  --total-executor-cores NUM  Total cores for all executors.
+        |
+        | Spark standalone, YARN and Kubernetes only:
+        |  --executor-cores NUM        Number of cores used by each executor. 
+        (Default: 1 in
+        |                              YARN and K8S modes, or all available 
+        cores on the worker
+        |                              in standalone mode).
+        |
+        | Spark on YARN and Kubernetes only:
+        |  --num-executors NUM         Number of executors to launch (Default: 2).
+        |                              If dynamic allocation is enabled, 
+        the initial number of
+        |                              executors will be at least NUM.
+        |  --principal PRINCIPAL       Principal to be used to login to KDC.
+        |  --keytab KEYTAB             The full path to the file 
+        that contains the keytab for the
+        |                              principal specified above.
+        |
+        | Spark on YARN only:
+        |  --queue QUEUE_NAME          The YARN queue to submit to (Default: "default").
+        |  --archives ARCHIVES         Comma separated list of archives
+        to be extracted into the
+        |                              working directory of each executor.
+      """.stripMargin
+    )
+    if (SparkSubmit.isSqlShell(mainClass)) {
+      logInfo("CLI options:")
+      logInfo(getSqlShellOptions())
+    }
+    throw new SparkUserAppException(exitCode)
+    
+    def getSqlShellOptions(): String
+    功能: 使用spark sql命令行使用`--help`配置,并捕获输出,过滤不需要的行
+    val currentOut = System.out
+    val currentErr = System.err
+    val currentSm = System.getSecurityManager()
+    try {
+      val out = new ByteArrayOutputStream()
+      val stream = new PrintStream(out)
+      System.setOut(stream)
+      System.setErr(stream)
+      val sm = new SecurityManager() {
+        override def checkExit(status: Int): Unit = {
+          throw new SecurityException()
+        }
+        override def checkPermission(perm: java.security.Permission): Unit = {}
+      }
+      System.setSecurityManager(sm)
+
+      try {
+        Utils.classForName(mainClass).getMethod("main", classOf[Array[String]])
+          .invoke(null, Array(HELP))
+      } catch {
+        case e: InvocationTargetException =>
+          if (!e.getCause().isInstanceOf[SecurityException]) {
+            throw e
+          }
+      }
+      stream.flush()
+      Source.fromString(new String(out.toByteArray(), StandardCharsets.UTF_8)).getLines
+        .filter { line =>
+          !line.startsWith("log4j") && !line.startsWith("usage")
+        }
+        .mkString("\n")
+    } finally {
+      System.setSecurityManager(currentSm)
+      System.setOut(currentOut)
+      System.setErr(currentErr)
+    }
+    
+    def error(msg: String): Unit = throw new SparkException(msg)
+    功能: 获取错误信息
+    
+    def toSparkConf(sparkConf: Option[SparkConf] = None): SparkConf
+    功能: 转化为spark配置信息
+    val= sparkProperties.foldLeft(sparkConf.getOrElse(new SparkConf())) {
+      case (conf, (k, v)) => conf.set(k, v)
+    }
+}
+```
+
 #### StandaloneResourceUtils
+
+```scala
+private[spark] object StandaloneResourceUtils extends Logging {
+    介绍: 独立运行资源工具类
+    #name @SPARK_RESOURCES_COORDINATE_DIR = "spark-resources"	spark资源协调目录
+    #name @ALLOCATED_RESOURCES_FILE = "__allocated_resources__.json"	资源分配文件
+    #name @RESOURCES_LOCK_FILE = "__allocated_resources__.lock"	资源锁文件
+    操作集:
+    
+}
+```
+
+
 
 #### 基础拓展
 
