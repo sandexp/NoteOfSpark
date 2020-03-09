@@ -256,6 +256,1277 @@ private[spark] trait StandaloneAppClientListener {
 
 #### history
 
+##### ApplicationCache
+
+```scala
+private[history] class ApplicationCache(
+    val operations: ApplicationCacheOperations,
+    val retainedApplications: Int,
+    val clock: Clock) extends Logging {
+    介绍: 应用UI的缓存,只要有足够的空间,就会缓存应用,参考@LoadedAppUI对UI生命周期的描述
+    构造器参数:
+    	operations	通过操作对记录的实现
+    	retainedApplications	剩余应用的数量
+    	clock	时钟
+    属性:
+    #name @appLoader = new CacheLoader[CacheKey, CacheEntry] 	应用缓存加载器
+    val= new CacheLoader[CacheKey, CacheEntry] {
+        // 缓存key不存在,或者是键值对过期了(被移除缓存区),加载即可
+        override def load(key: CacheKey): CacheEntry = {
+          loadApplicationEntry(key.appId, key.attemptId)
+        }
+    }
+    #name @removalListener	用于移除的监听器
+    val= new RemovalListener[CacheKey, CacheEntry] {
+        // 移除事件,提醒provider与UI断开连接
+        override def onRemoval(rm: RemovalNotification[CacheKey, CacheEntry]): Unit = {
+          metrics.evictionCount.inc()
+          val key = rm.getKey
+          logDebug(s"Evicting entry ${key}")
+          operations.detachSparkUI(key.appId, key.attemptId, rm.getValue().loadedUI.ui)
+        }
+    }
+    #name @appCache: LoadingCache[CacheKey, CacheEntry]	应用缓存
+    val= CacheBuilder.newBuilder()
+        .maximumSize(retainedApplications)
+        .removalListener(removalListener)
+        .build(appLoader)
+    #name @metrics = new CacheMetrics("history.cache")	缓存度量器
+    操作集:
+    def get(appId: String, attemptId: Option[String] = None): CacheEntry
+    功能: 获取有(appId,attemptId)组成缓存key的缓存Entry
+    val= try {
+      appCache.get(new CacheKey(appId, attemptId))
+    } catch {
+      case e @ (_: ExecutionException | _: UncheckedExecutionException) =>
+        throw Option(e.getCause()).getOrElse(e)
+    }
+    
+    def withSparkUI[T](appId: String, attemptId: Option[String])(fn: SparkUI => T): T 
+    功能: 当处理UI读取锁的时候运行闭包,组织历史服务器在使用的时候关闭UI数据存储
+    1. 获取entry
+    var entry = get(appId, attemptId)
+    2. 需要使用合法的entry运行闭包,所以需要重试直到获取一个可用的entry
+    entry.loadedUI.lock.readLock().lock()
+    try {
+      while (!entry.loadedUI.valid) {
+        entry.loadedUI.lock.readLock().unlock()
+        entry = null
+        try {
+          invalidate(new CacheKey(appId, attemptId))
+          entry = get(appId, attemptId)
+          metrics.loadCount.inc()
+        } finally {
+          if (entry != null) {
+            entry.loadedUI.lock.readLock().lock()
+          }
+        }
+      }
+      fn(entry.loadedUI.ui)
+    } finally {
+      if (entry != null) {
+        entry.loadedUI.lock.readLock().unlock()
+      }
+    }
+    
+    def size(): Long = appCache.size()
+    功能: 获取缓存UI的大小
+    
+    def time[T](t: Timer)(f: => T): T 
+    功能: 获取计时器时间,并执行函数@f
+    val timeCtx = t.time()
+    try {
+      f
+    } finally {
+      timeCtx.close()
+    }
+    
+    @throws[NoSuchElementException]
+    def loadApplicationEntry(appId: String, attemptId: Option[String]): CacheEntry	
+    功能: 加载应用条目
+    如果应用没有完成,使用@ApplicationCacheCheckFilter 将过滤器添加到HTTP请求中去,所以访问UI会触发更新检查,产生的条目包含UI和时间戳信息,计时器@metrics.loadT可以定位加载UI的时机.
+    1. 更新加载次数
+    metrics.loadCount.inc()
+    2. 加载UI
+    val loadedUI = time(metrics.loadTimer) {
+      metrics.lookupCount.inc()
+      operations.getAppUI(appId, attemptId) match {
+        case Some(loadedUI) =>
+          logDebug(s"Loaded application $appId/$attemptId")
+          loadedUI
+        case None =>
+          metrics.lookupFailureCount.inc()
+          logInfo(s"Failed to load application attempt $appId/$attemptId")
+          throw new NoSuchElementException(s"no application 
+          with application Id '$appId'" +
+          attemptId.map { id => s" attemptId '$id'" }.getOrElse(" and no attempt Id"))
+      }
+    }
+    3. 连接sparkUI
+    try {
+      val completed = 
+        loadedUI.ui.getApplicationInfoList.exists(_.attempts.last.completed)
+      if (!completed) {
+        registerFilter(new CacheKey(appId, attemptId), loadedUI)
+      }
+      operations.attachSparkUI(appId, attemptId, loadedUI.ui, completed)
+      new CacheEntry(loadedUI, completed)
+    } catch {
+      case e: Exception =>
+        logWarning(s"Failed to initialize application UI for $appId/$attemptId", e)
+        operations.detachSparkUI(appId, attemptId, loadedUI.ui)
+        throw e
+    }
+    
+    def toString: String
+    功能: 信息显示
+    val sb = new StringBuilder(s"ApplicationCache(" +
+          s" retainedApplications= $retainedApplications)")
+    sb.append(s"; time= ${clock.getTimeMillis()}")
+    sb.append(s"; entry count= ${appCache.size()}\n")
+    sb.append("----\n")
+    appCache.asMap().asScala.foreach {
+      case(key, entry) => sb.append(s"  $key -> $entry\n")
+    }
+    sb.append("----\n")
+    sb.append(metrics)
+    sb.append("----\n")
+    val= sb.toString()
+    
+    def invalidate(key: CacheKey): Unit = appCache.invalidate(key)
+    功能: 使指定的key无效
+    
+    def registerFilter(key: CacheKey, loadedUI: LoadedAppUI): Unit
+    功能: 注册过滤器,用于WEBUI检查给定应用/请求的更新
+    require(loadedUI != null)
+    val enumDispatcher = java.util.EnumSet.of(
+        DispatcherType.ASYNC, DispatcherType.REQUEST)
+    val filter = new ApplicationCacheCheckFilter(key, loadedUI, this)
+    val holder = new FilterHolder(filter)
+    require(loadedUI.ui.getHandlers != null, "null handlers")
+    loadedUI.ui.getHandlers.foreach { handler =>
+      handler.addFilter(holder, "/*", enumDispatcher)
+    }
+}
+```
+
+```scala
+private[history] final class CacheEntry(
+    val loadedUI: LoadedAppUI,
+    val completed: Boolean) {
+    介绍: 缓存的entry
+    构造器参数:
+    	loadUI	sparkUI
+    	completed	任务完成标记
+    def toString: String 
+    功能: 信息显示,用户测试
+    val= s"UI ${loadedUI.ui}, completed=$completed"
+}
+
+private[history] final case class CacheKey(appId: String, attemptId: Option[String]) {
+    介绍: 缓存key,比较appId,然后比较@attemptId
+    def toString: String
+    功能: 信息显示
+    val= appId + attemptId.map { id => s"/$id" }.getOrElse("")
+}
+```
+
+```scala
+private[history] class CacheMetrics(prefix: String) extends Source {
+    介绍: 缓存度量器
+    属性:
+    #name @lookupCount = new Counter()	查找计数器
+    #name @lookupFailureCount = new Counter()	查找失败计数器
+    #name @evictionCount = new Counter()	回收计数器
+    #name @loadCount = new Counter()	加载计数器
+    #name @loadTimer = new Timer()	加载计时器
+    #name @counters	计数器表
+    val= ("lookup.count", lookupCount),
+   		("lookup.failure.count", lookupFailureCount),
+    	("eviction.count", evictionCount),
+    	("load.count", loadCount))
+    #name @allMetrics	所有度量器(包含计时器)
+    val= counters ++ Seq(("load.timer", loadTimer))
+    #name @sourceName = "ApplicationCache"	资源名称
+    #name @metricRegistry: MetricRegistry = new MetricRegistry	度量注册器
+    操作集:
+    def toString: String
+    功能: 信息显示
+    val sb = new StringBuilder()
+    counters.foreach { case (name, counter) =>
+      sb.append(name).append(" = ").append(counter.getCount).append('\n')
+    }
+    val= sb.toString()
+    
+    def init(): Unit 
+    功能: 初始化度量器,注册所有度量属性
+    allMetrics.foreach { case (name, metric) =>
+      metricRegistry.register(MetricRegistry.name(prefix, name), metric)
+    }
+}
+```
+
+```scala
+private[history] trait ApplicationCacheOperations {
+    介绍: 应用缓存操作
+    def getAppUI(appId: String, attemptId: Option[String]): Option[LoadedAppUI]
+    功能: 获取应用UI,且会探测是否需要更新
+    
+    def attachSparkUI(
+      appId: String,
+      attemptId: Option[String],
+      ui: SparkUI,
+      completed: Boolean): Unit
+   功能: 连接重构的sparkUI
+    
+   def detachSparkUI(appId: String, attemptId: Option[String], ui: SparkUI): Unit
+   功能: 断开sparkUI的连接
+}
+```
+
+```scala
+private[history] class ApplicationCacheCheckFilter(
+    key: CacheKey,
+    loadedUI: LoadedAppUI,
+    cache: ApplicationCache)
+extends Filter with Logging {
+    介绍: 应用缓存检查过滤器
+    这个服务程序过滤器,会拦截应用UI上的HTTP请求.且会触发数据的更新.
+    如果应用缓存表明了应用需要更新,过滤器会返回一个302,去重定向调用,询问去重新请求Web页面.调用者重复请求时,应用缓存会断开并重新连接UI,会获取新更新的web应用.
+    这个需要调用者去处理302请求,由于POST,PUT请求的不确定性,过滤器不会过滤这些请求.由于当前webUI是只读的,并不会存在这个问题.可能比起发送重定向,简简单单的更新value以便于获取下一个值更好.
+    构造器参数:
+    	key	缓存key
+    	loadUI	sparkUI
+    	cache	应用缓存
+    操作集:
+    def init(config: FilterConfig): Unit = { }
+    功能: 过滤器初始化
+    
+    def destroy(): Unit = { }
+    功能: 销毁过滤器
+    
+    def doFilter(
+      request: ServletRequest,
+      response: ServletResponse,
+      chain: FilterChain): Unit
+    功能: 过滤请求
+    输入参数:
+    	request	HTTP请求
+    	response	HTTP响应
+    	chain	过滤链
+    0. 请求类型校验
+    if (!(request.isInstanceOf[HttpServletRequest])) {
+      throw new ServletException("This filter only works for HTTP/HTTPS")
+    }
+    1. 获取请求信息
+    val httpRequest = request.asInstanceOf[HttpServletRequest]
+    val httpResponse = response.asInstanceOf[HttpServletResponse]
+    val requestURI = httpRequest.getRequestURI
+    val operation = httpRequest.getMethod
+    2. 检查是否需要删除或刷新UI
+    loadedUI.lock.readLock().lock()
+    if (loadedUI.valid) {
+      try {
+        chain.doFilter(request, response)
+      } finally {
+        loadedUI.lock.readLock.unlock()
+      }
+    } else {
+      loadedUI.lock.readLock.unlock()
+      cache.invalidate(key)
+      val queryStr = Option(httpRequest.getQueryString).map("?" + _).getOrElse("")
+      val redirectUrl = httpResponse.encodeRedirectURL(requestURI + queryStr)
+      httpResponse.sendRedirect(redirectUrl)
+    }
+}
+```
+
+##### ApplicationHistoryProvider
+
+```scala
+private[history] abstract class ApplicationHistoryProvider {
+    介绍: 应用历史提供程序
+    操作集:
+    def getEventLogsUnderProcess(): Int =0 
+    功能 获取进程的事件日志
+    返回应用事件日志的数量,这个提供程序当前仍然处于运行状态,历史服务器UI可以使用这个去向用户表明应用在UI的监视返回内部.可以列举额外的已知的应用(当应用事件日志完成时).
+    
+    def getLastUpdatedTime(): Long=0
+    功能: 获取上次更新时间
+    
+    def getListing(): Iterator[ApplicationInfo]
+    功能: 获取应用显示列表
+    
+    def getAppUI(appId: String, attemptId: Option[String]): Option[LoadedAppUI]
+    功能: 获取sparkUI
+    
+    def stop(): Unit = { }
+    功能: 停止提供程序
+    
+    def start(): Unit = { }
+    功能: 启动提供程序,这个函数的实现需要初始化提供函数且启动后台线程,在创建之后进行启动
+    
+    def getConfig(): Map[String, String] = Map()
+    功能: 获取历史服务器主页的配置数据
+    
+    @throws(classOf[SparkException])
+    def writeEventLogs(appId: String, attemptId: Option[String], zipStream: ZipOutputStream): Unit
+    功能: 写出事件日志到指定的输出流中@zipStream,日志会使用zip进行压缩
+    
+    def getApplicationInfo(appId: String): Option[ApplicationInfo]
+    功能: 获取应用信息
+    
+    def getEmptyListingHtml(): Seq[Node] = Seq.empty
+    功能: 获取空的html文本列表
+    
+    def onUIDetached(appId: String, attemptId: Option[String], ui: SparkUI): Unit = { }
+    功能: 当退出UI时的处理
+}
+```
+
+##### EventLogFileReader
+
+```scala
+abstract class EventLogFileReader(
+    protected val fileSystem: FileSystem,
+    val rootPath: Path){
+    介绍: 事件日志文件读取器
+    构造器参数:
+    	fileSystem	文件系统
+    	rootPath	根路径
+    操作集:
+    def fileSizeForDFS(path: Path): Option[Long]
+    功能: 获取指定路径@path的分布式文件大小
+    Utils.tryWithResource(fileSystem.open(path)) { in =>
+      in.getWrappedStream match {
+        case dfsIn: DFSInputStream => Some(dfsIn.getFileLength)
+        case _ => None
+      }
+    }
+    
+    def addFileAsZipEntry(
+      zipStream: ZipOutputStream,
+      path: Path,
+      entryName: String): Unit
+    功能: 作为压缩的entry添加文件
+    Utils.tryWithResource(fileSystem.open(path, 1 * 1024 * 1024)) { inputStream =>
+      zipStream.putNextEntry(new ZipEntry(entryName))
+      ByteStreams.copy(inputStream, zipStream)
+      zipStream.closeEntry()
+    }
+    
+    def lastIndex: Option[Long]
+    功能: 获取日志文件中最后一个索引,单个日志文件时为None
+    
+    def fileSizeForLastIndex: Long
+    功能: 获取最后一个索引文件的大小
+    
+    def completed: Boolean
+    功能: 确定任务是否完成
+    
+    def modificationTime: Long
+    功能: 获取修改时间
+    
+    def fileSizeForLastIndexForDFS: Option[Long]
+    功能: 获取最后一个文件的文件大小(分布式情况下)
+    
+    def zipEventLogFiles(zipStream: ZipOutputStream): Unit
+    功能: 压缩事件日志文件,使用指定的压缩输出流@zipStream
+    
+    def listEventLogFiles: Seq[FileStatus]
+    功能: 返回所有的事件日志文件
+    
+    def compressionCodec: Option[String]
+    功能: 返回端压缩名称
+    
+    def totalSize: Long
+    功能: 获取事件日志文件的总大小
+}
+```
+
+```scala
+object EventLogFileReader {
+    属性:
+    #name @codecMap = new ConcurrentHashMap[String, CompressionCodec]()	压缩方式查找表
+    	主要避免了多次创建
+    操作集:
+    def apply(
+      fs: FileSystem,
+      path: Path,
+      lastIndex: Option[Long]): EventLogFileReader
+    功能: 获取事件日志实例
+    val= lastIndex match {
+      case Some(_) => new RollingEventLogFilesFileReader(fs, path)
+      case None => new SingleFileEventLogFileReader(fs, path)
+    }
+    
+    def apply(fs: FileSystem, path: Path): Option[EventLogFileReader] 
+    功能: 同上
+    val= apply(fs, fs.getFileStatus(path))
+    
+    def apply(fs: FileSystem, status: FileStatus): Option[EventLogFileReader] 
+    功能: 同上
+    val= if (isSingleEventLog(status)) {
+      Some(new SingleFileEventLogFileReader(fs, status.getPath))
+    } else if (isRollingEventLogs(status)) {
+      Some(new RollingEventLogFilesFileReader(fs, status.getPath))
+    } else {
+      None
+    }
+    
+    def openEventLog(log: Path, fs: FileSystem): InputStream
+    功能: 开启事件日志,返回包含事件数据的输入流
+    val in = new BufferedInputStream(fs.open(log))
+    try {
+      val codec = codecName(log).map { c =>
+        codecMap.computeIfAbsent(c, CompressionCodec.createCodec(new SparkConf, _))
+      }
+      codec.map(_.compressedContinuousInputStream(in)).getOrElse(in)
+    } catch {
+      case e: Throwable =>
+        in.close()
+        throw e
+    }
+    
+    def isSingleEventLog(status: FileStatus): Boolean
+    功能: 确定是否为单个事件日志
+    val= !status.isDirectory && !status.getPath.getName.startsWith(".")
+    
+    def isRollingEventLogs(status: FileStatus): Boolean
+    功能: 确定是否轮询事件日志
+    val= RollingEventLogFilesWriter.isEventLogDir(status)
+}
+```
+
+```scala
+class SingleFileEventLogFileReader(
+    fs: FileSystem,
+    path: Path) extends EventLogFileReader(fs, path) {
+    介绍: 单个文件事件日志阅读器
+    这个阅读器会读取单个事件日志文件的信息,只有在需要的时候才会获取事件日志的状态.可以并发改变的时候,会给出`live`状态,在获取状态之前修改日志名称会抛出异常.
+    构造器参数:
+    	fs	文件系统
+    	path	事件日志路径
+    属性:
+    #name @status = fileSystem.getFileStatus(rootPath)	lazy	文件状态
+    操作集:
+    def lastIndex: Option[Long] = None
+    功能: 获取最后一个文件所以,单文件,所以为None
+    
+    def fileSizeForLastIndex: Long = status.getLen
+    功能: 获取最后一个文件的大小
+    
+    def completed: Boolean = !rootPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS)
+    功能: 确定任务是否完成
+    
+    def modificationTime: Long = status.getModificationTime
+    功能: 获取修改时间
+    
+    def listEventLogFiles: Seq[FileStatus] = Seq(status)
+    功能: 列举事件日志文件
+    
+    def compressionCodec: Option[String] = EventLogFileWriter.codecName(rootPath)
+    功能: 获取采样压缩名称
+    
+    def totalSize: Long = fileSizeForLastIndex
+    功能: 获取文件总大小
+    
+    def zipEventLogFiles(zipStream: ZipOutputStream): Unit
+    功能: 压缩事件日志文件
+    addFileAsZipEntry(zipStream, rootPath, rootPath.getName)
+    
+    def fileSizeForLastIndexForDFS: Option[Long]
+    功能: 获取DFS最后一个文件大小
+    val= if (completed) {
+      Some(fileSizeForLastIndex)
+    } else {
+      fileSizeForDFS(rootPath)
+    }
+}
+```
+
+```scala
+class RollingEventLogFilesFileReader(
+    fs: FileSystem,
+    path: Path) extends EventLogFileReader(fs, path) {
+    介绍: 从多个滚动的事件日志中读取
+    属性:
+    #name @files: Seq[FileStatus] 	lazy	文件列表
+    val= {
+        import RollingEventLogFilesWriter._
+        val ret = fs.listStatus(rootPath).toSeq
+        require(ret.exists(isEventLogFile), "Log directory must contain 
+        at least one event log file!")
+        require(ret.exists(isAppStatusFile), "Log directory must contain 
+        an appstatus file!")
+        val= ret
+    }
+    #name @appStatusFile = files.find(isAppStatusFile).get	lazy	获取应用文件状态
+    #name @eventLogFiles: Seq[FileStatus]	获取事件日志文件列表
+    val= {
+        val eventLogFiles = files.filter(isEventLogFile).sortBy { status =>
+            getIndex(status.getPath.getName)
+        }
+        val indices = eventLogFiles.map { file => getIndex(file.getPath.getName) }.sorted
+        require((indices.head to indices.last) == indices, "Found missing event log file,
+    expected" +s" indices: ${(indices.head to indices.last)}, actual: ${indices}")
+        val= eventLogFiles
+    }
+    操作集:
+    def lastIndex: Option[Long] = Some(getIndex(lastEventLogFile.getPath.getName))
+    功能: 获取最后一个文件
+    
+    def fileSizeForLastIndex: Long = lastEventLogFile.getLen
+    功能: 获取最后一个文件长度
+    
+    def completed: Boolean
+    功能: 确定任务是否完成
+    val= !appStatusFile.getPath.getName.endsWith(EventLogFileWriter.IN_PROGRESS)
+    
+    def fileSizeForLastIndexForDFS: Option[Long]
+    功能: 获取DFS文件系统中最后一个文件的大小
+    val= if (completed) {
+      Some(fileSizeForLastIndex)
+    } else {
+      fileSizeForDFS(lastEventLogFile.getPath)
+    }
+    
+    def modificationTime: Long = lastEventLogFile.getModificationTime
+    功能: 获取修改时间
+    
+    def zipEventLogFiles(zipStream: ZipOutputStream): Unit
+    功能: 压缩事件日志文件,使用指定输出流@zipStream
+    val dirEntryName = rootPath.getName + "/"
+    zipStream.putNextEntry(new ZipEntry(dirEntryName))
+    files.foreach { file =>
+      addFileAsZipEntry(zipStream, file.getPath, dirEntryName + file.getPath.getName)
+    }
+    
+    def listEventLogFiles: Seq[FileStatus] = eventLogFiles
+    功能: 列举事件日志文件
+    
+    def compressionCodec: Option[String]
+    功能: 获取压缩方式名称
+    val= EventLogFileWriter.codecName(eventLogFiles.head.getPath)
+    
+    def totalSize: Long = eventLogFiles.map(_.getLen).sum
+    功能: 获取文件总大小
+    
+    def lastEventLogFile: FileStatus = eventLogFiles.last
+    功能: 获取上一个日志文件状态
+}
+```
+
+##### EventLogFileWriter
+
+```markdown
+介绍:
+ 	写出事件日志到文件中的基本写出器,下述参数配置可以调和写出行为:
+ 	1. spark.eventLog.compress	是否压缩事件日志文件
+ 	2. spark.eventLog.compression.codec	压缩事件日志文件的压缩形式
+ 	3. spark.eventLog.overwrite	是否覆盖到存在的文件中
+ 	4. spark.eventLog.buffer.kb	写出到输出流的缓冲区大小
+```
+
+```scala
+abstract class EventLogFileWriter(
+    appId: String,
+    appAttemptId : Option[String],
+    logBaseDir: URI,
+    sparkConf: SparkConf,
+    hadoopConf: Configuration) extends Logging {
+    构造器参数:
+    	appId	应用编号
+    	appAttemptId	应用请求号
+    	logBaseDir	日志基本目录
+    	sparkConf	spark配置
+    	hadoopConf	hadoop配置
+    属性:
+    #name @shouldCompress = sparkConf.get(EVENT_LOG_COMPRESS)	是否需要压缩
+    #name @shouldOverwrite = sparkConf.get(EVENT_LOG_OVERWRITE)	是否需要覆盖
+    #name @outputBufferSize=sparkConf.get(EVENT_LOG_OUTPUT_BUFFER_SIZE).toInt 输出缓冲区大小
+    #name @fileSystem = Utils.getHadoopFileSystem(logBaseDir, hadoopConf)	文件系统
+    #name @compressionCodec	压缩方式
+    val= if (shouldCompress) {
+      Some(CompressionCodec.createCodec(
+          sparkConf, sparkConf.get(EVENT_LOG_COMPRESSION_CODEC)))
+    } else {
+      None
+    }
+    #name @compressionCodecName	压缩名称
+    val= compressionCodec.map { c =>
+        CompressionCodec.getShortName(c.getClass.getName)
+      }
+    #name @hadoopDataStream: Option[FSDataOutputStream] = None	hadoop数据输出流
+    #name @writer: Option[PrintWriter] = None	写出器
+    操作集:
+    def requireLogBaseDirAsDirectory(): Unit
+    功能: 基本日志目录的校验
+    if (!fileSystem.getFileStatus(new Path(logBaseDir)).isDirectory) {
+      throw new IllegalArgumentException(s"Log directory $logBaseDir is not 
+      a directory.")
+    }
+    
+    def initLogFile(path: Path)(fnSetupWriter: OutputStream => PrintWriter): Unit
+    功能: 初始化日志文件
+    if (shouldOverwrite && fileSystem.delete(path, true)) {
+      logWarning(s"Event log $path already exists. Overwriting...")
+    }
+    val defaultFs = FileSystem.getDefaultUri(hadoopConf).getScheme
+    val isDefaultLocal = defaultFs == null || defaultFs == "file"
+    val uri = path.toUri
+    val dstream =
+      if ((isDefaultLocal && uri.getScheme == null) || uri.getScheme == "file") {
+        new FileOutputStream(uri.getPath)
+      } else {
+        hadoopDataStream = Some(
+          SparkHadoopUtil.createFile(
+              fileSystem, path, sparkConf.get(EVENT_LOG_ALLOW_EC)))
+        hadoopDataStream.get
+      }
+    try {
+      val cstream = compressionCodec.map(_.compressedContinuousOutputStream(dstream))
+        .getOrElse(dstream)
+      val bstream = new BufferedOutputStream(cstream, outputBufferSize)
+      fileSystem.setPermission(path, EventLogFileWriter.LOG_FILE_PERMISSIONS)
+      logInfo(s"Logging events to $path")
+      writer = Some(fnSetupWriter(bstream))
+    } catch {
+      case e: Exception =>
+        dstream.close()
+        throw e
+    }
+    
+    def writeJson(json: String, flushLogger: Boolean = false): Unit
+    功能: 写出json
+    writer.foreach(_.println(json))
+    if (flushLogger) {
+      writer.foreach(_.flush())
+      hadoopDataStream.foreach(_.hflush())
+    }
+    
+    def closeWriter(): Unit =writer.foreach(_.close())
+    功能: 关闭写出器
+    
+    def renameFile(src: Path, dest: Path, overwrite: Boolean): Unit
+    功能: 重命名文件
+    if (fileSystem.exists(dest)) {
+      if (overwrite) {
+        logWarning(s"Event log $dest already exists. Overwriting...")
+        if (!fileSystem.delete(dest, true)) {
+          logWarning(s"Error deleting $dest")
+        }
+      } else {
+        throw new IOException(s"Target log file already exists ($dest)")
+      }
+    }
+    fileSystem.rename(src, dest)
+    try {
+      fileSystem.setTimes(dest, System.currentTimeMillis(), -1)
+    } catch {
+      case e: Exception => logDebug(s"failed to set time of $dest", e)
+    }
+    
+    def start(): Unit
+    功能: 启动写出器,用于事件日志记录
+    
+    def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit
+    功能: 写出json形式的事件到文件中
+    
+    def stop(): Unit
+    功能: 停止写出器
+    
+    def logPath: String
+    功能: 返回记录路径
+}
+```
+
+```scala
+object EventLogFileWriter {
+    #name @IN_PROGRESS = ".inprogress"	进程内标志
+    #name @LOG_FILE_PERMISSIONS = new FsPermission(Integer.parseInt("770", 8).toShort)
+    	日志文件权限
+    操作集:
+    def apply(
+      appId: String,
+      appAttemptId: Option[String],
+      logBaseDir: URI,
+      sparkConf: SparkConf,
+      hadoopConf: Configuration): EventLogFileWriter
+    功能: 获取日志文件写出器
+    val= if (sparkConf.get(EVENT_LOG_ENABLE_ROLLING)) {
+      new RollingEventLogFilesWriter(
+          appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
+    } else {
+      new SingleEventLogFileWriter(
+          appId, appAttemptId, logBaseDir, sparkConf, hadoopConf)
+    }
+    
+    def nameForAppAndAttempt(appId: String, appAttemptId: Option[String]): String
+    功能: 应用和请求的名称
+    val= {
+        val base = Utils.sanitizeDirName(appId)
+        if (appAttemptId.isDefined) {
+          base + "_" + Utils.sanitizeDirName(appAttemptId.get)
+        } else {
+          base
+        }
+      }
+    
+    def codecName(log: Path): Option[String]
+    功能: 获取压缩名称
+    val logName = log.getName.stripSuffix(IN_PROGRESS)
+    val= logName.split("\\.").tail.lastOption
+}
+```
+
+```scala
+class SingleEventLogFileWriter(
+    appId: String,
+    appAttemptId : Option[String],
+    logBaseDir: URI,
+    sparkConf: SparkConf,
+    hadoopConf: Configuration)
+  extends EventLogFileWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf) {
+      介绍: 写出事件日志到单个文件的写出器
+      属性:
+      #name @logPath: String 	日志路径
+      val= SingleEventLogFileWriter.getLogPath(logBaseDir, appId,
+    appAttemptId, compressionCodecName)
+      #name @inProgressPath = logPath + EventLogFileWriter.IN_PROGRESS	进程内路径
+      操作集:
+      def start(): Unit
+      功能: 启动写出器
+      requireLogBaseDirAsDirectory()
+      initLogFile(new Path(inProgressPath)) { os =>
+          new PrintWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8))
+      }
+      
+      def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit 
+      功能: 写出事件,按照json格式写出
+      writeJson(eventJson, flushLogger)
+      
+      def stop(): Unit 
+      功能: 停止写出器
+      closeWriter()
+      renameFile(new Path(inProgressPath), new Path(logPath), shouldOverwrite)    
+  }
+```
+
+```scala
+object SingleEventLogFileWriter {
+    def getLogPath(
+      logBaseDir: URI,
+      appId: String,
+      appAttemptId: Option[String],
+      compressionCodecName: Option[String] = None): String
+    功能: 获取日志路径
+    返回系统安全的路径,用于给指定的应用记录日志,注意由于当前仅仅创建了一个日志文件,不想对所有信息进行加密,需要对文件名进行加密,而非是文件本身.否则,如果文件被压缩,就不会直到使用哪种压缩方式去解压元数据了.
+    日志文件会辨识压缩方式,例如,app_123是一个非压缩文件,app_123.lzf是一个lzf压缩文件.
+    val codec = compressionCodecName.map("." + _).getOrElse("")
+    val= new Path(logBaseDir).toString.stripSuffix("/") + "/" +
+      EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId) + codec
+}
+```
+
+```scala
+class RollingEventLogFilesWriter(
+    appId: String,
+    appAttemptId : Option[String],
+    logBaseDir: URI,
+    sparkConf: SparkConf,
+    hadoopConf: Configuration)
+  extends EventLogFileWriter(appId, appAttemptId, logBaseDir, sparkConf, hadoopConf) {
+      介绍: 滚动日志文件写出器
+      写出器会写出事件日志到多个日志文件中,在指定范围内滚动,这个类对每个应用创建了一个目录,存储日志文件的同时存储了元数据信息.目录名称和目录中的文件会遵循如下规则:
+      - 目录名称: eventlog_v2_appId(_[appAttemptId])
+      - 日志文件前缀名称: events_[index]_[appId](_[appAttemptId])(.[codec])
+      - 索引单调增加 
+      - 元数据名称/文件名: appstatus_[appId](_[appAttemptId])(.inprogress)
+      写出器会滚动日志文件(达到规定大小的时候),注意写出器不会检查写出文件的大小,写出器会定位压缩器写出的字节数量,对于元数据文件来说,这个类会均衡0字节文件,这样可以花费最小的代价.
+      属性:
+      #name eventFileMaxLength = sparkConf.get(EVENT_LOG_ROLLING_MAX_FILE_SIZE)
+      	事件文件最大大小
+      #name @logDirForAppPath = getAppEventLogDirPath(logBaseDir, appId, appAttemptId)
+      	应用日志目录路径
+      #name @countingOutputStream: Option[CountingOutputStream] = None	计数输出流
+      #name @index: Long = 0L	滚动日志索引
+      #name @currentEventLogFilePath: Path = _	当前日志文件路径
+      操作集:
+      def start(): Unit
+      功能: 启动写出器
+      requireLogBaseDirAsDirectory()
+      if (fileSystem.exists(logDirForAppPath) && shouldOverwrite) {
+          fileSystem.delete(logDirForAppPath, true)
+      }
+      if (fileSystem.exists(logDirForAppPath)) {
+          throw new IOException(s"Target log directory already
+          exists ($logDirForAppPath)")
+      }
+      fileSystem.mkdirs(logDirForAppPath, EventLogFileWriter.LOG_FILE_PERMISSIONS)
+      createAppStatusFile(inProgress = true)
+      rollEventLogFile()
+ 	
+      def writeEvent(eventJson: String, flushLogger: Boolean = false): Unit
+      功能: 写出事件
+      writer.foreach { w =>
+          val currentLen = countingOutputStream.get.getBytesWritten
+          if (currentLen + eventJson.length > eventFileMaxLength) {
+              rollEventLogFile()
+          }
+      }
+      writeJson(eventJson, flushLogger)
+      
+      def rollEventLogFile(): Unit
+      功能: 滚动事件日志文件
+      closeWriter()
+      index += 1
+      currentEventLogFilePath = getEventLogFilePath(
+          logDirForAppPath, appId, appAttemptId, index,
+      compressionCodecName)
+      initLogFile(currentEventLogFilePath) { os =>
+          countingOutputStream = Some(new CountingOutputStream(os))
+          new PrintWriter(
+              new OutputStreamWriter(countingOutputStream.get, StandardCharsets.UTF_8))
+      }
+      
+      def stop(): Unit
+      功能: 停止写出器
+      closeWriter()
+      val appStatusPathIncomplete = getAppStatusFilePath(
+          logDirForAppPath, appId, appAttemptId,inProgress = true)
+      val appStatusPathComplete = getAppStatusFilePath(
+          logDirForAppPath, appId, appAttemptId,inProgress = false)
+      renameFile(appStatusPathIncomplete, appStatusPathComplete, overwrite = true)
+  	
+      def logPath: String = logDirForAppPath.toString
+      功能: 获取日志路径
+      
+      def createAppStatusFile(inProgress: Boolean): Unit
+      功能: 创建应用文件状态
+      val appStatusPath = getAppStatusFilePath(
+          logDirForAppPath, appId, appAttemptId, inProgress)
+      val outputStream = fileSystem.create(appStatusPath)
+      outputStream.close()
+  }
+```
+
+```scala
+object RollingEventLogFilesWriter {
+    属性:
+    #name @EVENT_LOG_DIR_NAME_PREFIX = "eventlog_v2_"	事件日志目录前缀名称
+    #name @EVENT_LOG_FILE_NAME_PREFIX = "events_"	事件日志文件前缀
+    #name @APPSTATUS_FILE_NAME_PREFIX = "appstatus_"	应用状态前缀
+    操作集:
+    def getAppEventLogDirPath(
+        logBaseDir: URI, appId: String, appAttemptId: Option[String]): Path 
+    功能: 获取应用事件日志路径
+    val= new Path(new Path(logBaseDir), EVENT_LOG_DIR_NAME_PREFIX +
+      EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId))
+    
+    def getAppStatusFilePath(
+      appLogDir: Path,
+      appId: String,
+      appAttemptId: Option[String],
+      inProgress: Boolean): Path
+    功能: 获取应用文件状态路径
+    val base = APPSTATUS_FILE_NAME_PREFIX +
+      EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId)
+    val name = if (inProgress) base + EventLogFileWriter.IN_PROGRESS else base
+    val= new Path(appLogDir, name)
+    
+    def getEventLogFilePath(
+      appLogDir: Path,
+      appId: String,
+      appAttemptId: Option[String],
+      index: Long,
+      codecName: Option[String]): Path
+    功能: 获取事件日志文件路径
+    val base = s"${EVENT_LOG_FILE_NAME_PREFIX}${index}_" +
+      EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId)
+    val codec = codecName.map("." + _).getOrElse("")
+    val= new Path(appLogDir, base + codec)
+    
+    def isEventLogDir(status: FileStatus): Boolean
+    功能: 确定是否为事件日志目录
+    val= status.isDirectory &&
+    	status.getPath.getName.startsWith(EVENT_LOG_DIR_NAME_PREFIX)
+    
+    def isEventLogFile(status: FileStatus): Boolean
+    功能: 确定是否为事件日志文件
+    val= status.isFile && status.getPath.getName.startsWith(EVENT_LOG_FILE_NAME_PREFIX)
+    
+    def isAppStatusFile(status: FileStatus): Boolean
+    功能: 确定是否为应用状态文件
+    status.isFile && status.getPath.getName.startsWith(APPSTATUS_FILE_NAME_PREFIX)
+    
+    def getIndex(eventLogFileName: String): Long 
+    功能: 获取索引值
+    require(eventLogFileName.startsWith(EVENT_LOG_FILE_NAME_PREFIX), "Not an event 
+    log file!")
+    val index = eventLogFileName.stripPrefix(EVENT_LOG_FILE_NAME_PREFIX).split("_")(0)
+    val= index.toLong
+}
+```
+
+##### FsHistoryProvider
+
+##### HistoryAppStatusStore
+
+```scala
+private[spark] class HistoryAppStatusStore(
+    conf: SparkConf,
+    store: KVStore)
+extends AppStatusStore(store, None) with Logging {
+    介绍: 历史应用状态存储器
+    构造器参数:
+    	conf	spark配置
+    	store	kv存储
+    #name @logUrlPattern: Option[String]	日志地址形式
+    val= {
+        val appInfo = super.applicationInfo()
+        val applicationCompleted = appInfo.attempts.nonEmpty &&
+            appInfo.attempts.head.completed
+        if (applicationCompleted ||
+            conf.get(APPLY_CUSTOM_EXECUTOR_LOG_URL_TO_INCOMPLETE_APP)) {
+          conf.get(CUSTOM_EXECUTOR_LOG_URL)
+        } else {
+          None
+        }
+      }
+    #name @logUrlHandler = new ExecutorLogUrlHandler(logUrlPattern)	日志地址处理器
+    操作集:
+    def executorList(activeOnly: Boolean): Seq[v1.ExecutorSummary]
+    功能: 获取执行器处理器列表
+    val execList = super.executorList(activeOnly)
+    val= logUrlPattern match {
+      case Some(pattern) => execList.map(replaceLogUrls(_, pattern))
+      case None => execList
+    }
+    
+    def executorSummary(executorId: String): v1.ExecutorSummary
+    功能: 获取指定执行器@executorId的执行器描述@ExecutorSummary
+    val execSummary = super.executorSummary(executorId)
+    val= logUrlPattern match {
+      case Some(pattern) => replaceLogUrls(execSummary, pattern)
+      case None => execSummary
+    }
+    
+    def replaceLogUrls(exec: v1.ExecutorSummary, urlPattern: String): v1.ExecutorSummary
+    功能: 替换日志地址为指定
+    1. 获取新的地址表
+    val newLogUrlMap = logUrlHandler.applyPattern(exec.executorLogs, exec.attributes)
+    2. 更新地址信息
+    val= replaceExecutorLogs(exec, newLogUrlMap)
+    
+    def replaceExecutorLogs(
+      source: v1.ExecutorSummary,
+      newExecutorLogs: Map[String, String]): v1.ExecutorSummary
+    功能: 替换执行器日志
+    val= new v1.ExecutorSummary(
+        source.id, source.hostPort, source.isActive, source.rddBlocks,
+        source.memoryUsed, source.diskUsed, source.totalCores, source.maxTasks,
+        source.activeTasks,
+        source.failedTasks, source.completedTasks, source.totalTasks,
+        source.totalDuration,
+        source.totalGCTime, source.totalInputBytes, source.totalShuffleRead,
+        source.totalShuffleWrite, source.isBlacklisted, source.maxMemory, source.addTime,
+        source.removeTime, source.removeReason, newExecutorLogs, source.memoryMetrics,
+        source.blacklistedInStages, source.peakMemoryMetrics, source.attributes,
+        source.resources)
+}
+```
+
+##### HistoryPage
+
+```scala
+介绍:
+	历史服务器的web页面
+```
+
+##### HistoryServer
+
+```markdown
+介绍:
+	历史服务器,用于表现完成应用的sparkUI
+ 	对于度量模式下,MasterWebUI已经获取了这个功能,因此,当前历史服务器的主要使用就是在其他部署模式下.
+ 	日志目录结构遵循如下规则:
+    在给定的基础目录内部,每个应用的世界目录保存在应用的子目录中,与保存在世界日志路径中的日志是一个格式,
+```
+
+```scala
+class HistoryServer(
+    conf: SparkConf,
+    provider: ApplicationHistoryProvider,
+    securityManager: SecurityManager,
+    port: Int)
+extends WebUI(securityManager, securityManager.getSSLOptions("historyServer"), port, conf) with Logging with UIRoot with ApplicationCacheOperations {
+    构造器参数:
+    	conf	spark配置
+    	provider	应用历史提供程序
+    	securityManager	安全管理器
+    	port	端口
+    属性:
+    #name @retainedApplications = conf.get(History.RETAINED_APPLICATIONS)	保留的应用数量
+    #name @maxApplications = conf.get(HISTORY_UI_MAX_APPS)	最大应用数量
+    #name @appCache = new ApplicationCache(this, retainedApplications, new SystemClock())
+    	应用缓存
+    #name @cacheMetrics = appCache.metrics	缓存度量器
+    #name @loaderServlet = new HttpServlet	加载服务程序
+    val= new HttpServlet {
+    protected override def doGet(req: HttpServletRequest, res: HttpServletResponse)
+        : Unit = {
+      val parts = Option(req.getPathInfo()).getOrElse("").split("/")
+      if (parts.length < 2) {
+        res.sendError(HttpServletResponse.SC_BAD_REQUEST,
+          s"Unexpected path info in request (URI = ${req.getRequestURI()}")
+        return
+      }
+      val appId = parts(1)
+      var shouldAppendAttemptId = false
+      val attemptId = if (parts.length >= 3) {
+        Some(parts(2))
+      } else {
+        val lastAttemptId = 	
+          provider.getApplicationInfo(appId).flatMap(_.attempts.head.attemptId)
+        if (lastAttemptId.isDefined) {
+          shouldAppendAttemptId = true
+          lastAttemptId
+        } else {
+          None
+        }
+      }
+      if (!loadAppUi(appId, None) && (
+          !attemptId.isDefined || !loadAppUi(appId, attemptId))) {
+        val msg = <div class="row-fluid">Application {appId} not found.</div>
+        res.setStatus(HttpServletResponse.SC_NOT_FOUND)
+        UIUtils.basicSparkPage(req, msg, "Not Found").foreach { n =>
+          res.getWriter().write(n.toString)
+        }
+        return
+      }
+      val redirect = if (shouldAppendAttemptId) {
+        req.getRequestURI.stripSuffix("/") + "/" + attemptId.get
+      } else {
+        req.getRequestURI
+      }
+      val query = Option(req.getQueryString).map("?" + _).getOrElse("")
+      res.sendRedirect(res.encodeRedirectURL(redirect + query))
+    }
+    protected override def doTrace(
+        req: HttpServletRequest, res: HttpServletResponse): Unit = {
+      res.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED)
+    }
+  }
+    
+    def withSparkUI[T](appId: String, attemptId: Option[String])(fn: SparkUI => T): T
+    功能: 处理sparkUI
+    appCache.withSparkUI(appId, attemptId)(fn)
+    
+    def initialize(): Unit
+    功能: 服务器初始化
+    1. 连接web页面
+    attachPage(new HistoryPage(this))
+    2. 连接处理器
+    attachHandler(ApiRootResource.getServletHandler(this))
+    3. 添加静态处理器
+    addStaticHandler(SparkUI.STATIC_RESOURCE_DIR)
+    4. 连接服务程序处理器
+    val contextHandler = new ServletContextHandler
+    contextHandler.setContextPath(HistoryServer.UI_PATH_PREFIX)
+    contextHandler.addServlet(new ServletHolder(loaderServlet), "/*")
+    attachHandler(contextHandler)
+    
+    def bind(): Unit
+    功能: 在web接口之前绑定HTTP服务器
+    
+    def stop(): Unit
+    功能: 停止服务,关闭文件系统
+    super.stop()
+    provider.stop()
+    
+    def detachSparkUI(appId: String, attemptId: Option[String], ui: SparkUI): Unit 
+    功能: 解除sparkUI的连接
+    assert(serverInfo.isDefined, "HistoryServer must be bound before detaching SparkUIs")
+    ui.getHandlers.foreach(detachHandler)
+    provider.onUIDetached(appId, attemptId, ui)
+    
+    def getAppUI(appId: String, attemptId: Option[String]): Option[LoadedAppUI] 
+    功能: 获取应用的UI,无论应用是否完成
+    val= provider.getAppUI(appId, attemptId)
+    
+    def getApplicationList(): Iterator[ApplicationInfo]
+    功能: 获取可用的应用列表,按照结束时间降序排序
+    val= provider.getListing()
+    
+    def getEventLogsUnderProcess(): Int
+    功能: 获取进程内的事件日志数量
+    val= provider.getEventLogsUnderProcess()
+    
+    def getLastUpdatedTime(): Long 
+    功能: 获取上次更新的时间
+    
+    def getApplicationInfoList: Iterator[ApplicationInfo]
+    功能: 获取应用信息列表
+    val= getApplicationList()
+    
+    def getApplicationInfo(appId: String): Option[ApplicationInfo] 
+    功能: 获取指定的应用信息
+    val= provider.getApplicationInfo(appId)
+    
+    def writeEventLogs(
+      appId: String,
+      attemptId: Option[String],
+      zipStream: ZipOutputStream): Unit
+    功能: 写出事件日志
+    provider.writeEventLogs(appId, attemptId, zipStream)
+    
+    def emptyListingHtml(): Seq[Node]
+    功能: 获取空的html列表
+    provider.getEmptyListingHtml()
+    
+    def getProviderConfig(): Map[String, String] = provider.getConfig()
+    功能: 获取提供程序的配置
+    
+    def loadAppUi(appId: String, attemptId: Option[String]): Boolean
+    功能: 加载应用UI并连接到web服务器上
+    try {
+      appCache.withSparkUI(appId, attemptId) { _ =>
+        // Do nothing, just force the UI to load.
+      }
+      true
+    } catch {
+      case NonFatal(e: NoSuchElementException) =>
+        false
+    }
+    
+    def toString: String
+    功能: 信息显示
+}
+```
+
+```scala
+object HistoryServer extends Logging {
+    介绍:
+    推荐的开始和停止历史服务器的方式为通过启动脚本启动(start-history-server.sh和stop-history-server.sh).这个路径是基本日志目录,同时含有相关的服务器配置信息,会通过@SPARK_HISTORY_OPTS指定
+    属性:
+    #name @conf = new SparkConf	spark	spark配置
+    #name @UI_PATH_PREFIX = "/history"	UI路径前缀
+    操作集:
+    def getAttemptURI(appId: String, attemptId: Option[String]): String
+    功能: 获取请求地址
+    val attemptSuffix = attemptId.map { id => s"/$id" }.getOrElse("")
+    val= s"${HistoryServer.UI_PATH_PREFIX}/${appId}${attemptSuffix}"
+    
+    def initSecurity(): Unit
+    功能: 初始化安全配置
+    if (conf.get(History.KERBEROS_ENABLED)) {
+      val principalName = conf.get(History.KERBEROS_PRINCIPAL)
+        .getOrElse(throw new NoSuchElementException(History.KERBEROS_PRINCIPAL.key))
+      val keytabFilename = conf.get(History.KERBEROS_KEYTAB)
+        .getOrElse(throw new NoSuchElementException(History.KERBEROS_KEYTAB.key))
+      SparkHadoopUtil.get.loginUserFromKeytab(principalName, keytabFilename)
+    }
+    
+    def createSecurityManager(config: SparkConf): SecurityManager 
+    功能: 创建安全管理器
+    if (config.getBoolean(SecurityManager.SPARK_AUTH_CONF, false)) {
+      logDebug(s"Clearing ${SecurityManager.SPARK_AUTH_CONF}")
+      config.set(SecurityManager.SPARK_AUTH_CONF, "false")
+    }
+    if (config.get(ACLS_ENABLE)) {
+      logInfo(s"${ACLS_ENABLE.key} is configured, " +
+        s"clearing it and only using ${History.HISTORY_SERVER_UI_ACLS_ENABLE.key}")
+      config.set(ACLS_ENABLE, false)
+    }
+    val= new SecurityManager(config)
+    
+    def main(argStrings: Array[String]): Unit
+    功能: 启动函数
+}
+```
+
+##### HistoryServerArguments
+
+```scala
+private[history] class HistoryServerArguments(conf: SparkConf, args: Array[String])
+extends Logging {
+    介绍: 历史服务器参数的命令行转换类
+    属性:
+    #name @propertiesFile: String = null	属性文件
+    操作集:
+    @tailrec
+    private def parse(args: List[String]): Unit 
+    功能: 转换函数
+    args match {
+      case ("--help" | "-h") :: tail =>
+        printUsageAndExit(0)
+      case ("--properties-file") :: value :: tail =>
+        propertiesFile = value
+        parse(tail)
+      case Nil =>
+      case _ =>
+        printUsageAndExit(1)
+    }
+    
+    def printUsageAndExit(exitCode: Int): Unit
+    功能: 打印使用信息
+    System.err.println(
+      """
+      |Usage: HistoryServer [options]
+      |
+      |Options:
+      |  --properties-file FILE      Path to a custom Spark properties file.
+      |                              Default is conf/spark-defaults.conf.
+      |
+      |Configuration options can be set by setting the corresponding JVM system property.
+      |History Server options are always available; additional options depend 
+      on the provider.
+      |
+      |History Server options:
+      |
+      |  spark.history.ui.port              Port where server will listen for connections
+      |                                     (default 18080)
+      |  spark.history.acls.enable          Whether to enable view acls for 
+      all applications
+      |                                     (default false)
+      |  spark.history.provider             Name of history provider class (defaults to
+      |                                     file system-based provider)
+      |  spark.history.retainedApplications Max number of application UIs to keep loaded
+      in memory
+      |                                     (default 50)
+      |FsHistoryProvider options:
+      |
+      |  spark.history.fs.logDirectory      Directory where app logs are stored
+      |                                     (default: file:/tmp/spark-events)
+      |  spark.history.fs.update.interval   How often to reload log data from storage
+      |                                     (in seconds, default: 10)
+      |""".stripMargin)
+    System.exit(exitCode)
+    
+    初始化操作:
+    parse(args.toList)
+    功能: 转换参数列表中的配置
+    
+    Utils.loadDefaultSparkProperties(conf, propertiesFile)
+    功能: 加载配置文件的配置
+}
+```
+
+##### HistoryServerDiskManager
+
+```scala
+private class HistoryServerDiskManager(
+    conf: SparkConf,
+    path: File,
+    listing: KVStore,
+    clock: Clock) extends Logging {
+    介绍: 
+}
+```
+
+
+
 #### master
 
 ##### UI
@@ -8944,11 +10215,292 @@ private[spark] object StandaloneResourceUtils extends Logging {
     #name @ALLOCATED_RESOURCES_FILE = "__allocated_resources__.json"	资源分配文件
     #name @RESOURCES_LOCK_FILE = "__allocated_resources__.lock"	资源锁文件
     操作集:
+    def acquireResources(
+      conf: SparkConf,
+      componentName: String,
+      resources: Map[String, ResourceInformation],
+      pid: Int)
+    : Map[String, ResourceInformation]
+    功能: 获取资源,分为3步工作,
+    	1. 获取@RESOURCES_LOCK_FILE 的锁,获取worker和driver之间的锁
+    	2. 从ALLOCATED_RESOURCES_FILE获取分配的资源,对其中发现的资源进行分类,并隔离分配到worker和driver中,如果可用资源不满足worker和master的要求,试着去排除一些相关进程已经结束,如果还不满足要求,就会抛出异常,
+    	3. 使用带有pid的新分配的资源更新ALLOCATED_RESOURCES_FILE,然后返回分配的资源并释放锁
+    输入参数:
+    	cong	spark配置
+    	componentName	组件名称
+    	resources	资源列表
+    	pid	进程编号
+    0. 如果不需要资源协调,直接返回原始资源表
+    if (!needCoordinate(conf)) {
+      return resources
+    }
+    1. 空资源处理
+    val resourceRequirements = parseResourceRequirements(conf, componentName)
+    if (resourceRequirements.isEmpty) {
+      return Map.empty
+    }
+    2. 获取资源锁
+    val lock = acquireLock(conf)
+    3. 获取资源分配列表(pid -->Map(resourceName --> Address[]))
+    val resourcesFile = new File(getOrCreateResourcesDir(conf), ALLOCATED_RESOURCES_FILE)
+    var origAllocation = Seq.empty[StandaloneResourceAllocation]
+    var allocated = {
+        if (resourcesFile.exists()) {
+          origAllocation = allocatedStandaloneResources(resourcesFile.getPath)
+          val allocations = origAllocation.map { resource =>
+            val resourceMap = {
+              resource.allocations.map { allocation =>
+                allocation.id.resourceName -> allocation.addresses.toArray
+              }.toMap
+            }
+            resource.pid -> resourceMap
+          }.toMap
+          allocations
+        } else {
+          Map.empty[Int, Map[String, Array[String]]]
+        }
+      }
+    4. 新建资源分配表,并对其进行分配
+    var newAssignments: Map[String, Array[String]] = null
+    var checked = false
+    var keepAllocating = true
+	while (keepAllocating) {
+        keepAllocating = false
+        val pidsToCheck = mutable.Set[Int]()
+        newAssignments = resourceRequirements.map { req =>
+          val rName = req.resourceName
+          val amount = req.amount
+          var available = resources(rName).addresses //可用资源列表
+          allocated.foreach { a =>
+            val thePid = a._1
+            val resourceMap = a._2
+            val assigned = resourceMap.getOrElse(rName, Array.empty)
+            val retained = available.diff(assigned)
+              // 如果剩余资源少于可利用资源那么,可用资源和分配资源之间一定存在有资源冲突,所以需要存储
+              // PID,去检查是否遍历完所有分配资源之后,是否仍然存活且资源不足.
+            if (retained.length < available.length && !checked) {
+              pidsToCheck += thePid
+            }
+            if (retained.length >= amount) {
+              available = retained
+            } else if (checked) {
+              keepAllocating = false
+              throw new SparkException(s"No more 
+              resources available since they've already" +
+                s" assigned to other workers/drivers.")
+            } else {
+              keepAllocating = true
+            }
+          }
+            // 分配资源
+          val assigned = {
+            if (keepAllocating) { // 不满足分配资源需求,需要剥夺结束进程的资源,来满足资源要求
+              val (invalid, valid) = allocated.partition { a =>
+                pidsToCheck(a._1) && !(Utils.isTesting || Utils.isProcessRunning(a._1))}
+              allocated = valid
+              origAllocation = origAllocation.filter(
+                allocation => !invalid.contains(allocation.pid))
+              checked = true
+              available
+            } else {
+              available.take(amount)
+            }
+          }
+          rName -> assigned
+        }.toMap
+      }
+    5. 获取分配的资源并写出
+    val newAllocation = {
+        val allocations = newAssignments.map { case (rName, addresses) =>
+          ResourceAllocation(ResourceID(componentName, rName), addresses)
+        }.toSeq
+        StandaloneResourceAllocation(pid, allocations)
+      }
+    writeResourceAllocationJson(
+        componentName, origAllocation ++ Seq(newAllocation), resourcesFile)
+    newAllocation.toResourceInformationMap
+    6. 释放锁
+    releaseLock(lock)
     
+    def releaseResources(
+      conf: SparkConf,
+      componentName: String,
+      toRelease: Map[String, ResourceInformation],
+      pid: Int)
+    : Unit
+    功能: 释放资源,释放worker/driver的所有资源
+    0. 不需要资源调节则直接退出
+    if (!needCoordinate(conf)) {
+      return
+    }
+    1. 释放资源
+    if (toRelease != null && toRelease.nonEmpty) {
+      val lock = acquireLock(conf)
+      try {
+        val resourcesFile = new File(getOrCreateResourcesDir(conf), ALLOCATED_RESOURCES_FILE)
+        if (resourcesFile.exists()) {
+          val (target, others) =
+            allocatedStandaloneResources(resourcesFile.getPath).partition(_.pid == pid)
+          if (target.nonEmpty) {
+            if (others.isEmpty) {
+              if (!resourcesFile.delete()) {
+                logError(s"Failed to delete $ALLOCATED_RESOURCES_FILE.")
+              }
+            } else {
+              writeResourceAllocationJson(componentName, others, resourcesFile)
+            }
+            logDebug(s"$componentName(pid=$pid) released resources:
+            ${toRelease.mkString("\n")}")
+          } else {
+            logWarning(s"$componentName(pid=$pid) has already released its resources.")
+          }
+        }
+      } finally {
+        releaseLock(lock)
+      }
+    }
+    
+    def acquireLock(conf: SparkConf): FileLock
+    功能: 获取文件锁
+    val resourcesDir = getOrCreateResourcesDir(conf)
+    val lockFile = new File(resourcesDir, RESOURCES_LOCK_FILE)
+    val lockFileChannel = new RandomAccessFile(lockFile, "rw").getChannel
+    var keepTry = true
+    var lock: FileLock = nullwhile (keepTry) {
+      try {
+        lock = lockFileChannel.lock()
+        logInfo(s"Acquired lock on $RESOURCES_LOCK_FILE.")
+        keepTry = false
+      } catch {
+        case e: OverlappingFileLockException =>
+          keepTry = true
+          // 随机休眠，避免冲突
+          val duration = Random.nextInt(1000) + 1000
+          Thread.sleep(duration)
+      }
+    }
+    assert(lock != null, s"Acquired null lock on $RESOURCES_LOCK_FILE.")
+    val= lock
+    
+    def releaseLock(lock: FileLock): Unit
+    功能: 释放文件锁
+    try {
+      lock.release()
+      lock.channel().close()
+      logInfo(s"Released lock on $RESOURCES_LOCK_FILE.")
+    } catch {
+      case e: Exception =>
+        logError(s"Error while releasing lock on $RESOURCES_LOCK_FILE.", e)
+    }
+    
+    def getOrCreateResourcesDir(conf: SparkConf): File 
+    功能: 获取/创建资源目录
+    val coordinateDir = new File(conf.get(SPARK_RESOURCES_DIR).getOrElse {
+      val sparkHome = if (Utils.isTesting) {
+        assert(sys.props.contains("spark.test.home") ||
+          sys.env.contains("SPARK_HOME"), "spark.test.home or SPARK_HOME is not set.")
+        sys.props.getOrElse("spark.test.home", sys.env("SPARK_HOME"))
+      } else {
+        sys.env.getOrElse("SPARK_HOME", ".")
+      }
+      sparkHome
+    })
+    val resourceDir = new File(coordinateDir, SPARK_RESOURCES_COORDINATE_DIR)
+    if (!resourceDir.exists()) {
+      Utils.createDirectory(resourceDir)
+    }
+    val= resourceDir
+    
+    def allocatedStandaloneResources(resourcesFile: String)
+  	: Seq[StandaloneResourceAllocation]
+    功能: 分配独立资源
+    withResourcesJson[StandaloneResourceAllocation](resourcesFile) { json =>
+      implicit val formats = DefaultFormats
+      parse(json).extract[Seq[StandaloneResourceAllocation]]
+    }
+    
+    def prepareResourcesFile(
+      componentName: String,
+      resources: Map[String, ResourceInformation],
+      dir: File): Option[File]
+    功能: 准备资源文件
+    保存driver/executor分配的资源文件到json格式的资源文件中,仅仅在独立部署时可以使用
+    0. 空资源退出
+    if (resources.isEmpty) {
+      return None
+    }
+    1. 获取分配的资源表
+    val compShortName = componentName.substring(componentName.lastIndexOf(".") + 1)
+    val tmpFile = Utils.tempFileWith(dir)
+    val allocations = resources.map { case (rName, rInfo) =>
+      ResourceAllocation(ResourceID(componentName, rName), rInfo.addresses)
+    }.toSeq
+    2. 将资源写到json中
+    try {
+      writeResourceAllocationJson(componentName, allocations, tmpFile)
+    } catch {
+      case NonFatal(e) =>
+        val errMsg = s"Exception threw while preparing resource file for $compShortName"
+        logError(errMsg, e)
+        throw new SparkException(errMsg, e)
+    }
+    3. 重命名文件并返回
+    val resourcesFile = File.createTempFile(s"resource-$compShortName-", ".json", dir)
+    tmpFile.renameTo(resourcesFile)
+    Some(resourcesFile)
+    
+    def writeResourceAllocationJson[T](
+      componentName: String,
+      allocations: Seq[T],
+      jsonFile: File): Unit
+    功能: 写出资源分配的json
+    val allocationJson = Extraction.decompose(allocations)
+    Files.write(jsonFile.toPath, compact(render(allocationJson)).getBytes())
+    
+    def needCoordinate(conf: SparkConf): Boolean
+    功能: 确定是否需要进行worker与master直接的资源协调
+    val= conf.get(SPARK_RESOURCES_COORDINATE)
+    
+    def toMutable(immutableResources: Map[String, ResourceInformation])
+    : Map[String, MutableResourceInfo] 
+    功能: 转变为可变资源表
+    val= immutableResources.map { case (rName, rInfo) =>
+      val mutableAddress = new mutable.HashSet[String]()
+      mutableAddress ++= rInfo.addresses
+      rName -> MutableResourceInfo(rInfo.name, mutableAddress)
+    }
+    
+    def formatResourcesDetails(
+      usedInfo: Map[String, ResourceInformation],
+      freeInfo: Map[String, ResourceInformation]): String
+    功能: 格式化资源信息
+    val= usedInfo.map { case (rName, rInfo) =>
+      val used = rInfo.addresses.mkString("[", ", ", "]")
+      val free = freeInfo(rName).addresses.mkString("[", ", ", "]")
+      s"$rName: Free: $free / Used: $used"
+    }.mkString(", ")
+    
+    def formatResourcesAddresses(resources: Map[String, ResourceInformation]): String 
+    功能: 格式化资源地址
+    val= resources.map { case (rName, rInfo) =>
+      s"$rName: ${rInfo.addresses.mkString("[", ", ", "]")}"
+    }.mkString(", ")
+    
+    def formatResourcesUsed(
+      resourcesTotal: Map[String, ResourceInformation],
+      resourcesUsed: Map[String, ResourceInformation]): String 
+    功能: 格式化使用的资源
+    val= resourcesTotal.map { case (rName, rInfo) =>
+      val used = resourcesUsed(rName).addresses.length
+      val total = rInfo.addresses.length
+      s"$used / $total $rName"
+    }.mkString(", ")
+    
+    def formatResourceRequirements(requirements: Seq[ResourceRequirement]): String 
+    功能: 格式化资源需求
+    val= requirements.map(req => s"${req.amount} ${req.resourceName}").mkString(", ")
 }
 ```
-
-
 
 #### 基础拓展
 
