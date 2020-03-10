@@ -1171,6 +1171,1108 @@ object RollingEventLogFilesWriter {
 
 ##### FsHistoryProvider
 
+```markdown
+介绍:
+ 	这个类提供来自事件日志的应用历史,日志信息存储在文件系统中,这个供应程序周期性检测后台新完成的应用,且表示到历史应用UI上,通过转换相关的事件日志.
+ 	--- 如果有新建个更新断开连接的请求 ---
+ 	- 新的请求在@checkForLogs中断开连接,日志目录被扫描,且日志目录的从上传扫描以来任意的条目都会被认为新建的和更新的.这些会重新创建一个请求信息条目,且会更新和创建匹配的应用信息元素.
+ 	- 更新请也会在@checkForLogs中寻找: 如果请求的日志文件增加了,请求就会被一个更大日志大小的请求代替.
+ 	日志大小的使用,而不是件简单的依靠修改时间,需要下述地址新
+ 	- 一些文件系统不会更新修改时间的值,物理数据何时刷新去打开问阿金输出流.切换到不会被找到的历史信息
+ 	- 修改时间的粒度为2s以上.对于文件系统的快速变化将会被忽略.
+ 	定位文件大小的会对给定的下述变量进行操作:
+ 	随着事件的添加,日志变得越来越多.如果使用了不支持的格式,原理依旧不会被打破.简单的json事件流,作为当前的事件,保留了这些变量.
+```
+
+```scala
+private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
+extends ApplicationHistoryProvider with Logging{
+    属性:
+    #name @SAFEMODE_CHECK_INTERVAL_S = conf.get(History.SAFEMODE_CHECK_INTERVAL_S)
+    	安全模式检查周期
+    #name @UPDATE_INTERVAL_S = conf.get(History.UPDATE_INTERVAL_S)	更新时间周期
+    #name @CLEAN_INTERVAL_S = conf.get(History.CLEANER_INTERVAL_S)	清理事件日志周期
+    #name @NUM_PROCESSING_THREADS = conf.get(History.NUM_REPLAY_THREADS) 
+    	重新进行事件日志的线程数量
+    #name @logDir = conf.get(History.HISTORY_LOG_DIR)	日志目录
+    #name @historyUiAclsEnable = conf.get(History.HISTORY_SERVER_UI_ACLS_ENABLE)
+    	是否允许对历史webUI的访问
+    #name @historyUiAdminAcls = conf.get(History.HISTORY_SERVER_UI_ADMIN_ACLS)
+    	历史webUI管理访问控制表
+    #name @historyUiAdminAclsGroups 历史webUI管理访问控制组
+    val= conf.get(History.HISTORY_SERVER_UI_ADMIN_ACLS_GROUPS)
+    #name @hadoopConf = SparkHadoopUtil.get.newConfiguration(conf)	hadoop配置
+    #name @lastScanTime = new java.util.concurrent.atomic.AtomicLong(-1) 上次扫描时间
+    #name @pool	用于检查事件线程和清理日志线程(调度线程池只能有一个,否则文件系统会有并发问题)
+    val= ThreadUtils.newDaemonSingleThreadScheduledExecutor("spark-history-task-%d")
+    #name @pendingReplayTasksCount = new java.util.concurrent.atomic.AtomicInteger(0)
+    	待定重演的任务计数器
+    #name @storePath = conf.get(LOCAL_STORE_DIR).map(new File(_))	存储路径
+    #name @fastInProgressParsing = conf.get(FAST_IN_PROGRESS_PARSING) 允许进程内日志优化
+    #name @listing: KVStore	存储列表
+    val= storePath.map { path =>
+        val dbPath=Files.createDirectories(
+            new File(path, "listing.ldb").toPath()).toFile()
+        Utils.chmod700(dbPath)
+        val metadata = new FsHistoryProviderMetadata(CURRENT_LISTING_VERSION,
+          AppStatusStore.CURRENT_VERSION, logDir.toString())
+        try {
+          open(dbPath, metadata)
+        } catch {
+          case _: UnsupportedStoreVersionException | _: MetadataMismatchException =>
+            logInfo("Detected incompatible DB versions, deleting...")
+            path.listFiles().foreach(Utils.deleteRecursively)
+            open(dbPath, metadata)
+          case dbExc: NativeDB.DBException =>
+            logWarning(s"Failed to load disk store $dbPath :", dbExc)
+            Utils.deleteRecursively(dbPath)
+            open(dbPath, metadata)
+        }
+  }.getOrElse(new InMemoryStore())
+    #name @diskManager	磁盘管理器
+    val= storePath.map { path =>
+        new HistoryServerDiskManager(conf, path, listing, clock)
+      }
+    #name @blacklist = new ConcurrentHashMap[String, Long]	黑名单列表
+    #name @activeUIs = new mutable.HashMap[(String, Option[String]), LoadedAppUI]()
+    	激活的sparkUI表
+    #name @initThread: Thread = null	初始化线程
+    #name @replayExecutor: ExecutorService	重演执行器(定长线程池,用于转换日志文件)
+    val= if (!Utils.isTesting) {
+      ThreadUtils.newDaemonFixedThreadPool(NUM_PROCESSING_THREADS, "log-replay-executor")
+    } else {
+      MoreExecutors.sameThreadExecutor()
+    }
+    操作集:
+    def blacklist(path: Path): Unit
+    功能: 将指定路径添加到黑名单列表中
+    blacklist.put(path.getName, clock.getTimeMillis())
+    
+    def clearBlacklist(expireTimeInSeconds: Long): Unit
+    功能: 情况指定时间@expireTimeInSeconds内的黑名单列表
+    val expiredThreshold = clock.getTimeMillis() - expireTimeInSeconds * 1000
+    blacklist.asScala.retain((_, creationTime) => creationTime >= expiredThreshold)
+    
+    def getRunner(operateFun: () => Unit): Runnable
+    功能: 获取一个可以运行的线程实例
+    输入参数:
+    	operateFun	线程处理函数
+    () => Utils.tryOrExit { operateFun() }
+    
+    def initialize(): Thread
+    功能: 初始化提供程序,获取一个处理线程
+    if (!isFsInSafeMode()) {
+      startPolling() // 非安全模式,启动轮询
+      null
+    } else {
+      startSafeModeCheckThread(None)
+    }
+    
+    def startSafeModeCheckThread(
+      errorHandler: Option[Thread.UncaughtExceptionHandler]): Thread 
+    功能: 启动安全模式检查线程
+    1. 获取初始化线程
+    在文件系统处于安全模式的情况下,不能探测任何东西,所以在轮询前,开启一个线程用于使文件系统离开安全模式,这个运行主历史服务器显示在webUI上.
+    val initThread = new Thread(() => {
+      try {
+        while (isFsInSafeMode()) { // 等待文件系统脱离安全模式
+          logInfo("HDFS is still in safe mode. Waiting...")
+          val deadline = clock.getTimeMillis() +
+            TimeUnit.SECONDS.toMillis(SAFEMODE_CHECK_INTERVAL_S)
+          clock.waitTillTime(deadline)
+        }
+        startPolling()
+      } catch {
+        case _: InterruptedException =>
+      }
+    })
+    2. 设置并启动线程
+    initThread.setDaemon(true)
+    initThread.setName(s"${getClass().getSimpleName()}-init")
+    initThread.setUncaughtExceptionHandler(errorHandler.getOrElse(
+      (_: Thread, e: Throwable) => {
+        logError("Error initializing FsHistoryProvider.", e)
+        System.exit(1)
+      }))
+    initThread.start()
+    val= initThread
+    
+    def startPolling(): Unit
+    功能: 启动轮询
+    1. 初始化磁盘管理器
+    diskManager.foreach(_.initialize())
+    2. 校验日志目录
+    val path = new Path(logDir)
+    try {
+      if (!fs.getFileStatus(path).isDirectory) {
+        throw new IllegalArgumentException(
+          "Logging directory specified is not a directory: %s".format(logDir))
+      }
+    } catch {
+      case f: FileNotFoundException =>
+        var msg = s"Log directory specified does not exist: $logDir"
+        if (logDir == DEFAULT_LOG_DIR) {
+          msg += " Did you configure the correct one through
+          spark.history.fs.logDirectory?"
+        }
+        throw new FileNotFoundException(msg).initCause(f)
+    }
+    3. 测试期间关闭后台线程
+    if (!conf.contains(IS_TESTING)) {
+      logDebug(s"Scheduling update thread every $UPDATE_INTERVAL_S seconds")
+      pool.scheduleWithFixedDelay(
+        getRunner(() => checkForLogs()), 0, UPDATE_INTERVAL_S, TimeUnit.SECONDS)
+      if (conf.get(CLEANER_ENABLED)) {
+        pool.scheduleWithFixedDelay(
+          getRunner(() => cleanLogs()), 0, CLEAN_INTERVAL_S, TimeUnit.SECONDS)
+      }
+      if (conf.contains(DRIVER_LOG_DFS_DIR) && conf.get(DRIVER_LOG_CLEANER_ENABLED)) {
+        pool.scheduleWithFixedDelay(getRunner(() => cleanDriverLogs()),
+          0,
+          conf.get(DRIVER_LOG_CLEANER_INTERVAL),
+          TimeUnit.SECONDS)
+      }
+    } else {
+      logDebug("Background update thread disabled for testing")
+    }
+    
+    def getListing(): Iterator[ApplicationInfo]
+    功能: 获取应用列表(降序)
+    val= listing.view(classOf[ApplicationInfoWrapper])
+      .index("endTime")
+      .reverse()
+      .iterator()
+      .asScala
+      .map(_.toApplicationInfo())
+    
+    def getApplicationInfo(appId: String): Option[ApplicationInfo]
+    功能: 获取指定应用@appId的应用信息
+    val= try {
+      Some(load(appId).toApplicationInfo())
+    } catch {
+      case _: NoSuchElementException =>
+        None
+    }
+    
+    def getEventLogsUnderProcess(): Int = pendingReplayTasksCount.get()
+    功能: 获取进程内的事件日志数量
+    
+    def getLastUpdatedTime(): Long = lastScanTime.get()
+    功能: 获取上次更新时间
+    
+    def stringToSeq(list: String): Seq[String]
+    功能: 逗号分割的串转换为列表
+    val= list.split(',').map(_.trim).filter(!_.isEmpty)
+    
+    def getAppUI(appId: String, attemptId: Option[String]): Option[LoadedAppUI]
+    功能: 获取应用的webUI
+    1. 获取应用相关
+    val app = try {
+      load(appId)
+     } catch {
+      case _: NoSuchElementException =>
+        return None
+    }
+    val attempt = app.attempts.find(_.info.attemptId == attemptId).orNull
+    if (attempt == null) {
+      return None
+    }
+    2. 获取安全管理器
+    val conf = this.conf.clone()
+    val secManager = new SecurityManager(conf)
+    secManager.setAcls(historyUiAclsEnable)
+    secManager.setAdminAcls(
+        historyUiAdminAcls ++ 	stringToSeq(attempt.adminAcls.getOrElse("")))
+    secManager.setViewAcls(
+        attempt.info.sparkUser, stringToSeq(attempt.viewAcls.getOrElse("")))
+    secManager.setAdminAclsGroups(historyUiAdminAclsGroups ++
+      stringToSeq(attempt.adminAclsGroups.getOrElse("")))
+    secManager.setViewAclsGroups(stringToSeq(attempt.viewAclsGroups.getOrElse("")))
+    3. 获取磁盘的kv存储器
+    val kvstore = try {
+      diskManager match {
+        case Some(sm) =>
+          loadDiskStore(sm, appId, attempt)
+
+        case _ =>
+          createInMemoryStore(attempt)
+      }
+    } catch {
+      case _: FileNotFoundException =>
+        return None
+    }
+    4. 创建sparkUI
+    val ui = SparkUI.create(
+        None, new HistoryAppStatusStore(conf, kvstore), conf, secManager,
+      app.info.name, HistoryServer.getAttemptURI(appId, attempt.info.attemptId),
+      attempt.info.startTime.getTime(), attempt.info.appSparkVersion)
+    5. 按照属性进行排序
+    loadPlugins().toSeq.sortBy(_.displayOrder).foreach(_.setupUI(ui))
+    6. 加载应用UI
+    val loadedUI = LoadedAppUI(ui)
+    synchronized {
+      activeUIs((appId, attemptId)) = loadedUI
+    }
+    val= Some(loadedUI)
+    
+    def getEmptyListingHtml(): Seq[Node]
+    功能: 获取空的HTML文档
+    val= 
+    <p>
+      Did you specify the correct logging directory? Please verify your setting of
+      <span style="font-style:italic">spark.history.fs.logDirectory</span>
+      listed above and whether you have the permissions to access it.
+      <br/>
+      It is also possible that your application did not run to
+      completion or did not stop the SparkContext.
+    </p>
+    
+    def getConfig(): Map[String, String]
+    功能: 获取属性配置表
+    1. 确定安全模式
+    val safeMode = if (isFsInSafeMode()) {
+      Map("HDFS State" -> "In safe mode, application logs not available.")
+    } else {
+      Map()
+    }
+    val= Map("Event log directory" -> logDir.toString) ++ safeMode
+    
+    def start(): Unit
+    功能: 启动提供程序
+    initThread = initialize()
+    
+    def stop(): Unit
+    功能: 关闭提供程序
+    try {
+      if (initThread != null && initThread.isAlive()) {
+        initThread.interrupt()
+        initThread.join()
+      }
+      Seq(pool, replayExecutor).foreach { executor =>
+        executor.shutdown()
+        if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+          executor.shutdownNow()
+        }
+      }
+    } finally {
+      activeUIs.foreach { case (_, loadedUI) => loadedUI.ui.store.close() }
+      activeUIs.clear()
+      listing.close()
+    }
+    
+    def onUIDetached(appId: String, attemptId: Option[String], ui: SparkUI): Unit
+    功能: 断开与sparkUI的连接
+    1. 获取UI配置
+    val uiOption = synchronized {
+      activeUIs.remove((appId, attemptId))
+    }
+    2. 关闭kv存储中相应webUI,如果webUI不可用,将其从磁盘中移除
+    uiOption.foreach { loadedUI =>
+      loadedUI.lock.writeLock().lock()
+      try {
+        loadedUI.ui.store.close()
+      } finally {
+        loadedUI.lock.writeLock().unlock()
+      }
+      diskManager.foreach { dm =>
+        dm.release(appId, attemptId, delete = !loadedUI.valid)
+      }
+    }
+    
+    def checkForLogs(): Unit
+    功能: 基于当前日志目录内容构建应用列表,尽可能的重用内存数据,通过不读取上次更新的应用的方式,
+    try {
+      val newLastScanTime = clock.getTimeMillis()
+      logDebug(s"Scanning $logDir with lastScanTime==$lastScanTime")
+      val updated = Option(fs.listStatus(new Path(logDir))).map(_.toSeq).getOrElse(Nil)
+        .filter { entry => !isBlacklisted(entry.getPath) }
+        .flatMap { entry => EventLogFileReader(fs, entry) }
+        .filter { reader =>
+          try {
+            val info = listing.read(classOf[LogInfo], reader.rootPath.toString())
+            if (info.appId.isDefined) {
+              listing.write(info.copy(lastProcessed = newLastScanTime,
+                fileSize = reader.fileSizeForLastIndex,
+                lastIndex = reader.lastIndex,
+                isComplete = reader.completed))
+            }
+            if (shouldReloadLog(info, reader)) {
+              if (info.appId.isDefined && (info.isComplete == reader.completed) &&
+                  fastInProgressParsing) {
+                val appInfo = listing.read(
+                    classOf[ApplicationInfoWrapper], info.appId.get)
+                val attemptList = appInfo.attempts.map { attempt =>
+                  if (attempt.info.attemptId == info.attemptId) {
+                    new AttemptInfoWrapper(
+                      attempt.info.copy(lastUpdated = new Date(newLastScanTime)),
+                      attempt.logPath,
+                      attempt.fileSize,
+                      attempt.lastIndex,
+                      attempt.adminAcls,
+                      attempt.viewAcls,
+                      attempt.adminAclsGroups,
+                      attempt.viewAclsGroups)
+                  } else {
+                    attempt
+                  }
+                }
+                val updatedAppInfo = new ApplicationInfoWrapper(
+                    appInfo.info, attemptList)
+                listing.write(updatedAppInfo)
+                invalidateUI(info.appId.get, info.attemptId)
+                false
+              } else {
+                true
+              }
+            } else {
+              false
+            }
+          } catch {
+            case _: NoSuchElementException =>
+              listing.write(LogInfo(reader.rootPath.toString(), newLastScanTime, LogType.EventLogs,
+                None, None, reader.fileSizeForLastIndex, reader.lastIndex,
+                reader.completed))
+              reader.fileSizeForLastIndex > 0
+          }
+        }
+        .sortWith { case (entry1, entry2) =>
+          entry1.modificationTime > entry2.modificationTime
+        }
+      if (updated.nonEmpty) {
+        logDebug(s"New/updated attempts found: ${updated.size}
+        ${updated.map(_.rootPath)}")
+      }
+      val tasks = updated.flatMap { entry =>
+        try {
+          val task: Future[Unit] = replayExecutor.submit(
+            () => mergeApplicationListing(entry, newLastScanTime, true))
+          Some(task -> entry.rootPath)
+        } catch {
+          case e: Exception =>
+            logError(s"Exception while submitting event log for replay", e)
+            None
+        }
+      }
+      pendingReplayTasksCount.addAndGet(tasks.size)
+      tasks.foreach { case (task, path) =>
+        try {
+          task.get()
+        } catch {
+          case e: InterruptedException =>
+            throw e
+          case e: ExecutionException if e.getCause.
+            isInstanceOf[AccessControlException] =>
+            logWarning(s"Unable to read log $path", e.getCause)
+            blacklist(path)
+            listing.delete(classOf[LogInfo], path.toString)
+          case e: Exception =>
+            logError("Exception while merging application listings", e)
+        } finally {
+          pendingReplayTasksCount.decrementAndGet()
+        }
+      }
+      val stale = listing.view(classOf[LogInfo])
+        .index("lastProcessed")
+        .last(newLastScanTime - 1)
+        .asScala
+        .toList
+      stale.foreach { log =>
+        log.appId.foreach { appId =>
+          cleanAppData(appId, log.attemptId, log.logPath)
+          listing.delete(classOf[LogInfo], log.logPath)
+        }
+      }
+      lastScanTime.set(newLastScanTime)
+    } catch {
+      case e: Exception => logError("Exception in checking for event log updates", e)
+    }
+    
+    def shouldReloadLog(info: LogInfo, reader: EventLogFileReader): Boolean 
+    功能: 确定是否需要重载日志
+    val= if (info.isComplete != reader.completed) {
+      true
+    } else {
+      var result = if (info.lastIndex.isDefined) {
+        require(reader.lastIndex.isDefined)
+        info.lastIndex.get < reader.lastIndex.get || 
+          info.fileSize < reader.fileSizeForLastIndex
+      } else {
+        info.fileSize < reader.fileSizeForLastIndex
+      }
+      if (!result && !reader.completed) {
+        try {
+          result = reader.fileSizeForLastIndexForDFS.exists(info.fileSize < _)
+        } catch {
+          case e: Exception =>
+            logDebug(s"Failed to check the length for the file : ${info.logPath}", e)
+        }
+      }
+      result
+    }
+    
+    def cleanAppData(appId: String, attemptId: Option[String], logPath: String): Unit
+    功能: 清除指定应用的数据
+    1. 从磁盘中是否当前应用的空间
+    val app = load(appId)
+      val (attempt, others) = app.attempts.partition(_.info.attemptId == attemptId)
+      assert(attempt.isEmpty || attempt.size == 1)
+      val isStale = attempt.headOption.exists { a =>
+        if (a.logPath != new Path(logPath).getName()) {
+          false
+        } else {
+          val maybeUI = synchronized {
+            activeUIs.remove(appId -> attemptId)
+          }
+          maybeUI.foreach { ui =>
+            ui.invalidate()
+            ui.ui.store.close()
+          }
+          diskManager.foreach(_.release(appId, attemptId, delete = true))
+          true
+        }
+      }
+    2. 更新旧的信息
+    if (isStale) {
+        if (others.nonEmpty) {
+            // 获取新的应用信息
+          val newAppInfo = new ApplicationInfoWrapper(app.info, others)
+          // 写出新的应用信息
+          listing.write(newAppInfo)
+        } else {
+            // 表为空则删除
+          listing.delete(classOf[ApplicationInfoWrapper], appId)
+        }
+      }
+    
+    def writeEventLogs(
+      appId: String,
+      attemptId: Option[String],
+      zipStream: ZipOutputStream): Unit
+    功能: 写出事件日志
+    1. 获取应用
+    val app = try {
+      load(appId)
+    } catch {
+      case _: NoSuchElementException =>
+        throw new SparkException(s"Logs for $appId not found.")
+    }
+    2. 写出日志文件
+    try {
+      attemptId
+        .map { id => app.attempts.filter(_.info.attemptId == Some(id)) }
+        .getOrElse(app.attempts)
+        .foreach { attempt =>
+          val reader = EventLogFileReader(fs, new Path(logDir, attempt.logPath),
+            attempt.lastIndex)
+          reader.zipEventLogFiles(zipStream)
+        }
+    } finally {
+      zipStream.close()
+    }
+    
+    def mergeApplicationListing(
+      reader: EventLogFileReader,
+      scanTime: Long,
+      enableOptimizations: Boolean): Unit 
+    功能: 合并应用列表
+    1. 获取事件过滤器
+    val eventsFilter: ReplayEventsFilter = { eventString =>
+      eventString.startsWith(APPL_START_EVENT_PREFIX) ||
+        eventString.startsWith(APPL_END_EVENT_PREFIX) ||
+        eventString.startsWith(LOG_START_EVENT_PREFIX) ||
+        eventString.startsWith(ENV_UPDATE_EVENT_PREFIX)
+    }
+    2. 确定相关参数
+    val logPath = reader.rootPath
+    val appCompleted = reader.completed
+    val reparseChunkSize = conf.get(END_EVENT_REPARSE_CHUNK_SIZE)
+    val shouldHalt = enableOptimizations &&
+      ((!appCompleted && fastInProgressParsing) || reparseChunkSize > 0)
+    val bus = new ReplayListenerBus()
+    val listener = new AppListingListener(reader, clock, shouldHalt)
+    bus.addListener(listener)
+    logInfo(s"Parsing $logPath for listing data...")
+    val logFiles = reader.listEventLogFiles
+    3. 转换应用事件日志
+    parseAppEventLogs(logFiles, bus, !appCompleted, eventsFilter)
+    4. 获取查询事件
+    如果上面允许使用,当有足够的信息去创建列表信息的时候,列表监听器会停止转换.当应用完成的时候,快速转换就被取消了,仍然需要重演,直到日志文件的结尾.尝试去获取应用和结束时间.这个代码跳过了底层流以便以可以指向任何日志文件的结尾,这样就可以不用读取和一行一行的转换了.因为应用和时间在spark子系统调度的时候希尔，不能保证结束事件在日志中，所以为了保证安全，代码必须使用配置数据块去在文件末尾进行转换，且如果需要的数据找不到的话，尝试转换整个日志。
+    注意到跳过压缩文件的字节的代价是不晓得，所以有一些键树在普通的日志文件上,通过重演总线进行控制.代码会重新打开文件,以便可以确定跳转到的位置.这颗不如仅仅跳转到当前位置来的划算,但是是个确定当前位置的好方式.意味重演监视器总线缓冲数据在内部,
+    val lookForEndEvent = shouldHalt && (appCompleted || !fastInProgressParsing)
+    if (lookForEndEvent && listener.applicationInfo.isDefined) {
+      val lastFile = logFiles.last
+      Utils.tryWithResource(EventLogFileReader.openEventLog(lastFile.getPath, fs)) {
+          in =>
+        val target = lastFile.getLen - reparseChunkSize
+        if (target > 0) {
+          logInfo(s"Looking for end event; skipping $target bytes from $logPath...")
+          var skipped = 0L
+          while (skipped < target) {
+            skipped += in.skip(target - skipped)
+          }
+        }
+        val source = Source.fromInputStream(in).getLines()
+        if (target > 0) {
+          source.next()
+        }
+        bus.replay(source, lastFile.getPath.toString, !appCompleted, eventsFilter)
+      }
+    }
+    5. 处理应用信息
+    listener.applicationInfo match {
+      case Some(app) if !lookForEndEvent || app.attempts.head.info.completed =>
+        invalidateUI(app.info.id, app.attempts.head.info.attemptId)
+        addListing(app)
+        listing.write(LogInfo(
+            logPath.toString(), scanTime, LogType.EventLogs, Some(app.info.id),
+          app.attempts.head.info.attemptId, reader.fileSizeForLastIndex,
+          reader.lastIndex, reader.completed))
+        if (appCompleted && reader.lastIndex.isEmpty) {
+          val inProgressLog = logPath.toString() + EventLogFileWriter.IN_PROGRESS
+          try {
+            listing.read(classOf[LogInfo], inProgressLog)
+            if (!fs.isFile(new Path(inProgressLog))) {
+              listing.delete(classOf[LogInfo], inProgressLog)
+            }
+          } catch {
+            case _: NoSuchElementException =>
+          }
+        }
+      case Some(_) =>
+        logInfo(s"Reparsing $logPath since end event was not found.")
+        mergeApplicationListing(reader, scanTime, enableOptimizations = false)
+      case _ =>
+        listing.write(
+          LogInfo(logPath.toString(), scanTime, LogType.EventLogs, None, None,
+            reader.fileSizeForLastIndex, reader.lastIndex, reader.completed))
+    }
+    
+    def invalidateUI(appId: String, attemptId: Option[String]): Unit
+    功能: 是sparkUI失效
+    synchronized {
+      activeUIs.get((appId, attemptId)).foreach { ui =>
+        ui.invalidate()
+        ui.ui.store.close()
+      }
+    }
+    
+    def cleanLogs(): Unit
+    功能: 通过用户定义的清理策略删除事件日志
+    1. 清理需要的日志
+    val maxTime = clock.getTimeMillis() - conf.get(MAX_LOG_AGE_S) * 1000
+    val maxNum = conf.get(MAX_LOG_NUM)
+    val expired = listing.view(classOf[ApplicationInfoWrapper])
+      .index("oldestAttempt")
+      .reverse()
+      .first(maxTime)
+      .asScala
+      .toList
+    expired.foreach { app =>
+      val (remaining, toDelete) = app.attempts.partition { attempt =>
+        attempt.info.lastUpdated.getTime() >= maxTime
+      }
+      deleteAttemptLogs(app, remaining, toDelete)
+    }
+    2. 删除没有合法应用的且超过配置最大年龄的日志文件
+    val stale = listing.view(classOf[LogInfo])
+      .index("lastProcessed")
+      .reverse()
+      .first(maxTime)
+      .asScala
+      .filter { l => l.logType == null || l.logType == LogType.EventLogs }
+      .toList
+    stale.foreach { log =>
+      if (log.appId.isEmpty) {
+        logInfo(s"Deleting invalid / corrupt event log ${log.logPath}")
+        deleteLog(fs, new Path(log.logPath))
+        listing.delete(classOf[LogInfo], log.logPath)
+      }
+    }
+    3. 如果文件数量大于MAX_LOG_NUM,一个一个地清除所有完成的请求
+    val num = listing.view(classOf[LogInfo]).index("lastProcessed").asScala.size
+    var count = num - maxNum
+    if (count > 0) {
+      logInfo(s"Try to delete $count old event logs to keep $maxNum logs in total.")
+      val oldAttempts = listing.view(classOf[ApplicationInfoWrapper])
+        .index("oldestAttempt")
+        .asScala
+      oldAttempts.foreach { app =>
+        if (count > 0) {
+          val (toDelete, remaining) = app.attempts.partition(_.info.completed)
+          count -= deleteAttemptLogs(app, remaining, toDelete)
+        }
+      }
+      if (count > 0) {
+        logWarning(s"Fail to clean up according to MAX_LOG_NUM policy ($maxNum).")
+      }
+    }
+	4. 清理黑名单列表
+    clearBlacklist(CLEAN_INTERVAL_S)
+    
+    def deleteAttemptLogs(
+      app: ApplicationInfoWrapper,
+      remaining: List[AttemptInfoWrapper],
+      toDelete: List[AttemptInfoWrapper]): Int
+    功能: 删除请求日志
+    if (remaining.nonEmpty) {
+      val newApp = new ApplicationInfoWrapper(app.info, remaining)
+      listing.write(newApp)
+    }
+    var countDeleted = 0
+    toDelete.foreach { attempt =>
+      logInfo(s"Deleting expired event log for ${attempt.logPath}")
+      val logPath = new Path(logDir, attempt.logPath)
+      listing.delete(classOf[LogInfo], logPath.toString())
+      cleanAppData(app.id, attempt.info.attemptId, logPath.toString())
+      if (deleteLog(fs, logPath)) {
+        countDeleted += 1
+      }
+    }
+    if (remaining.isEmpty) {
+      listing.delete(app.getClass(), app.id)
+    }
+    val= countDeleted
+    
+    def cleanDriverLogs(): Unit
+    功能: 清理配置的spark dfs目录的驱动器日志(超出最大年龄)
+    val driverLogDir = conf.get(DRIVER_LOG_DFS_DIR).get
+    val driverLogFs = new Path(driverLogDir).getFileSystem(hadoopConf)
+    val currentTime = clock.getTimeMillis()
+    val maxTime = currentTime - conf.get(MAX_DRIVER_LOG_AGE_S) * 1000
+    val logFiles = driverLogFs.listLocatedStatus(new Path(driverLogDir))
+    while (logFiles.hasNext()) {
+      val f = logFiles.next()
+      val deleteFile =
+        try {
+          val info = listing.read(classOf[LogInfo], f.getPath().toString())
+          if (info.fileSize < f.getLen() ||
+              info.lastProcessed < f.getModificationTime()) {
+            listing.write(
+              info.copy(lastProcessed = currentTime, fileSize = f.getLen()))
+            false
+          } else if (info.lastProcessed > maxTime) {
+            false
+          } else {
+            true
+          }
+        } catch {
+          case e: NoSuchElementException =>
+            listing.write(LogInfo(
+                f.getPath().toString(), currentTime, LogType.DriverLogs, None,
+              None, f.getLen(), None, false))
+          false
+        }
+      if (deleteFile) {
+        logInfo(s"Deleting expired driver log for: ${f.getPath().getName()}")
+        listing.delete(classOf[LogInfo], f.getPath().toString())
+        deleteLog(driverLogFs, f.getPath())
+      }
+    }
+    val stale = listing.view(classOf[LogInfo])
+      .index("lastProcessed")
+      .reverse()
+      .first(maxTime)
+      .asScala
+      .filter { l => l.logType != null && l.logType == LogType.DriverLogs }
+      .toList
+    stale.foreach { log =>
+      logInfo(s"Deleting invalid driver log ${log.logPath}")
+      listing.delete(classOf[LogInfo], log.logPath)
+      deleteLog(driverLogFs, new Path(log.logPath))
+    }
+    
+    def rebuildAppStore(
+      store: KVStore,
+      reader: EventLogFileReader,
+      lastUpdated: Long): Unit
+    功能: 重建应用存储
+    val replayConf = conf.clone().set(ASYNC_TRACKING_ENABLED, false)
+    val trackingStore = new ElementTrackingStore(store, replayConf)
+    val replayBus = new ReplayListenerBus()
+    val listener = new AppStatusListener(trackingStore, replayConf, false,
+      lastUpdateTime = Some(lastUpdated))
+    replayBus.addListener(listener)
+    for {
+      plugin <- loadPlugins()
+      listener <- plugin.createListeners(conf, trackingStore)
+    } replayBus.addListener(listener)
+    try {
+      logInfo(s"Parsing ${reader.rootPath} to re-build UI...")
+      parseAppEventLogs(reader.listEventLogFiles, replayBus, !reader.completed)
+      trackingStore.close(false)
+      logInfo(s"Finished parsing ${reader.rootPath}")
+    } catch {
+      case e: Exception =>
+        Utils.tryLogNonFatalError {
+          trackingStore.close()
+        }
+        throw e
+    }
+    
+    def parseAppEventLogs(
+      logFiles: Seq[FileStatus],
+      replayBus: ReplayListenerBus,
+      maybeTruncated: Boolean,
+      eventsFilter: ReplayEventsFilter = SELECT_ALL_FILTER): Unit
+    功能: 转换应用事件日志
+    var continueReplay = true
+    logFiles.foreach { file =>
+      if (continueReplay) {
+        Utils.tryWithResource(EventLogFileReader.openEventLog(file.getPath, fs)) { in =>
+          continueReplay = replayBus.replay(in, file.getPath.toString,
+            maybeTruncated = maybeTruncated, eventsFilter = eventsFilter)
+        }
+      }
+    }
+    
+    def isFsInSafeMode(): Boolean
+    功能: 检查HDFS是否处于安全模式下
+    val= fs match {
+        case dfs: DistributedFileSystem =>
+          isFsInSafeMode(dfs)
+        case _ =>
+          false
+      }
+    
+    def isFsInSafeMode(dfs: DistributedFileSystem): Boolean
+    功能: 检查是否处于安全模式下
+    val= dfs.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_GET, true)
+    
+    def toString: String
+    功能: 诊断信息显示
+    val count = listing.count(classOf[ApplicationInfoWrapper])
+    val= s"""|FsHistoryProvider{logdir=$logDir,
+        |  storedir=$storePath,
+        |  last scan time=$lastScanTime
+        |  application count=$count}""".stripMargin
+    
+    def load(appId: String): ApplicationInfoWrapper
+    功能: 加载应用信息
+    val= listing.read(classOf[ApplicationInfoWrapper], appId)
+    
+    def addListing(app: ApplicationInfoWrapper): Unit 
+    功能: 将应用信息写入给定的存储器,序列化,从而去避免两个线程同时请求同一个应用
+    val attempt = app.attempts.head
+    val oldApp = try {
+      load(app.id)
+    } catch {
+      case _: NoSuchElementException =>
+        app
+    }
+    def compareAttemptInfo(a1: AttemptInfoWrapper, a2: AttemptInfoWrapper): Boolean = {
+      a1.info.startTime.getTime() > a2.info.startTime.getTime()
+    }
+    val attempts = oldApp.attempts.filter(_.info.attemptId != attempt.info.attemptId) ++
+      List(attempt)
+    val newAppInfo = new ApplicationInfoWrapper(
+      app.info,
+      attempts.sortWith(compareAttemptInfo))
+    listing.write(newAppInfo)
+    
+    def loadDiskStore(
+      dm: HistoryServerDiskManager,
+      appId: String,
+      attempt: AttemptInfoWrapper): KVStore
+    功能: 加载磁盘存储器
+    val metadata = new AppStatusStoreMetadata(AppStatusStore.CURRENT_VERSION)
+    dm.openStore(appId, attempt.info.attemptId).foreach { path =>
+      try {
+        return KVUtils.open(path, metadata)
+      } catch {
+        case e: Exception =>
+          logInfo(s"Failed to open existing store for 
+          $appId/${attempt.info.attemptId}.", e)
+          dm.release(appId, attempt.info.attemptId, delete = true)
+      }
+    }
+    val reader = EventLogFileReader(fs, new Path(logDir, attempt.logPath),
+      attempt.lastIndex)
+    val isCompressed = reader.compressionCodec.isDefined
+    logInfo(s"Leasing disk manager space for app $appId / ${attempt.info.attemptId}...")
+    val lease = dm.lease(reader.totalSize, isCompressed)
+    val newStorePath = try {
+      Utils.tryWithResource(KVUtils.open(lease.tmpPath, metadata)) { store =>
+        rebuildAppStore(store, reader, attempt.info.lastUpdated.getTime())
+      }
+      lease.commit(appId, attempt.info.attemptId)
+    } catch {
+      case e: Exception =>
+        lease.rollback()
+        throw e
+    }
+    val= KVUtils.open(newStorePath, metadata)
+    
+    def createInMemoryStore(attempt: AttemptInfoWrapper): KVStore
+    功能: 创建内存存储器
+    val store = new InMemoryStore()
+    val reader = EventLogFileReader(fs, new Path(logDir, attempt.logPath),
+      attempt.lastIndex)
+    rebuildAppStore(store, reader, attempt.info.lastUpdated.getTime())
+    val= store
+    
+    def loadPlugins(): Iterable[AppHistoryServerPlugin]
+    功能: 加载插件
+    val= ServiceLoader.load(
+        classOf[AppHistoryServerPlugin], Utils.getContextOrSparkClassLoader).asScala
+    
+    def getAttempt(appId: String, attemptId: Option[String]): AttemptInfoWrapper 
+    功能: 获取请求信息,测试使用
+    val= load(appId).attempts.find(_.info.attemptId == attemptId).getOrElse(
+      throw new NoSuchElementException(s"Cannot find attempt $attemptId of $appId."))
+    
+    def deleteLog(fs: FileSystem, log: Path): Boolean
+    功能: 删除指定日志
+    var deleted = false
+    if (isBlacklisted(log)) {
+      logDebug(s"Skipping deleting $log as we don't have permissions on it.")
+    } else {
+      try {
+        deleted = fs.delete(log, true)
+      } catch {
+        case _: AccessControlException =>
+          logInfo(s"No permission to delete $log, ignoring.")
+        case ioe: IOException =>
+          logError(s"IOException in cleaning $log", ioe)
+      }
+    }
+    val= deleted
+}
+```
+
+```scala
+private[history] object FsHistoryProvider {
+    属性:
+    #name @APPL_START_EVENT_PREFIX = "{\"Event\":\"SparkListenerApplicationStart\""
+    	应用启动事件前缀
+    #name @APPL_END_EVENT_PREFIX = "{\"Event\":\"SparkListenerApplicationEnd\""
+    	应用结束事件前缀
+    #name @LOG_START_EVENT_PREFIX = "{\"Event\":\"SparkListenerLogStart\""
+    	日志启动事件前缀
+    #name @ENV_UPDATE_EVENT_PREFIX = "{\"Event\":\"SparkListenerEnvironmentUpdate\","
+    	环境更新事件前缀
+    #name @CURRENT_LISTING_VERSION = 1L	当前写出展示数据库数据的版本
+}
+```
+
+```scala
+private[history] case class FsHistoryProviderMetadata(
+    version: Long,
+    uiVersion: Long,
+    logDir: String)
+结束: 文件系统提供程序元数据
+构造器参数:
+	version 版本信息
+	uiVersion	web版本信息
+	logDir	日志目录
+
+private[history] object LogType extends Enumeration {
+  介绍: 记录类型
+    驱动器日志/事件日志
+  val DriverLogs, EventLogs = Value
+}
+
+private[history] case class LogInfo(
+    @KVIndexParam logPath: String,
+    @KVIndexParam("lastProcessed") lastProcessed: Long,
+    logType: LogType.Value,
+    appId: Option[String],
+    attemptId: Option[String],
+    fileSize: Long,
+    @JsonDeserialize(contentAs = classOf[JLong])
+    lastIndex: Option[Long],
+    isComplete: Boolean)
+介绍: 日志信息
+构造器参数:
+	logPath	日志路径
+	lastProcessed	上一个进程号
+	logType	日志类型
+	appId	应用编号
+	attemptId	请求编号
+	fileSize	文件大小
+	lastIndex	最后一个文件的索引
+	isComplete	是否完成
+
+private[history] class AttemptInfoWrapper(
+    val info: ApplicationAttemptInfo,
+    val logPath: String,
+    val fileSize: Long,
+    @JsonDeserialize(contentAs = classOf[JLong])
+    val lastIndex: Option[Long],
+    val adminAcls: Option[String],
+    val viewAcls: Option[String],
+    val adminAclsGroups: Option[String],
+    val viewAclsGroups: Option[String])
+介绍: 请求信息
+构造器参数:
+	info	应用请求信息
+	logPath	日志路径
+	fileSize	文件大小
+	lastIndex	最后一个文件索引
+	adminAcls	管理访问控制器
+	viewAcls	视图访问控制器
+	adminAclsGroups	管理访问控制组
+	viewAclsGroups	视图访问控制组
+```
+
+```scala
+private[history] class ApplicationInfoWrapper(
+    val info: ApplicationInfo,
+    val attempts: List[AttemptInfoWrapper]) {
+    介绍: 应用信息
+    构造器参数:
+    	info	应用信息
+    	attempts	请求信息列表
+    操作集:
+    def id: String = info.id
+    功能: 获取应用ID
+    
+    def endTime(): Long = attempts.head.info.endTime.getTime()
+    功能: 获取应用结束时间
+    
+    def oldestAttempt(): Long = attempts.map(_.info.lastUpdated.getTime()).min
+    功能: 获取最老版本的信息
+    
+    def toApplicationInfo(): ApplicationInfo = info.copy(attempts = attempts.map(_.info))
+    功能: 转化为应用信息
+}
+```
+
+```scala
+private[history] class AppListingListener(
+    reader: EventLogFileReader,
+    clock: Clock,
+    haltEnabled: Boolean) extends SparkListener {
+    介绍: 应用列表监听器
+    构造器参数:
+    	reader	事件日志读取器
+    	clock	时钟
+    	haltEnabled	是否允许停止
+    属性:
+    #name @app=new MutableApplicationInfo()	应用信息
+    #name @attempt	请求信息
+    val= new MutableAttemptInfo(reader.rootPath.getName(),
+    reader.fileSizeForLastIndex, reader.lastIndex)
+    #name @gotEnvUpdate = false	是否更新了环境变量
+    #name @halted = false	停止标记
+    
+    操作集:
+    def onApplicationStart(event: SparkListenerApplicationStart): Unit
+    功能: 处理应用启动
+    app.id = event.appId.orNull
+    app.name = event.appName
+    attempt.attemptId = event.appAttemptId
+    attempt.startTime = new Date(event.time)
+    attempt.lastUpdated = new Date(clock.getTimeMillis())
+    attempt.sparkUser = event.sparkUser
+    checkProgress()
+    
+    def onApplicationEnd(event: SparkListenerApplicationEnd): Unit
+    功能: 应用结束处理
+    attempt.endTime = new Date(event.time)
+    attempt.lastUpdated = new Date(reader.modificationTime)
+    attempt.duration = event.time - attempt.startTime.getTime()
+    attempt.completed = true
+    
+    def onEnvironmentUpdate(event: SparkListenerEnvironmentUpdate): Unit
+    功能: 更新环境变量
+    if (!gotEnvUpdate) {
+      def emptyStringToNone(
+          strOption: Option[String]): Option[String] = strOption match {
+        case Some("") => None
+        case _ => strOption
+      }
+      val allProperties = event.environmentDetails("Spark Properties").toMap
+      attempt.viewAcls = emptyStringToNone(allProperties.get(UI_VIEW_ACLS.key))
+      attempt.adminAcls = emptyStringToNone(allProperties.get(ADMIN_ACLS.key))
+      attempt.viewAclsGroups = emptyStringToNone(
+          allProperties.get(UI_VIEW_ACLS_GROUPS.key))
+      attempt.adminAclsGroups = emptyStringToNone(
+          allProperties.get(ADMIN_ACLS_GROUPS.key))
+      gotEnvUpdate = true
+      checkProgress()
+    }
+    
+    def onOtherEvent(event: SparkListenerEvent): Unit
+    功能: 处理其他事件
+    event match {
+        case SparkListenerLogStart(sparkVersion) =>
+          attempt.appSparkVersion = sparkVersion
+        case _ =>
+      }
+    
+    def applicationInfo: Option[ApplicationInfoWrapper]
+    功能: 获取应用信息
+    val= if (app.id != null) {
+      Some(app.toView())
+    } else {
+      None
+    }
+    
+    def checkProgress(): Unit
+    功能: 检查进程,如果有足够的数据创建应用,则抛出异常
+    if (haltEnabled && !halted && app.id != null && gotEnvUpdate) {
+      halted = true
+      throw new HaltReplayException()
+    }
+    
+    内部类:
+    private class MutableApplicationInfo {
+        介绍: 多值应用信息
+        属性:
+        #name @id: String = null	应用信息
+        #name @name: String = null	应用名称
+        #name @coresGranted: Option[Int] = None	核心数量
+        #name @maxCores: Option[Int] = None	最大核心数量
+        #name @coresPerExecutor: Option[Int] = None	每个执行器的核心数量
+        #name @memoryPerExecutorMB: Option[Int] = None	每个执行器的内存量
+        操作集:
+        def toView(): ApplicationInfoWrapper
+        功能: 转换为视图
+        val apiInfo = ApplicationInfo(id, name, coresGranted, maxCores, coresPerExecutor,
+        memoryPerExecutorMB, Nil)
+        val= new ApplicationInfoWrapper(apiInfo, List(attempt.toView()))
+    }
+    
+    private class MutableAttemptInfo(
+        logPath: String, fileSize: Long, lastIndex: Option[Long]) {
+        属性:
+        #name @attemptId: Option[String] = None	请求id
+        #name @startTime = new Date(-1)	开始时间
+        #name @endTime = new Date(-1)	结束时间
+        #name @lastUpdated = new Date(-1)	上次更新时间
+        #name @duration = 0L	持续时间
+        #name @sparkUser: String = null	sparkUser
+        #name @completed = false	完成标记
+        #name @appSparkVersion = ""	应用spark版本
+        #name @adminAcls: Option[String] = None 访问控制器
+        #name @viewAcls: Option[String] = None	视图访问控制器
+        #name @adminAclsGroups: Option[String] = None	管理访问控制组
+        #name @viewAclsGroups: Option[String] = None	视图访问控制组
+        操作集:
+        def toView(): AttemptInfoWrapper
+        功能: 转换为视图信息
+        val apiInfo = ApplicationAttemptInfo(
+            attemptId,
+            startTime,
+            endTime,
+            lastUpdated,
+            duration,
+            sparkUser,
+            completed,
+            appSparkVersion)
+         val= new AttemptInfoWrapper(
+            apiInfo,
+            logPath,
+            fileSize,
+            lastIndex,
+            adminAcls,
+            viewAcls,
+            adminAclsGroups,
+            viewAclsGroups)
+    }
+}
+```
+
 ##### HistoryAppStatusStore
 
 ```scala
@@ -1521,11 +2623,239 @@ private class HistoryServerDiskManager(
     path: File,
     listing: KVStore,
     clock: Clock) extends Logging {
-    介绍: 
+    介绍: 历史服务器的磁盘管理器
+    这个类使用SHS追踪磁盘的使用，当使用超出配置的容量的时候，允许应用数据从磁盘中删除。这个类的目标不是确保使用不会超出容器的，，当应用数据写出时，磁盘使用会暂时的上升，但是最终会降落到容量值以下。
+    构造器参数:
+    	conf	spark配置
+    	parh	路径位置
+    	listing	kv存储器
+    	clock	时钟
+    属性:
+    #name @appStoreDir = new File(path, "apps")	应用存储目录
+    #name @tmpStoreDir = new File(path, "temp")	临时存储目录
+    #name @maxUsage = conf.get(MAX_LOCAL_DISK_USAGE)	最大使用量
+    #name @currentUsage = new AtomicLong(0L)	当前使用量
+    #name @committedUsage = new AtomicLong(0L)	已提交使用量
+    #name @active = new HashMap[(String, Option[String]), Long]()	激活列表
+    初始化操作:
+    if (!appStoreDir.isDirectory() && !appStoreDir.mkdir()) {
+        throw new IllegalArgumentException(s"Failed to create app directory
+        ($appStoreDir).")
+      }
+    if (!tmpStoreDir.isDirectory() && !tmpStoreDir.mkdir()) {
+        throw new IllegalArgumentException(s"Failed to create temp directory
+        ($tmpStoreDir).")
+      }
+    功能: 目录合法性校验
+    
+    操作集:
+    def initialize(): Unit
+    功能: 初始化
+    1. 更新使用情况
+    updateUsage(sizeOf(appStoreDir), committed = true)
+    2. 启动时清除临时目录
+    tmpStoreDir.listFiles().foreach(FileUtils.deleteQuietly)
+    3. 遍历记录的存储目录,并移除外部代码移除的目录
+    val orphans = listing.view(classOf[ApplicationStoreInfo]).asScala.filter { info =>
+      !new File(info.path).exists()
+    }.toSeq
+    orphans.foreach { info =>
+      listing.delete(info.getClass(), info.path)
+    }
+    logInfo("Initialized disk manager: " +
+      s"current usage = ${Utils.bytesToString(currentUsage.get())}, " +
+      s"max usage = ${Utils.bytesToString(maxUsage)}")
+    
+    def lease(eventLogSize: Long, isCompressed: Boolean = false): Lease 
+    功能: 租用存储空间,租用空间作为给定事件日志的一部分,这个是一个粗略计算,意味着应用可以与租用的空间不一样.如果没有足够的租用空间,其他应用可以释放空间从而形成新的空间.这个方法总是返回一个租用使用的对象,意味着对于本地磁盘使用,如果在没有足够的释放空间应用的时候,可能会超出配置容量.
+    当租约开启的时候,数据会被写出到临时目录中,所以@openStore()会返回None给应用
+    1. 确保有足够的租用空间
+    val needed = approximateSize(eventLogSize, isCompressed)
+    makeRoom(needed)
+    2. 创建临时目录,并修改权限
+    val tmp = Utils.createTempDir(tmpStoreDir.getPath(), "appstore")
+    Utils.chmod700(tmp)
+    3. 更新使用情况
+    updateUsage(needed)
+    val current = currentUsage.get()
+    if (current > maxUsage) {
+      logInfo(s"Lease of ${Utils.bytesToString(needed)} may cause usage to exceed max " +
+        s"(${Utils.bytesToString(current)} > ${Utils.bytesToString(maxUsage)})")
+    }
+    val= new Lease(tmp, needed)
+    
+    def openStore(appId: String, attemptId: Option[String]): Option[File]
+    功能: 打开存储器,如果可以的话返回应用存储的位置,将存储标记为已经被使用,以便在指定位置之外没有被释放状态
+    1. 获取存储路径
+    val storePath = active.synchronized {
+      val path = appStorePath(appId, attemptId)
+      if (path.isDirectory()) {
+        active(appId -> attemptId) = sizeOf(path)
+        Some(path)
+      } else {
+        None
+      }
+    }
+    2. 更新获取的时间
+    storePath.foreach { path =>
+      updateAccessTime(appId, attemptId)
+    }
+    val= storePath
+    
+    def release(appId: String, attemptId: Option[String], delete: Boolean = false): Unit
+    功能: 释放租借,向磁盘管理器表名给定应用没有占用存储
+    1. 从信息表中移除指定应用的条目,由于levelDB可能修改刚读取的存储文件的结构,当前关闭时对其进行计数的更新即可
+    val oldSizeOpt = active.synchronized {
+      active.remove(appId -> attemptId)
+    }
+    2. 从存储中移除删除的条目
+    oldSizeOpt.foreach { oldSize =>
+      val path = appStorePath(appId, attemptId)
+      updateUsage(-oldSize, committed = true)
+      if (path.isDirectory()) {
+        if (delete) {
+          deleteStore(path)
+        } else {
+          val newSize = sizeOf(path)
+          val newInfo = listing.read(
+              classOf[ApplicationStoreInfo], path.getAbsolutePath())
+            .copy(size = newSize)
+          listing.write(newInfo)
+          updateUsage(newSize, committed = true)
+        }
+      }
+    }
+    
+    def makeRoom(size: Long): Unit 
+    功能: 生成指定大小的空间
+    1. 计算需要释放的空间
+    if (free() < size) {
+      logDebug(s"Not enough free space, looking at candidates for deletion...")
+      val evicted = new ListBuffer[ApplicationStoreInfo]()
+      Utils.tryWithResource(listing.view(
+          classOf[ApplicationStoreInfo]).index("lastAccess").closeableIterator()
+      ) { iter =>
+        var needed = size
+        while (needed > 0 && iter.hasNext()) {
+          val info = iter.next()
+          val isActive = active.synchronized {
+            active.contains(info.appId -> info.attemptId)
+          }
+          if (!isActive) {
+            evicted += info
+            needed -= info.size
+          }
+        }
+      }
+    }
+    2. 实际释放空间
+    if (evicted.nonEmpty) {
+        val freed = evicted.map { info =>
+          logInfo(s"Deleting store for ${info.appId}/${info.attemptId}.")
+          deleteStore(new File(info.path))
+          updateUsage(-info.size, committed = true)
+          info.size
+        }.sum
+        logInfo(s"Deleted ${evicted.size} store(s) to free 
+        ${Utils.bytesToString(freed)} " +
+          s"(target = ${Utils.bytesToString(size)}).")
+      } else {
+        logWarning(s"Unable to free any space to make room 
+        for ${Utils.bytesToString(size)}.")
+      }
+    
+    def appStorePath(appId: String, attemptId: Option[String]): File
+    功能: 获取应用存储路径
+    val fileName = appId + attemptId.map("_" + _).getOrElse("") + ".ldb"
+    val= new File(appStoreDir, fileName)
+    
+    def updateAccessTime(appId: String, attemptId: Option[String]): Unit
+    功能: 更新获取时间
+    val path = appStorePath(appId, attemptId)
+    val info = ApplicationStoreInfo(
+        path.getAbsolutePath(), clock.getTimeMillis(), appId, attemptId,sizeOf(path))
+    val= listing.write(info)
+    
+    def updateUsage(delta: Long, committed: Boolean = false): Unit 
+    功能: 增量式更新当前空间使用情况
+    1. 更新当前空间使用量
+    val updated = currentUsage.addAndGet(delta)
+    if (updated < 0) {
+      throw new IllegalStateException(
+        s"Disk usage tracker went negative (now = $updated, delta = $delta)")
+    }
+    2. 更新提交的空间使用量
+    if (committed) {
+      val updatedCommitted = committedUsage.addAndGet(delta)
+      if (updatedCommitted < 0) {
+        throw new IllegalStateException(
+          s"Disk usage tracker went negative (now = $updatedCommitted, delta = $delta)")
+      }
+    }
+    
+    def sizeOf(path: File): Long = FileUtils.sizeOf(path)
+    功能: 返回目录的大小
+    
+    内部类:
+    private[history] class Lease(val tmpPath: File, private val leased: Long) {
+        介绍: 存储租约
+        构造器参数:
+        	tmpPath	临时目录
+        	leased	租用空间大小
+        操作集:
+        def commit(appId: String, attemptId: Option[String]): File
+        功能: 提交租用空间信息到最终位置,更新计数信息,这个方法标记应用为激活状态,所以存储器不能释放其内存
+    	val dst = appStorePath(appId, attemptId)
+          active.synchronized {
+            require(!active.contains(appId -> attemptId),
+              s"Cannot commit lease for active application $appId / $attemptId")
+            if (dst.isDirectory()) {
+              val size = sizeOf(dst)
+              deleteStore(dst)
+              updateUsage(-size, committed = true)
+            }
+          }
+          updateUsage(-leased)
+          val newSize = sizeOf(tmpPath)
+          makeRoom(newSize)
+          tmpPath.renameTo(dst)
+          updateUsage(newSize, committed = true)
+          if (committedUsage.get() > maxUsage) {
+            val current = Utils.bytesToString(committedUsage.get())
+            val max = Utils.bytesToString(maxUsage)
+            logWarning(s"Commit of application $appId / $attemptId causes 
+            maximum disk usage to be " +
+              s"exceeded ($current > $max)")
+          }
+          updateAccessTime(appId, attemptId)
+          active.synchronized {
+            active(appId -> attemptId) = newSize
+          }
+          dst
+    	}
+    
+    def rollback(): Unit 
+    功能: 回滚,删除创建租用空间的临时目录
+    updateUsage(-leased)
+    FileUtils.deleteDirectory(tmpPath)
 }
 ```
 
-
+```scala
+private case class ApplicationStoreInfo(
+    @KVIndexParam path: String,
+    @KVIndexParam("lastAccess") lastAccess: Long,
+    appId: String,
+    attemptId: Option[String],
+    size: Long)
+介绍: 应用存储信息
+构造器参数:
+	path	应用路径
+	lastAccess	上次访问时间
+	appId	应用编号
+	attemptId	请编号
+	size	应用占用空间大小
+```
 
 #### master
 
