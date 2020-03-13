@@ -1,4 +1,3 @@
----
 
 1.  [CheckPoint.scala](CheckPoint)
 2.  [ContextWaiter.scala](ContextWaiter)
@@ -10,8 +9,6 @@
 8. [StreamingContext.scala](StreamingContext)
 9. [StreamingSource.scala](StreamingSource)
 10. [Time.scala](Time)
-
----
 
 #### CheckPoint
 
