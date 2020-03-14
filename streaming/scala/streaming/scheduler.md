@@ -1656,6 +1656,574 @@ private[streaming] class ReceiverSchedulingPolicy {
 
 #### ReceiverTracker
 
+```scala
+private[streaming] object ReceiverState extends Enumeration {
+    介绍: 接收器状态
+    type ReceiverState = Value
+    val INACTIVE, SCHEDULED, ACTIVE = Value
+    状态列表:
+    INACTIVE 未激活
+    SCHEDULED	调度状态
+    ACTIVE	激活状态
+}
+```
+
+```scala
+private[streaming] sealed trait ReceiverTrackerMessage
+介绍: 接收器定位消息
+
+private[streaming] case class RegisterReceiver(
+    streamId: Int,
+    typ: String,
+    host: String,
+    executorId: String,
+    receiverEndpoint: RpcEndpointRef
+  ) extends ReceiverTrackerMessage
+介绍: 注册接收器事件
+
+private[streaming] case class AddBlock(receivedBlockInfo: ReceivedBlockInfo)
+  extends ReceiverTrackerMessage
+介绍: 添加数据块消息
+
+private[streaming] case class ReportError(streamId: Int, message: String, error: String)
+介绍: 汇报错误消息
+
+private[streaming] case class DeregisterReceiver(
+    streamId: Int, msg: String, error: String)
+extends ReceiverTrackerMessage
+介绍: 解除接收器的注册
+
+private[streaming] sealed trait ReceiverTrackerLocalMessage
+介绍: 接收器定位消息,用于驱动器和接收器定位端点间的本地交互
+
+private[streaming] case class RestartReceiver(receiver: Receiver[_])
+  extends ReceiverTrackerLocalMessage
+介绍: 重启接收器消息
+
+private[streaming] case class StartAllReceivers(receiver: Seq[Receiver[_]])
+  extends ReceiverTrackerLocalMessage
+介绍: 重启所有接收器消息
+
+private[streaming] case object StopAllReceivers extends ReceiverTrackerLocalMessage
+介绍: 停止所有接收器消息
+
+private[streaming] case object AllReceiverIds extends ReceiverTrackerLocalMessage
+介绍: 获取所有接收器编号消息
+
+private[streaming] case class UpdateReceiverRateLimit(streamUID: Int, newRate: Long)
+  extends ReceiverTrackerLocalMessage
+介绍: 更新接收器比例界限值消息
+
+private[streaming] case object GetAllReceiverInfo extends ReceiverTrackerLocalMessage
+介绍: 获取所有接收器信息消息
+```
+
+```scala
+private[streaming]
+class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false) 
+extends Logging {
+    介绍: 接收器定位器
+    这个类管理器@ReceiverInputDStreams的接收器的执行,这个类的实例必须在所有输入流添加完毕,并使用@StreamingContext.start()之后才能创建,因为需要输入流的最终集合才能实例化
+    构造器参数:
+    ssc	streaming上下文
+    skipReceiverLaunch	是否跳过接收器的运行
+    属性:
+    #name @receiverInputStreams = ssc.graph.getReceiverInputStreams()	接收器输入流
+    #name @receiverInputStreamIds = receiverInputStreams.map { _.id }	接收器输入流编号列表
+    #name @receivedBlockTracker	接收数据块定位器
+    val= new ReceivedBlockTracker(
+        ssc.sparkContext.conf,
+        ssc.sparkContext.hadoopConfiguration,
+        receiverInputStreamIds,
+        ssc.scheduler.clock,
+        ssc.isCheckpointPresent,
+        Option(ssc.checkpointDir)
+      )
+    #name @listenerBus = ssc.scheduler.listenerBus	监听总线
+    #name @trackerState = Initialized	volatile	定位器状态(由状态锁@trackerStateLock保护)
+    #name @endpoint: RpcEndpointRef = null	RPC端点引用
+    #name @schedulingPolicy = new ReceiverSchedulingPolicy()	接收器调度策略
+    #name @receiverJobExitLatch = new CountDownLatch(receiverInputStreams.length)
+    	接收器job退出锁存器(降为0的时候失效)
+    #name @receiverTrackingInfos = new HashMap[Int, ReceiverTrackingInfo]
+    	接收器定位信息映射表
+    #name @receiverPreferredLocations = new HashMap[Int, Option[String]]
+    	接收器最佳位置映射表
+    操作集:
+    def start(): Unit 
+    功能: 启动追踪器(RPC端点和接收器执行线程)
+    if (isTrackerStarted) {
+      throw new SparkException("ReceiverTracker already started")
+    }
+    if (!receiverInputStreams.isEmpty) {
+      endpoint = ssc.env.rpcEnv.setupEndpoint(
+        "ReceiverTracker", new ReceiverTrackerEndpoint(ssc.env.rpcEnv))
+      if (!skipReceiverLaunch) launchReceivers()
+      logInfo("ReceiverTracker started")
+      trackerState = Started
+    }
+    
+    def stop(graceful: Boolean): Unit
+    功能: 停止接收器线程,可以选择是否处理完接收数据之后才退出@graceful
+    synchronized {
+        val isStarted: Boolean = isTrackerStarted
+        trackerState = Stopping
+        if (isStarted) {
+            if (!skipReceiverLaunch) {
+                1. 停止接收器,发送停止信号给所有接收器
+                endpoint.askSync[Boolean](StopAllReceivers)
+                2. 等待spark运行job完成,对于接收器来说需要@graceful执行完成
+                receiverJobExitLatch.await(10, TimeUnit.SECONDS)
+                if (graceful) {
+                    logInfo("Waiting for receiver job to terminate gracefully")
+                    receiverJobExitLatch.await()
+                    logInfo("Waited for receiver job to terminate gracefully")
+                }
+                3. 检查接收器是否都被解除注册
+                val receivers = endpoint.askSync[Seq[Int]](AllReceiverIds)
+                if (receivers.nonEmpty) {
+                    logWarning("Not all of the receivers 
+                    have deregistered, " + receivers)
+                } else {
+                    logInfo("All of the receivers have deregistered successfully")
+                }
+            }
+            4. 停止完毕之后,关闭RPC端点
+            ssc.env.rpcEnv.stop(endpoint)
+            endpoint = null
+        }
+        5. 停止定位器
+        receivedBlockTracker.stop()
+        logInfo("ReceiverTracker stopped")
+        trackerState = Stopped
+    }
+    
+    def allocateBlocksToBatch(batchTime: Time): Unit
+    功能: 分配数据块给指定批次@batchTime
+    if (receiverInputStreams.nonEmpty) {
+      receivedBlockTracker.allocateBlocksToBatch(batchTime)
+    }
+    
+    def getBlocksOfBatch(batchTime: Time): Map[Int, Seq[ReceivedBlockInfo]]
+    功能: 获取指定批次的数据块信息表
+    receivedBlockTracker.getBlocksOfBatch(batchTime)
+    
+    def getBlocksOfBatchAndStream(batchTime: Time, streamId: Int): Seq[ReceivedBlockInfo]
+    功能: 获取指定批次指定流接受的数据块信息列表@ReceivedBlockInfo
+    val= receivedBlockTracker.getBlocksOfBatchAndStream(batchTime, streamId)
+    
+    def cleanupOldBlocksAndBatches(cleanupThreshTime: Time): Unit
+    功能: 清除数据块的数据和元数据,且批次需要严格的小于指定时间@cleanupThreshTime
+    1. 清除数据块的数据和元数据
+    receivedBlockTracker.cleanupOldBatches(cleanupThreshTime, waitForCompletion = false)
+    2. 通知接收器删除旧数据块信息
+    if (WriteAheadLogUtils.enableReceiverLog(ssc.conf)) {
+      logInfo(s"Cleanup old received batch data: $cleanupThreshTime")
+      synchronized {
+        if (isTrackerStarted) {
+          endpoint.send(CleanupOldBlocks(cleanupThreshTime))
+        }
+      }
+    }
+    
+    def allocatedExecutors(): Map[Int, Option[String]] 
+    功能: 获取分配接收器的执行器映射表
+    synchronized {
+     if (isTrackerStarted) {
+       endpoint.askSync[Map[Int, ReceiverTrackingInfo]](GetAllReceiverInfo).mapValues {
+         _.runningExecutor.map {
+          _.executorId
+        }
+      }
+     } else {
+       Map.empty
+     }
+   }
+    
+    def numReceivers(): Int = receiverInputStreams.length
+    功能: 获取接收器的数量
+    
+    def registerReceiver(
+      streamId: Int,
+      typ: String,
+      host: String,
+      executorId: String,
+      receiverEndpoint: RpcEndpointRef,
+      senderAddress: RpcAddress
+    ): Boolean
+    功能: 注册接收器
+    1. 校验当前流@streamId是否在输入流列表中
+    if (!receiverInputStreamIds.contains(streamId)) {
+      throw new SparkException("Register received for unexpected id " + streamId)
+    }
+    2. 定位器状态校验
+    if (isTrackerStopping || isTrackerStopped) {
+      return false
+    }
+    3. 获取需要接受的执行器
+    // 确定调度位置
+    val scheduledLocations = receiverTrackingInfos(streamId).scheduledLocations
+    val acceptableExecutors = if (scheduledLocations.nonEmpty) {
+        // 表示当前接收器正在注册,使用@ReceiverSchedulingPolicy.scheduleReceivers调度
+        // 使用scheduledLocations检查
+        scheduledLocations.get
+      } else {
+        // 表示接收器以及使用@ReceiverSchedulingPolicy.rescheduleReceiver调度完毕,需要重新调度去
+        // 检查
+        scheduleReceiver(streamId)
+      }
+    4. 注册接收器
+    if (!isAcceptable) {
+      // Refuse it since it's scheduled to a wrong executor
+      false
+    } else {
+      val name = s"${typ}-${streamId}"
+      val receiverTrackingInfo = ReceiverTrackingInfo(
+        streamId,
+        ReceiverState.ACTIVE,
+        scheduledLocations = None,
+        runningExecutor = Some(ExecutorCacheTaskLocation(host, executorId)),
+        name = Some(name),
+        endpoint = Some(receiverEndpoint))
+      // 注册接收器信息
+      receiverTrackingInfos.put(streamId, receiverTrackingInfo)
+      listenerBus.post( // 发送监听事件
+      	StreamingListenerReceiverStarted(receiverTrackingInfo.toReceiverInfo))
+      logInfo("Registered receiver for stream " + streamId + " from " + senderAddress)
+      true
+    }
+    
+    def deregisterReceiver(streamId: Int, message: String, error: String): Unit 
+    功能: 解除接收器的注册
+    1. 确定错误信息
+    val lastErrorTime =
+      if (error == null || error == "") -1 else ssc.scheduler.clock.getTimeMillis()
+    val errorInfo = ReceiverErrorInfo(
+      lastErrorMessage = message, lastError = error, lastErrorTime = lastErrorTime)
+    2. 确定新的接收器定位信息
+    val newReceiverTrackingInfo = receiverTrackingInfos.get(streamId) match {
+      case Some(oldInfo) =>
+        oldInfo.copy(state = ReceiverState.INACTIVE, errorInfo = Some(errorInfo))
+      case None =>
+        logWarning("No prior receiver info")
+        ReceiverTrackingInfo(
+          streamId, ReceiverState.INACTIVE, None, None, None, None, Some(errorInfo))
+    }
+    3. 更新接收器定位信息到指定流@streamId中
+    receiverTrackingInfos(streamId) = newReceiverTrackingInfo
+    4. 发送监听事件
+    listenerBus.post(
+        StreamingListenerReceiverStopped(newReceiverTrackingInfo.toReceiverInfo))
+    val messageWithError = if (error != null && !error.isEmpty) {
+      s"$message - $error"
+    } else {
+      s"$message"
+    }
+    logError(s"Deregistered receiver for stream $streamId: $messageWithError")
+    
+    def sendRateUpdate(streamUID: Int, newRate: Long): Unit 
+    功能: 发送比例更新消息(RPC)(接收器最大消耗比)
+    synchronized {
+        if (isTrackerStarted) {
+          endpoint.send(UpdateReceiverRateLimit(streamUID, newRate))
+        }
+      }
+    
+    def addBlock(receivedBlockInfo: ReceivedBlockInfo): Boolean
+    功能: 给定流添加新的数据块
+    receivedBlockTracker.addBlock(receivedBlockInfo)
+    
+    def reportError(streamId: Int, message: String, error: String): Unit
+    功能: 通过接收器发送错误信息
+    1. 获取新的接收器定位信息
+    val newReceiverTrackingInfo = receiverTrackingInfos.get(streamId) match {
+      case Some(oldInfo) =>
+        val errorInfo = ReceiverErrorInfo(lastErrorMessage = message, lastError = error,
+          lastErrorTime = oldInfo.errorInfo.map(_.lastErrorTime).getOrElse(-1L))
+        oldInfo.copy(errorInfo = Some(errorInfo))
+      case None =>
+        logWarning("No prior receiver info")
+        val errorInfo = ReceiverErrorInfo(lastErrorMessage = message, lastError = error,
+          lastErrorTime = ssc.scheduler.clock.getTimeMillis())
+        ReceiverTrackingInfo(
+          streamId, ReceiverState.INACTIVE, None, None, None, None, Some(errorInfo))
+    }
+    2. 更新指定流@stream的数据块定位信息
+    receiverTrackingInfos(streamId) = newReceiverTrackingInfo
+    3. 发送监听事件
+    listenerBus.post(StreamingListenerReceiverError(
+        newReceiverTrackingInfo.toReceiverInfo))
+    val messageWithError = if (error != null && !error.isEmpty) {
+      s"$message - $error"
+    } else {
+      s"$message"
+    }
+    logWarning(s"Error reported by receiver for stream $streamId: $messageWithError")
+    
+    def scheduleReceiver(receiverId: Int): Seq[TaskLocation] 
+    功能: 调度接收器,获取调度的任务位置@TaskLocation 列表
+    1. 确定最优位置信息
+    val preferredLocation = receiverPreferredLocations.getOrElse(receiverId, None)
+    2. 获取调度确定的位置
+    val scheduledLocations = schedulingPolicy.rescheduleReceiver(
+      receiverId, preferredLocation, receiverTrackingInfos, getExecutors)
+    3. 更新执行器调度的接收器信息
+    updateReceiverScheduledExecutors(receiverId, scheduledLocations)
+    val= scheduledLocations
+    
+    def updateReceiverScheduledExecutors(
+      receiverId: Int, scheduledLocations: Seq[TaskLocation]): Unit 
+    功能: 更新接收器调度执行器信息
+    输入参数: 
+    	receiverId	接收器编号
+    	scheduledLocations	调度位置列表
+    1. 确定新的接收器定位信息
+    val newReceiverTrackingInfo = receiverTrackingInfos.get(receiverId) match {
+      case Some(oldInfo) =>
+        oldInfo.copy(state = ReceiverState.SCHEDULED,
+          scheduledLocations = Some(scheduledLocations))
+      case None =>
+        ReceiverTrackingInfo(
+          receiverId,
+          ReceiverState.SCHEDULED,
+          Some(scheduledLocations),
+          runningExecutor = None)
+    }
+    2. 更新接收器调度信息
+    receiverTrackingInfos.put(receiverId, newReceiverTrackingInfo)
+    
+    def hasUnallocatedBlocks: Boolean
+    功能: 检查是否还有未处理的数据块
+    receivedBlockTracker.hasUnallocatedReceivedBlocks
+    
+    def getExecutors: Seq[ExecutorCacheTaskLocation]
+    功能: 获取执行器列表(包含驱动器)
+    val= if (ssc.sc.isLocal) {
+      val blockManagerId = ssc.sparkContext.env.blockManager.blockManagerId
+      Seq(ExecutorCacheTaskLocation(blockManagerId.host, blockManagerId.executorId))
+    } else {
+      ssc.sparkContext.env.blockManager.master.getMemoryStatus.filter { 
+          case (blockManagerId, _) =>
+        blockManagerId.executorId != SparkContext.DRIVER_IDENTIFIER 
+      }.map { case (blockManagerId, _) =>
+        ExecutorCacheTaskLocation(blockManagerId.host, blockManagerId.executorId)
+      }.toSeq
+    }
+    
+    def runDummySparkJob(): Unit 
+    功能: 运行伪sparkJob,用于保证所有slave节点注册完毕,这个避免了所有接收器调度的同一个节点上.
+    if (!ssc.sparkContext.isLocal) {
+      ssc.sparkContext.makeRDD(1 to 50, 50).map(
+          x => (x, 1)).reduceByKey(_ + _, 20).collect()
+    }
+    assert(getExecutors.nonEmpty)
+    
+    def launchReceivers(): Unit
+    功能: 从@ReceiverInputDStreams 获取接收器,将其分配到工作节点中使之并行接受
+    val receivers = receiverInputStreams.map { nis =>
+      val rcvr = nis.getReceiver()
+      rcvr.setReceiverId(nis.id)
+      rcvr
+    }
+    runDummySparkJob()
+    logInfo("Starting " + receivers.length + " receivers")
+    endpoint.send(StartAllReceivers(receivers))
+    
+    def isTrackerStarted: Boolean = trackerState == Started
+    def isTrackerStopping: Boolean = trackerState == Stopping
+    def isTrackerStopped: Boolean = trackerState == Stopped
+    功能: 标记定位器已经开始/正在停止/已经停止
+    
+    内部类:
+    class ReceiverTrackerEndpoint(override val rpcEnv: RpcEnv) 
+    extends ThreadSafeRpcEndpoint {
+    	介绍: 从接收器中接受消息,是一个RPC端点
+        属性:
+        #name @walBatchingThreadPool	WAL批量写出线程池
+        val= ExecutionContext.fromExecutorService(
+      		ThreadUtils.newDaemonCachedThreadPool("wal-batching-thread-pool"))
+        #name @active: Boolean = true	volatile	接收器启动器标志
+        操作集:
+        def receive: PartialFunction[Any, Unit]
+        功能: 接受rpc消息
+        case StartAllReceivers(receivers) =>
+        	val scheduledLocations = schedulingPolicy.scheduleReceivers(
+            	receivers, getExecutors)
+        	for (receiver <- receivers) {
+            	val executors = scheduledLocations(receiver.streamId)
+            	updateReceiverScheduledExecutors(receiver.streamId, executors)
+            	receiverPreferredLocations(receiver.streamId) =
+                	receiver.preferredLocation
+            	startReceiver(receiver, executors)
+        	}
+        case RestartReceiver(receiver) =>
+        	val oldScheduledExecutors = getStoredScheduledExecutors(receiver.streamId)
+        	val scheduledLocations = if (oldScheduledExecutors.nonEmpty) {
+            	oldScheduledExecutors
+        	} else {
+            	val oldReceiverInfo = receiverTrackingInfos(receiver.streamId)
+            	val newReceiverInfo = oldReceiverInfo.copy(
+                	state = ReceiverState.INACTIVE, scheduledLocations = None)
+            	receiverTrackingInfos(receiver.streamId) = newReceiverInfo
+                schedulingPolicy.rescheduleReceiver(
+                    receiver.streamId,
+                    receiver.preferredLocation,
+                    receiverTrackingInfos,
+                    getExecutors)
+        	}
+        startReceiver(receiver, scheduledLocations)
+        case c: CleanupOldBlocks =>
+        	receiverTrackingInfos.values.flatMap(_.endpoint).foreach(_.send(c))
+        case UpdateReceiverRateLimit(streamUID, newRate) =>
+        for (info <- receiverTrackingInfos.get(streamUID); eP <- info.endpoint) {
+            eP.send(UpdateRateLimit(newRate))
+        }
+        case ReportError(streamId, message, error) =>
+        	reportError(streamId, message, error)
+    }
+    
+    def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit]
+    功能： 接受并响应RPC消息
+    case RegisterReceiver(streamId, typ, host, executorId, receiverEndpoint) =>
+        val successful =
+          registerReceiver(
+              streamId, typ, host, executorId, receiverEndpoint, context.senderAddress)
+        context.reply(successful)
+    case AddBlock(receivedBlockInfo) =>
+        if (WriteAheadLogUtils.isBatchingEnabled(ssc.conf, isDriver = true)) {
+          walBatchingThreadPool.execute(() => Utils.tryLogNonFatalError {
+            if (active) {
+              context.reply(addBlock(receivedBlockInfo))
+            } else {
+              context.sendFailure(
+                new IllegalStateException("ReceiverTracker 
+                RpcEndpoint already shut down."))
+            }
+          })
+        } else {
+          context.reply(addBlock(receivedBlockInfo))
+        }
+    case DeregisterReceiver(streamId, message, error) =>
+        deregisterReceiver(streamId, message, error)
+        context.reply(true)
+    case AllReceiverIds =>
+        context.reply(receiverTrackingInfos.filter(
+            _._2.state != 	ReceiverState.INACTIVE).keys.toSeq)
+    case GetAllReceiverInfo =>
+        context.reply(receiverTrackingInfos.toMap)
+    case StopAllReceivers =>
+        assert(isTrackerStopping || isTrackerStopped)
+        stopReceivers()
+        context.reply(true)
+    
+    def getStoredScheduledExecutors(receiverId: Int): Seq[TaskLocation]
+    功能: 获取存活的存储调度执行器列表
+    val= if (receiverTrackingInfos.contains(receiverId)) {
+        val scheduledLocations = receiverTrackingInfos(receiverId).scheduledLocations
+        if (scheduledLocations.nonEmpty) {
+          val executors = getExecutors.toSet
+          // Only return the alive executors
+          scheduledLocations.get.filter {
+            case loc: ExecutorCacheTaskLocation => executors(loc)
+            case loc: TaskLocation => true
+          }
+        } else {
+          Nil
+        }
+      } else {
+        Nil
+      }
+    
+    def startReceiver(
+        receiver: Receiver[_],
+        scheduledLocations: Seq[TaskLocation]): Unit
+    功能: 启动接收器
+    1. 定义函数确定是否需要启动接收器
+    def shouldStartReceiver: Boolean = {
+        !(isTrackerStopping || isTrackerStopped)
+    }
+    2. 确定接收器编号
+    val receiverId = receiver.streamId
+      if (!shouldStartReceiver) {
+        onReceiverJobFinish(receiverId)
+        return
+      }
+    3. 设置启动接收器函数
+    val checkpointDirOption = Option(ssc.checkpointDir)
+    val serializableHadoopConf =
+    new SerializableConfiguration(ssc.sparkContext.hadoopConfiguration)
+    val startReceiverFunc: Iterator[Receiver[_]] => Unit =
+    (iterator: Iterator[Receiver[_]]) => {
+        if (!iterator.hasNext) {
+            throw new SparkException(
+                "Could not start receiver as object not found.")
+        }
+        if (TaskContext.get().attemptNumber() == 0) {
+            val receiver = iterator.next()
+            assert(iterator.hasNext == false)
+            val supervisor = new ReceiverSupervisorImpl(
+                receiver, SparkEnv.get, serializableHadoopConf.value,
+                checkpointDirOption)
+            supervisor.start()
+            supervisor.awaitTermination()
+        } else {
+        }
+    }
+    4. 使用调度位置创建RDD,用于在接收器上运行spark job
+    val receiverRDD: RDD[Receiver[_]] =
+        if (scheduledLocations.isEmpty) {
+          ssc.sc.makeRDD(Seq(receiver), 1)
+        } else {
+          val preferredLocations = scheduledLocations.map(_.toString).distinct
+          ssc.sc.makeRDD(Seq(receiver -> preferredLocations))
+        }
+    receiverRDD.setName(s"Receiver $receiverId")
+    ssc.sparkContext.setJobDescription(s"Streaming job running receiver $receiverId")
+    ssc.sparkContext.setCallSite(Option(
+      ssc.getStartSite()).getOrElse(Utils.getCallSite()))
+    5. 尝试重启接受器job,直到@ReceiverTracker 停止
+    val future = ssc.sparkContext.submitJob[Receiver[_], Unit, Unit](
+        receiverRDD, startReceiverFunc, Seq(0), (_, _) => (), ())
+    future.onComplete {
+        case Success(_) =>
+        if (!shouldStartReceiver) {
+            onReceiverJobFinish(receiverId)
+        } else {
+            logInfo(s"Restarting Receiver $receiverId")
+            self.send(RestartReceiver(receiver))
+        }
+        case Failure(e) =>
+        if (!shouldStartReceiver) {
+            onReceiverJobFinish(receiverId)
+        } else {
+            logError("Receiver has been stopped. Try to restart it.", e)
+            logInfo(s"Restarting Receiver $receiverId")
+            self.send(RestartReceiver(receiver))
+        }
+    }(ThreadUtils.sameThread)
+    logInfo(s"Receiver ${receiver.streamId} started")
+    
+    def onStop(): Unit
+    功能: 停止接收器定位器
+    active = false
+    walBatchingThreadPool.shutdown()
+    
+    def onReceiverJobFinish(receiverId: Int): Unit
+    功能: 结束接收器job,意味着不会再次重启
+    receiverJobExitLatch.countDown()
+    receiverTrackingInfos.remove(receiverId).foreach { receiverTrackingInfo =>
+        if (receiverTrackingInfo.state == ReceiverState.ACTIVE) {
+            logWarning(s"Receiver $receiverId exited but didn't deregister")
+        }
+    }
+    
+    def stopReceivers(): Unit
+    功能: 发送停止信号给接收器
+    receiverTrackingInfos.values.flatMap(_.endpoint).foreach { _.send(StopReceiver) }
+    logInfo("Sent stop signal to all " + receiverTrackingInfos.size + " receivers")
+}
+```
+
 #### ReceiverTrackingInfo
 
 ```scala
@@ -1882,8 +2450,7 @@ extends SparkListener with ListenerBus[StreamingListener, StreamingListenerEvent
 }
 ```
 
-
-
 #### 基础拓展
 
 1.  [PID控制器](https://en.wikipedia.org/wiki/PID_controller)
+2.  预先写日志WAL
