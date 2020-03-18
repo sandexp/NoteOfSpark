@@ -146,11 +146,280 @@ outDeg[j]	是顶点j的出度
 
 ```scala
 object PageRank extends Logging {
+    def run[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED], numIter: Int, resetProb: Double = 0.15): Graph[Double, Double]
+    功能: 运行pageRank,迭代指定次数@numIter.返回一个图,包含带有边权的边属性
+    输入参数:
+    VD	原始顶点属性
+    ED	原始边属性
+    graph	需要计算pageRank的图
+    numIter	pageRank的迭代次数
+    resetProb	随机重置概率(alpha)
+    val= runWithOptions(graph, numIter, resetProb, None)
     
+    def runUpdate(rankGraph: Graph[Double, Double], personalized: Boolean,
+                resetProb: Double, src: VertexId): Graph[Double, Double]
+    功能: 运行pageRank算法的更新,更新pageRank每个节点的值
+    输入参数:
+    rankGraph	当前的pageRank图
+    personalized	如果是true则为个性化pageRank
+    resetProb	随机重置概率(alpga)
+    src	个性化pageRank的源顶点
+    1. 定义获取增量的函数
+    def delta(u: VertexId, v: VertexId): Double = { if (u == v) 1.0 else 0.0 }
+    2. 计算每个顶点的出向rank,使用本地预聚合,在接受顶点的时候进行最终的聚合.需要shuffle.
+    val rankUpdates = rankGraph.aggregateMessages[Double](
+      ctx => ctx.sendToDst(ctx.srcAttr * ctx.attr), _ + _, TripletFields.Src)
+    3. 使用rank更新函数,用于获取新的rank.没有接收到消息的时候使用join去保持顶点的rank值.需要shuffle,用于使用广播变量更新边分区的rank值.
+    // 更新重置概率(alpha)
+    val rPrb = if (personalized) {
+      (src: VertexId, id: VertexId) => resetProb * delta(src, id)
+    } else {
+      (src: VertexId, id: VertexId) => resetProb
+    }
+    // 使用join保持没有收到消息的顶点rank值
+    rankGraph.outerJoinVertices(rankUpdates) {
+        // map映射函数,(1.0 - resetProb) * msgSumOpt.getOrElse(0.0)恒为0
+      (id, oldRank, msgSumOpt) => rPrb(src, id) + (1.0 - resetProb) * msgSumOpt.getOrElse(0.0)
+    }
+    
+    def runWithOptions[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED], numIter: Int, resetProb: Double = 0.15,
+      srcId: Option[VertexId] = None): Graph[Double, Double]
+    功能: 迭代指定次数@numIter,返回一个带有顶点属性的图,属性中包含了pageRank和带边权的边属性
+    输入参数:
+    VD	原始顶点属性
+    ED	原始边属性
+    graph	需要计算pageRank的图
+    numIter	迭代次数
+    resetProb	随机重置概率(alpha)
+    srcId	自定义pageRank的源顶点
+    0. 参数校验
+    require(numIter > 0, s"Number of iterations must be greater than 0," +
+      s" but got ${numIter}")
+    require(resetProb >= 0 && resetProb <= 1, s"Random reset probability must belong" +
+      s" to [0, 1], but got ${resetProb}")
+    1. 确定是否是个性化设置和源顶点编号
+    val personalized = srcId.isDefined
+    val src: VertexId = srcId.getOrElse(-1L)
+    2. 使用边属性初始化pageRank图,这个边属性的权值为`1/出度` 且每个顶点的属性都是 1.0,如果运行了个性化的pageRank,仅仅源顶点的属性值为 1.0..其他点都是0.
+    var rankGraph: Graph[Double, Double] = graph
+      .outerJoinVertices(graph.outDegrees) { (vid, vdata, deg) => deg.getOrElse(0) }
+      // 设置顶点的权值
+      .mapTriplets( e => 1.0 / e.srcAttr, TripletFields.Src )
+      .mapVertices { (id, attr) =>
+          // 个性化顶点属性值设置
+        if (!(id != src && personalized)) 1.0 else 0.0
+      }
+    3. 迭代计算pageRank
+    var iteration = 0
+    var prevRankGraph: Graph[Double, Double] = null
+    while (iteration < numIter) {
+      rankGraph.cache()
+      prevRankGraph = rankGraph
+      rankGraph = runUpdate(rankGraph, personalized, resetProb, src)
+      rankGraph.cache()
+      rankGraph.edges.foreachPartition(x => {}) // also materializes rankGraph.vertices
+      logInfo(s"PageRank finished iteration $iteration.")
+      prevRankGraph.vertices.unpersist()
+      prevRankGraph.edges.unpersist()
+      iteration += 1
+    }
+    4. 检查图是否是正确的rank和形式,并格式化,参考SPARK-18847
+    normalizeRankSum(rankGraph, personalized)
+    
+    def runWithOptionsWithPreviousPageRank[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED], numIter: Int, resetProb: Double, srcId: Option[VertexId],
+      preRankGraph: Graph[Double, Double]): Graph[Double, Double]
+    功能: 根据上一个pageRank计算当前pageRank
+    输入参数:
+    graph	需要计算pageRank的图
+    numIter	迭代次数
+    resetProb	随机重置概率
+    srcId	个性化pageRank的源顶点
+    preRankGraph	保持迭代信息的pageRank图
+    0. 参数校验
+    require(numIter > 0, s"Number of iterations must be greater than 0," +
+      s" but got ${numIter}")
+    require(resetProb >= 0 && resetProb <= 1, s"Random reset probability must belong" +
+      s" to [0, 1], but got ${resetProb}")
+    1. 获取上次迭代的顶点信息
+    val graphVertices = graph.numVertices
+    val prePageRankVertices = preRankGraph.numVertices
+    require(graphVertices == prePageRankVertices, s"Graph and previous pageRankGraph" +
+      s" must have the same number of vertices but got ${graphVertices} and ${prePageRankVertices}")
+    2. 获取源顶点信息
+    val personalized = srcId.isDefined
+    val src: VertexId = srcId.getOrElse(-1L)
+    3. 初始化pageRank图,边属性为1/出度,每个顶点的属性为 1.0.如果是个性化配置,源顶点为1.0,其他顶点为0.
+    var rankGraph: Graph[Double, Double] = preRankGraph
+    var iteration = 0
+    var prevRankGraph: Graph[Double, Double] = null
+    4. 有上一个pageRank开始迭代计算pageRank
+    while (iteration < numIter) {
+      rankGraph.cache()
+      prevRankGraph = rankGraph
+      rankGraph = runUpdate(rankGraph, personalized, resetProb, src)
+      rankGraph.cache()
+      rankGraph.edges.foreachPartition(x => {}) // also materializes rankGraph.vertices
+      logInfo(s"PageRank finished iteration $iteration.")
+      prevRankGraph.vertices.unpersist()
+      prevRankGraph.edges.unpersist()
+      iteration += 1
+    }
+    5. 检查图是否是正确的rank和形式,并格式化,参考SPARK-18847
+    normalizeRankSum(rankGraph, personalized)
+    
+    def runParallelPersonalizedPageRank[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED],
+      numIter: Int,
+      resetProb: Double = 0.15,
+      sources: Array[VertexId]): Graph[Vector, Double]
+    功能: 运行自定义的pagerank,进行指定次数的迭代,用于并行启动节点的集合.返回一个图,这个图包含了所有的启动节点,且含有带有边权的边属性.
+    graph	用于计算个性化pageRank的图
+    numIter	迭代次数
+    resetProb	随机重置概率
+    sources	计算pageRank的资源列表
+    0. 参数校验
+    require(numIter > 0, s"Number of iterations must be greater than 0," +
+      s" but got ${numIter}")
+    require(resetProb >= 0 && resetProb <= 1, s"Random reset probability must belong" +
+      s" to [0, 1], but got ${resetProb}")
+    require(sources.nonEmpty, s"The list of sources must be non-empty," +
+      s" but got ${sources.mkString("[", ",", "]")}")
+    1. 获取迭代初始值
+    val zero = Vectors.sparse(sources.size, List()).asBreeze
+    // map of vid -> vector where for each vid, the _position of vid in source_ is set to 1.0
+    val sourcesInitMap = sources.zipWithIndex.map { case (vid, i) =>
+      val v = Vectors.sparse(sources.size, Array(i), Array(1.0)).asBreeze
+      (vid, v)
+    }.toMap
+    2. 确定参加pageRank的初始图
+    val sc = graph.vertices.sparkContext
+    val sourcesInitMapBC = sc.broadcast(sourcesInitMap)
+    var rankGraph = graph
+      // Associate the degree with each vertex
+      .outerJoinVertices(graph.outDegrees) { (vid, vdata, deg) => deg.getOrElse(0) }
+      // Set the weight on the edges based on the degree
+      .mapTriplets(e => 1.0 / e.srcAttr, TripletFields.Src)
+      .mapVertices((vid, _) => sourcesInitMapBC.value.getOrElse(vid, zero))
+    3. 迭代计算pageRank
+    var i = 0
+    while (i < numIter) {
+      val prevRankGraph = rankGraph
+      val rankUpdates = rankGraph.aggregateMessages[BV[Double]](
+        ctx => ctx.sendToDst(ctx.srcAttr *:* ctx.attr),
+        (a : BV[Double], b : BV[Double]) => a +:+ b, TripletFields.Src)
+      rankGraph = rankGraph.outerJoinVertices(rankUpdates) {
+        (vid, oldRank, msgSumOpt) =>
+          val popActivations: BV[Double] = msgSumOpt.getOrElse(zero) *:* (1.0 - resetProb)
+          val resetActivations = if (sourcesInitMapBC.value contains vid) {
+            sourcesInitMapBC.value(vid) *:* resetProb
+          } else {
+            zero
+          }
+          popActivations +:+ resetActivations
+        }.cache()
+      rankGraph.edges.foreachPartition(_ => {}) // also materializes rankGraph.vertices
+      prevRankGraph.vertices.unpersist()
+      prevRankGraph.edges.unpersist()
+      logInfo(s"Parallel Personalized PageRank finished iteration $i.")
+      i += 1
+    }
+    4. 检查图是否是正确的rank和形式,并格式化,参考SPARK-18847
+    val rankSums = rankGraph.vertices.values.fold(zero)(_ +:+ _)
+    rankGraph.mapVertices { (vid, attr) =>
+      Vectors.fromBreeze(attr /:/ rankSums)
+    }
+    
+    def runUntilConvergence[VD: ClassTag, ED: ClassTag](
+    graph: Graph[VD, ED], tol: Double, resetProb: Double = 0.15): Graph[Double, Double]
+    功能: 计算pageRank直到收敛为止
+    输入参数:
+    graph	需要计算pageRank的图
+    tol	收敛误差(小于这个值才可以被看做收敛)
+    resetProb	随机重置概率
+    val= runUntilConvergenceWithOptions(graph, tol, resetProb)
+    
+    def runUntilConvergenceWithOptions[VD: ClassTag, ED: ClassTag](
+      graph: Graph[VD, ED], tol: Double, resetProb: Double = 0.15,
+      srcId: Option[VertexId] = None): Graph[Double, Double]
+    功能: 同上
+    0. 参数校验
+    require(tol >= 0, s"Tolerance must be no less than 0, but got ${tol}")
+    require(resetProb >= 0 && resetProb <= 1, s"Random reset probability must belong" +
+      s" to [0, 1], but got ${resetProb}")
+    1. 确定需要参加pageRank的图
+    val personalized = srcId.isDefined
+    val src: VertexId = srcId.getOrElse(-1L)
+    val pagerankGraph: Graph[(Double, Double), Double] = graph
+      .outerJoinVertices(graph.outDegrees) {
+        (vid, vdata, deg) => deg.getOrElse(0)
+      }
+      .mapTriplets( e => 1.0 / e.srcAttr )
+      // Set the vertex attributes to (initialPR, delta = 0)
+      .mapVertices { (id, attr) =>
+        if (id == src) (0.0, Double.NegativeInfinity) else (0.0, 0.0)
+      }
+      .cache()
+    2. 定义顶点处理函数(新的pageRank更新逻辑)
+    def vertexProgram(id: VertexId, attr: (Double, Double), msgSum: Double): (Double, Double) = {
+      val (oldPR, lastDelta) = attr
+      val newPR = oldPR + (1.0 - resetProb) * msgSum
+      (newPR, newPR - oldPR)
+    }
+    3. 定义个性化顶点处理函数
+    def personalizedVertexProgram(id: VertexId, attr: (Double, Double),
+      msgSum: Double): (Double, Double) = {
+      val (oldPR, lastDelta) = attr
+      val newPR = if (lastDelta == Double.NegativeInfinity) {
+        1.0
+      } else {
+        oldPR + (1.0 - resetProb) * msgSum
+      }
+      (newPR, newPR - oldPR)
+    }
+    4. 定义消息发送函数
+    def sendMessage(edge: EdgeTriplet[(Double, Double), Double]) = {
+      if (edge.srcAttr._2 > tol) {
+        Iterator((edge.dstId, edge.srcAttr._2 * edge.attr))
+      } else {
+        Iterator.empty
+      }
+    }
+    5. 定义消息合并函数
+    def messageCombiner(a: Double, b: Double): Double = a + b
+    6. 确定初始化消息,用于pregal计算(需要发送到所有顶点上)
+    val initialMessage = if (personalized) 0.0 else resetProb / (1.0 - resetProb)
+    7. 执行动态pregal
+    val vp = if (personalized) {
+      (id: VertexId, attr: (Double, Double), msgSum: Double) =>
+        personalizedVertexProgram(id, attr, msgSum)
+    } else {
+      (id: VertexId, attr: (Double, Double), msgSum: Double) =>
+        vertexProgram(id, attr, msgSum)
+    }
+    8. 迭代进行pregal计算
+    val rankGraph = Pregel(pagerankGraph, initialMessage, activeDirection = EdgeDirection.Out)(
+      vp, sendMessage, messageCombiner)
+      .mapVertices((vid, attr) => attr._1)
+    9. 检查图是否是正确的rank和形式,并格式化,参考SPARK-18847
+    normalizeRankSum(rankGraph, personalized)
+    
+    def normalizeRankSum(rankGraph: Graph[Double, Double], personalized: Boolean)
+    功能: 正常化pageRank中的rank和
+    1. 获取rank和
+    val rankSum = rankGraph.vertices.values.sum()
+    2. 顶点属性处理
+    if (personalized) {
+      rankGraph.mapVertices((id, rank) => rank / rankSum)
+    } else {
+      val numVertices = rankGraph.numVertices
+      val correctionFactor = numVertices.toDouble / rankSum
+      rankGraph.mapVertices((id, rank) => rank * correctionFactor)
+    }
 }
 ```
-
-
 
 #### ShortestPaths
 
