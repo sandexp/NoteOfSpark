@@ -1321,6 +1321,589 @@ private[storage] class BlockInfoManager extends Logging {
 
 #### BlockManager
 
+```scala
+private[spark] trait BlockData {
+    介绍: 数据块数据
+    这个抽象类提供了数据块如何存储的方法,以及不同读取底层数据块数据的方法,调用者在数据块操作完毕之后可以调用@dispose().
+    操作集:
+    def toInputStream(): InputStream
+    功能: 将当前数据块数据转换成输入流,便于可以读取
+    
+    def toNetty(): Object
+    功能: 返回一个可以使用netty读取的数据块对象,参考@ManagedBuffer.convertToNetty()获取更多
+    
+    def toChunkedByteBuffer(allocator: Int => ByteBuffer): ChunkedByteBuffer
+    功能: 转换成块状字节缓冲区
+    输入参数:
+    allocator	分配函数
+    
+    def toByteBuffer(): ByteBuffer
+    功能: 转换为字节缓冲区
+    
+    def size: Long
+    功能: 转换为数据块的大小
+    
+    def dispose(): Unit
+    功能: 向外界暴露当前数据块
+}
+```
+
+```scala
+private[spark] class ByteBufferBlockData(
+    val buffer: ChunkedByteBuffer,
+    val shouldDispose: Boolean) extends BlockData {
+    介绍: 字节缓冲区数据块
+    构造器参数:
+    buffer	块状字节缓冲区
+    操作集:
+    def toInputStream(): InputStream = buffer.toInputStream(dispose = false)
+    功能: 将数据块数据转换为输入流(缓冲区内容-> 输入流)
+    
+    def toNetty(): Object = buffer.toNetty
+    功能: 转换为netty读取的对象
+    
+    def toChunkedByteBuffer(allocator: Int => ByteBuffer): ChunkedByteBuffer
+    功能: 转换为块状字节缓冲区(将缓冲区内容拷贝到新的缓冲区并返回,进行了浅拷贝,只拷贝内容不拷贝引用)
+    val= buffer.copy(allocator)
+    
+    def toByteBuffer(): ByteBuffer = buffer.toByteBuffer
+    功能: 转换为字节缓冲区
+    def size: Long = buffer.size
+    
+    def dispose(): Unit
+    功能: 清除直接内存中以及内存映射的数据
+    if (shouldDispose) {
+      buffer.dispose()
+    }
+}
+```
+
+```scala
+private[spark] class HostLocalDirManager(
+    futureExecutionContext: ExecutionContext,
+    cacheSize: Int,
+    externalBlockStoreClient: ExternalBlockStoreClient,
+    host: String,
+    externalShuffleServicePort: Int) extends Logging {
+    介绍: 本地目录管理器
+    构造器参数:
+        futureExecutionContext	异步任务执行器上下文
+        cacheSize	缓存大小
+        externalBlockStoreClient	外部数据块存储客户端
+        host	主机名称
+        externalShuffleServicePort	外部shuffle服务端口
+    属性:
+    #name @executorIdToLocalDirsCache	执行器编号->本地目录缓存映射
+    val= CacheBuilder
+      .newBuilder()
+      .maximumSize(cacheSize)
+      .build[String, Array[String]]()
+    操作集:
+    def getCachedHostLocalDirs()
+      : scala.collection.Map[String, Array[String]] 
+    功能: 获取缓存主机本地目录映射表@executorIdToLocalDirsCache
+    val= executorIdToLocalDirsCache.synchronized {
+        import scala.collection.JavaConverters._
+        return executorIdToLocalDirsCache.asMap().asScala
+    }
+    
+    def getHostLocalDirs(
+      executorIds: Array[String])(
+      callback: Try[java.util.Map[String, Array[String]]] => Unit): Unit
+    功能: 获取主机本地目录
+    输入参数:
+    executorIds	获取执行器列表
+    callback	执行器映射本地目录表回调函数
+    1. 获取一个执行任务线程
+    val hostLocalDirsCompletable = 
+    	new CompletableFuture[java.util.Map[String, Array[String]]]
+    2. 客户端获取本地执行目录
+    externalBlockStoreClient.getHostLocalDirs(
+      host,
+      externalShuffleServicePort,
+      executorIds,
+      hostLocalDirsCompletable)
+    3. 异步任务执行完成进行回调,发送任务执行成功/失败的消息
+    val= hostLocalDirsCompletable.whenComplete { (hostLocalDirs, throwable) =>
+      if (hostLocalDirs != null) {
+        callback(Success(hostLocalDirs))
+        executorIdToLocalDirsCache.synchronized {
+          executorIdToLocalDirsCache.putAll(hostLocalDirs)
+        }
+      } else {
+        callback(Failure(throwable))
+      }
+    }
+}
+```
+
+```scala
+private[spark] class BlockManager(
+    executorId: String,
+    rpcEnv: RpcEnv,
+    val master: BlockManagerMaster,
+    val serializerManager: SerializerManager,
+    val conf: SparkConf,
+    memoryManager: MemoryManager,
+    mapOutputTracker: MapOutputTracker,
+    shuffleManager: ShuffleManager,
+    val blockTransferService: BlockTransferService,
+    securityManager: SecurityManager,
+    externalBlockStoreClient: Option[ExternalBlockStoreClient])
+extends BlockDataManager with BlockEvictionHandler with Logging {
+    介绍: 数据块管理器
+    构造器参数:
+        executorId	执行器编号
+        rpcEnv	RPC环境
+        master	数据块管理器master
+        serializerManager	序列化管理器
+        mapOutputTracker	输出定位器
+        shuffleManager	shuffle管理器
+        blockTransferService	数据块转换服务
+        securityManager	安全管理器
+        externalBlockStoreClient	外部数据块存储客户端
+    属性:
+    #name @externalShuffleServiceEnabled: Boolean = externalBlockStoreClient.isDefined
+    	是否允许外部shuffle
+    #name @remoteReadNioBufferConversion	远端读取NIO缓冲区转换
+    val= conf.get(Network.NETWORK_REMOTE_READ_NIO_BUFFER_CONVERSION)
+    #name @subDirsPerLocalDir = conf.get(config.DISKSTORE_SUB_DIRECTORIES)
+    	每个本地目录的子目录数量(int类型)
+    #name @diskBlockManager	磁盘数据块管理器
+    val= {
+        val deleteFilesOnStop =// 确定是否需要在数据块管理器停止的时候将文件删除
+        !externalShuffleServiceEnabled || executorId == SparkContext.DRIVER_IDENTIFIER
+        new DiskBlockManager(conf, deleteFilesOnStop)
+    }
+    #name @blockInfoManager = new BlockInfoManager	数据块信息管理器(测试可见)
+    #name @futureExecutionContext	异步执行任务线程池
+    val=ExecutionContext.fromExecutorService(
+    	ThreadUtils.newDaemonCachedThreadPool("block-manager-future", 128))
+    #name @memoryStore	内存存储器(保存数据块的内存部分)
+    val= new MemoryStore(conf, blockInfoManager, serializerManager, memoryManager, this)
+    #name @diskStore = new DiskStore(conf, diskBlockManager, securityManager)	磁盘存储器
+    #name @maxOnHeapMemory = memoryManager.maxOnHeapStorageMemory	最大堆内存
+    #name @maxOffHeapMemory = memoryManager.maxOffHeapStorageMemory	最大非堆内存(方法区中)
+    #name @externalShuffleServicePort = StorageUtils.externalShuffleServicePort(conf)
+    	外部shuffle服务的端口
+    #name @blockManagerId: BlockManagerId = _	数据块管理器编号
+    #name @shuffleServerId: BlockManagerId = _	
+    	执行执行器shuffle的服务器地址(外部shuffle服务或者当前执行器的数据块管理器都可以)
+    #name @blockStoreClient = externalBlockStoreClient.getOrElse(blockTransferService)
+    	数据块存储客户端(用于读取其他执行器数据块,既可以是外部shuffle服务,也可以是连接到其他执行器的数据块转换服务@BlockTransferService)
+    #name @maxFailuresBeforeLocationRefresh 数据块管理器在刷新驱动器数据块位置前的最大失败次数
+    val= conf.get(config.BLOCK_FAILURES_BEFORE_LOCATION_REFRESH)
+    #name @slaveEndpoint	slaveRPC端点
+    val= rpcEnv.setupEndpoint(
+        "BlockManagerEndpoint" + BlockManager.ID_GENERATOR.next,
+        new BlockManagerSlaveEndpoint(rpcEnv, this, mapOutputTracker))
+    #name @asyncReregisterTask: Future[Unit] = null	异步注册任务
+    	待定重新注册的动作(用于异步执行),获取的时候需要获取同步锁@asyncReregisterLock
+    #name @asyncReregisterLock = new Object	异步注册锁
+    #name @cachedPeers: Seq[BlockManagerId] = _	缓存的数据块管理器标识符
+    #name @peerFetchLock = new Object	同级别数据块获取锁
+    #name @lastPeerFetchTimeNs = 0L	上个数据块获取的时间
+    #name @blockReplicationPolicy: BlockReplicationPolicy = _	数据块备份策略
+    #name @remoteBlockTempFileManager	远端数据块临时文件管理器
+    val= new BlockManager.RemoteBlockDownloadFileManager(this)
+    使用@DownloadFileManager,用于定位所有远端数据块文件(超出存储容量的部分),并会基于引用删除文件
+    #name @maxRemoteBlockToMem = conf.get(config.MAX_REMOTE_BLOCK_SIZE_FETCH_TO_MEM)
+    最大远端数据块转换到内存的量(默认200M)
+    #name @hostLocalDirManager: Option[HostLocalDirManager] = None	本地数据块管理器
+    
+    初始化操作:
+    memoryManager.setMemoryStore(memoryStore)
+    功能: 设置内存管理器
+    
+    内部类:
+    private[spark] abstract class BlockStoreUpdater[T](
+      blockSize: Long,
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[T],
+      tellMaster: Boolean,
+      keepReadLock: Boolean) {
+        介绍: 数据块存储更新器,用于存储数据块,无论是在内存上还是在磁盘上
+        构造器参数:
+        blockSize	数据块大小
+        blockId	数据块标识符
+        level	存储等级
+        classTag	类标签
+        tellMaster	更新是否告知master
+        keepReadLock	是否保持读取锁
+        操作集:
+        def readToByteBuffer(): ChunkedByteBuffer
+        功能: 读取数据块内容到内存中,如果数据块存储的更新基于临时文件,,这个就会导致将整个文件加载到块字节缓冲区中@ChunkedByteBuffer
+        
+        def blockData(): BlockData
+        功能: 获取数据块数据
+        
+        def saveToDiskStore(): Unit
+        功能: 将数据块内容保存到磁盘存储器中
+        
+        def saveDeserializedValuesToMemoryStore(inputStream: InputStream): Boolean
+        功能: 将反序列化的值保存到内存存储器中
+        try {
+        val values = serializerManager.dataDeserializeStream(
+            blockId, inputStream)(classTag)
+        memoryStore.putIteratorAsValues(blockId, values, classTag) match {// 存储数据
+          case Right(_) => true
+          case Left(iter) =>
+            // 如果存储到磁盘失败,将会直接将数据放置在磁盘上,这样就不需要这个迭代器信息,直接提前关闭
+            // 并释放资源
+            iter.close()
+            false
+        }
+      } finally {
+        IOUtils.closeQuietly(inputStream)
+      }
+    }
+    
+    def saveSerializedValuesToMemoryStore(bytes: ChunkedByteBuffer): Boolean
+    功能: 保存反序列化的值到内存存储器中,反序列化之后的值在块字节缓冲区中@bytes
+    val memoryMode = level.memoryMode 
+    // 这里并不存在需要防止磁盘的操作,因为本身数据就在内存,只需要转移位置即可
+      memoryStore.putBytes(blockId, blockSize, memoryMode, () => {
+        if (memoryMode == MemoryMode.OFF_HEAP && bytes.chunks.exists(!_.isDirect)) {
+          bytes.copy(Platform.allocateDirectBuffer)
+        } else {
+          bytes
+        }
+      })
+    
+    def save(): Boolean
+    功能: 防止给定的数据到给定存储等级的存储器中,如果需要备份,则进行备份
+    如果数据块已经存在了,这个方法不会覆盖.如果开启了读取锁保持@keepReadLock=true,这个方法会持有读取锁,并在返回的时候(尽管数据块已经存在)持有.如果没有设置,返回的时候就不会持有这个读取锁.
+    返回: 如果数据块已经存在或者保持数据成功则返回true,否则返回false
+    1. 放置数据,并检测放置的数据
+    doPut(blockId, level, classTag, tellMaster, keepReadLock) { info =>
+        val startTimeNs = System.nanoTime()
+        // 因为是存储字节信息，需要在本地存储之前初始化备份，这个操作很快，因为数据已经序列化
+        // 且马上就要发送,通过创建一个进行备份的异步任务进行备份处理.
+        val replicationFuture = if (level.replication > 1) {
+          Future {
+              // 这个是一个阻塞的方法,需要运行在创建的线程池中@futureExecutionContext
+            replicate(blockId, blockData(), level, classTag)
+          }(futureExecutionContext)
+        } else {
+          null
+        }
+		// 优先填满内存存储器,尽管设置了使用磁盘的属性,但是还需要优先满足内存存储器要求
+        if (level.useMemory) {
+          val putSucceeded = if (level.deserialized) {
+            saveDeserializedValuesToMemoryStore(blockData().toInputStream())
+          } else {
+            saveSerializedValuesToMemoryStore(readToByteBuffer())
+          }
+          if (!putSucceeded && level.useDisk) {
+            logWarning(s"Persisting block $blockId to disk instead.")
+            saveToDiskStore()
+          }
+        } else if (level.useDisk) {
+            // 内存无法存储则转存磁盘
+          saveToDiskStore()
+        }
+        // 告知master存储的情况(如果可能的话)
+        val putBlockStatus = getCurrentBlockStatus(blockId, info)
+        val blockWasSuccessfullyStored = putBlockStatus.storageLevel.isValid
+        if (blockWasSuccessfullyStored) {
+          info.size = blockSize
+          if (tellMaster && info.tellMaster) {
+            reportBlockStatus(blockId, putBlockStatus)
+          }
+          addUpdatedBlockStatusToTaskMetrics(blockId, putBlockStatus)
+        }
+        logDebug(s"Put block ${blockId} locally took 
+        	${Utils.getUsedTimeNs(startTimeNs)}")
+        // 存储完毕,等待异步备份工作的完成即可
+        if (level.replication > 1) {
+          // Wait for asynchronous replication to finish
+          try {
+            ThreadUtils.awaitReady(replicationFuture, Duration.Inf)
+          } catch {
+            case NonFatal(t) =>
+              throw new Exception("Error occurred while waiting for 
+              replication to finish", t)
+          }
+        }
+        if (blockWasSuccessfullyStored) {
+          None
+        } else {
+          Some(blockSize)
+        }
+      }.isEmpty
+    
+    private case class ByteBufferBlockStoreUpdater[T](
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[T],
+      bytes: ChunkedByteBuffer,
+      tellMaster: Boolean = true,
+      keepReadLock: Boolean = false)
+    extends BlockStoreUpdater[T](
+        bytes.size, blockId, level, classTag, tellMaster, keepReadLock) {
+        介绍: 字节缓冲区数据块存储更新器
+        构造器参数:
+            blockId	数据块标识符
+            level	存储等级
+            classTag	类型标签
+            bytes	块字节缓冲区
+            tellMaster	是否告知master
+            keepReadLock	是否保持读取锁
+        操作集:
+        def readToByteBuffer(): ChunkedByteBuffer = bytes
+        功能: 读取到字节缓冲区中,并返回字节缓冲区@ChunkedByteBuffer
+        
+        def blockData(): BlockData = new ByteBufferBlockData(bytes, false)
+        功能: 获取数据块数据,返回字节缓冲区的包装的数据块信息,不会释放内存区域,用于避免释放用户调用的缓冲区
+        
+        def saveToDiskStore(): Unit = diskStore.putBytes(blockId, bytes)
+        功能: 保存到磁盘存储器上
+    }
+    
+    private[spark] case class TempFileBasedBlockStoreUpdater[T](
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[T],
+      tmpFile: File,
+      blockSize: Long,
+      tellMaster: Boolean = true,
+      keepReadLock: Boolean = false)
+    extends BlockStoreUpdater[T](blockSize, blockId, level, classTag, tellMaster, keepReadLock) {
+        介绍: 基于临时文件的数据块存储更新器
+        构造器参数:
+        blockId	数据块标识符
+        level	存储等级
+        classTag	数据类型
+        tmpFile	临时文件
+        blockSize	数据块大小
+        tellMaster	是否通知master
+        keepReadLock	是否保持读取锁
+        操作集:
+        def readToByteBuffer(): ChunkedByteBuffe
+        功能: 转换为字节缓冲区
+        val allocator = level.memoryMode match { // 确定分配方式
+            case MemoryMode.ON_HEAP => ByteBuffer.allocate _ // 堆模式下,分配字节缓冲区
+            case MemoryMode.OFF_HEAP => Platform.allocateDirectBuffer _ // 非堆模式下,使用直接内存处理
+        }
+        val= blockData().toChunkedByteBuffer(allocator)
+        
+        def blockData(): BlockData = diskStore.getBytes(tmpFile, blockSize)
+        功能: 获取数据块数据
+        
+        def saveToDiskStore(): Unit = diskStore.moveFileToBlock(tmpFile, blockSize, blockId)
+        功能: 保存到磁盘存储器上
+        
+        def save(): Boolean
+        功能: 保存数据块数据(保存完毕删除临时文件)
+        val res = super.save()
+        tmpFile.delete()
+        val= res
+    }
+    
+    操作集:
+    def initialize(appId: String): Unit
+    功能: 使用给定的应用编号@appId 初始化数据块管理器,不会表现在构造器中,因为应用编号@appId 不会再数据块管理器初始化时间获取(尤其是驱动器,只能在使用@TaskScheduler注册之后得知).
+    这个方法初始化了@BlockTransferService 和@BlockStoreClient,使用@BlockManagerMaster注册,启动@BlockManagerWorker后台,如果配置了本地shuffle服务则还要将本地shuffle服务注册.
+    1. 初始化数据块转换服务
+    blockTransferService.init(this)
+    2. 初始化外部数据块存储客户端
+    externalBlockStoreClient.foreach { blockStoreClient =>
+      blockStoreClient.init(appId)
+    }
+    3. 获取数据块备份策略
+    blockReplicationPolicy = {
+      val priorityClass = conf.get(config.STORAGE_REPLICATION_POLICY)
+      val clazz = Utils.classForName(priorityClass)
+      val ret = clazz.getConstructor().newInstance().asInstanceOf[BlockReplicationPolicy]
+      logInfo(s"Using $priorityClass for block replication policy")
+      ret
+    }
+    4. 获取数据块管理标识符,并注册
+    val id =
+      BlockManagerId(executorId, blockTransferService.hostName, blockTransferService.port, None)
+    val idFromMaster = master.registerBlockManager(
+      id,
+      diskBlockManager.localDirsString,
+      maxOnHeapMemory,
+      maxOffHeapMemory,
+      slaveEndpoint)
+    blockManagerId = if (idFromMaster != null) idFromMaster else id // 尽可能需要在master状态下的标识符
+    5. 获取shuffle服务编号,并注册
+    shuffleServerId = if (externalShuffleServiceEnabled) {
+      logInfo(s"external shuffle service port = $externalShuffleServicePort")
+      BlockManagerId(executorId, blockTransferService.hostName, externalShuffleServicePort)
+    } else {
+      blockManagerId
+    }
+    if (externalShuffleServiceEnabled && !blockManagerId.isDriver) {
+      registerWithExternalShuffleServer()
+    }
+    6. 获取本地目录管理器
+    hostLocalDirManager =
+      if (conf.get(config.SHUFFLE_HOST_LOCAL_DISK_READING_ENABLED)) {
+        externalBlockStoreClient.map { blockStoreClient =>
+          new HostLocalDirManager(
+            futureExecutionContext,
+            conf.get(config.STORAGE_LOCAL_DISK_BY_EXECUTORS_CACHE_SIZE),
+            blockStoreClient,
+            blockManagerId.host,
+            externalShuffleServicePort)
+        }
+      } else {
+        None
+      }
+    logInfo(s"Initialized BlockManager: $blockManagerId")
+    
+    def shuffleMetricsSource: Source
+    功能: 获取shuffle的度量资源(外部shuffle/非外部shuffle(netty数据块转换))
+    if (externalShuffleServiceEnabled) {
+      new ShuffleMetricsSource("ExternalShuffle", blockStoreClient.shuffleMetrics())
+    } else {
+      new ShuffleMetricsSource("NettyBlockTransfer", blockStoreClient.shuffleMetrics())
+    }
+    
+    def registerWithExternalShuffleServer(): Unit 
+    功能: 使用外部shuffle服务器注册
+    1. 获取shuffle的配置参数
+    logInfo("Registering executor with local external shuffle service.")
+    val shuffleConfig = new ExecutorShuffleInfo(
+      diskBlockManager.localDirsString,
+      diskBlockManager.subDirsPerLocalDir,
+      shuffleManager.getClass.getName)
+    2. 周期性的向shuffle服务器发起请求,注册shuffle服务
+    val MAX_ATTEMPTS = conf.get(config.SHUFFLE_REGISTRATION_MAX_ATTEMPTS)
+    val SLEEP_TIME_SECS = 5
+    for (i <- 1 to MAX_ATTEMPTS) {
+      try {
+        blockStoreClient.asInstanceOf[ExternalBlockStoreClient].registerWithShuffleServer(
+          shuffleServerId.host, shuffleServerId.port, shuffleServerId.executorId, shuffleConfig)
+        return
+      } catch {
+        case e: Exception if i < MAX_ATTEMPTS =>
+          logError(s"Failed to connect to external shuffle server, will retry ${MAX_ATTEMPTS - i}"
+            + s" more times after waiting $SLEEP_TIME_SECS seconds...", e)
+          Thread.sleep(SLEEP_TIME_SECS * 1000L)
+        case NonFatal(e) =>
+          throw new SparkException("Unable to register with external shuffle server due to : " +
+            e.getMessage, e)
+      }
+    }
+    
+    def reportAllBlocks(): Unit
+    功能: 汇报所有的数据块给数据块管理器,如果数据块管理器丢数据了,这个操作是必须的.或者在执行器宕机之后需要汇报数据块消息的时候,这个操作也是必须的.
+    这个函数在master返回false的时候(表明从节点需要重新注册),会在后台特意的失败.错误条件会通过心跳信息,新建数据块注册,尝试重新注册所有数据块而断开连接.
+    1. 汇报数据块管理器大小给master
+    logInfo(s"Reporting ${blockInfoManager.size} blocks to the master.")
+    2. 检测是否含有不能汇报给master的状态,有的话则显示出来,并结束
+    for ((blockId, info) <- blockInfoManager.entries) {
+      val status = getCurrentBlockStatus(blockId, info)
+      if (info.tellMaster && !tryToReportBlockStatus(blockId, status)) {
+        logError(s"Failed to report $blockId to master; giving up.")
+        return
+      }
+    }
+    
+    def reregister(): Unit
+    功能: 使用master重新注册,并汇报所有的数据块到master上,这个会被心跳线程调用.(如果心跳表明当前数据块没有注册到管理器的话)
+    1. 向master注册数据块管理器
+    logInfo(s"BlockManager $blockManagerId re-registering with master")
+    master.registerBlockManager(blockManagerId, diskBlockManager.localDirsString, maxOnHeapMemory,
+      maxOffHeapMemory, slaveEndpoint)
+    2. 汇报所有的数据块
+    reportAllBlocks()
+    
+    def asyncReregister(): Unit
+    功能: 使用master重新注册(同步注册)
+    asyncReregisterLock.synchronized {
+      if (asyncReregisterTask == null) {
+        asyncReregisterTask = Future[Unit] { // 异步注册任务
+          // 这个是个阻塞动作，需要使用线程池@futureExecutionContext运行
+          reregister()
+          asyncReregisterLock.synchronized {
+              // 双重检定,重置注册任务
+            asyncReregisterTask = null
+          }
+        }(futureExecutionContext)
+      }
+    }
+    
+    def waitForAsyncReregister(): Unit 
+    功能: 等待待定的异步重新注册执行,否则什么都不做,测试可见
+    val task = asyncReregisterTask
+    if (task != null) {
+      try {
+        ThreadUtils.awaitReady(task, Duration.Inf)
+      } catch {
+        case NonFatal(t) =>
+          throw new Exception("Error occurred while waiting for async. reregistration", t)
+      }
+    }
+    
+    def getHostLocalShuffleData(
+      blockId: BlockId,
+      dirs: Array[String]): ManagedBuffer
+    功能: 获取本地shuffle数据
+    输入参数:
+    	dirs	指定的目录列表
+    val= shuffleManager.shuffleBlockResolver.getBlockData(blockId, Some(dirs))
+    
+    def getLocalBlockData(blockId: BlockId): ManagedBuffe
+    功能: 获取本地数据块信息
+    val= if (blockId.isShuffle) {
+      shuffleManager.shuffleBlockResolver.getBlockData(blockId)
+    } else {
+      getLocalBytes(blockId) match {
+        case Some(blockData) =>
+          new BlockManagerManagedBuffer(blockInfoManager, blockId, blockData, true)
+        case None =>
+          reportBlockStatus(blockId, BlockStatus.empty)
+          throw new BlockNotFoundException(blockId.toString)
+      }
+    }
+    
+    def putBlockData(
+      blockId: BlockId,
+      data: ManagedBuffer,
+      level: StorageLevel,
+      classTag: ClassTag[_]): Boolean
+    功能: 使用指定的存储等级,本地存放数据块
+    val= putBytes(blockId, new ChunkedByteBuffer(data.nioByteBuffer()), level)(classTag)
+    
+    def putBlockDataAsStream(
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[_]): StreamCallbackWithID
+    功能: 流式存储数据块
+    1. 获取文件通道
+    val (_, tmpFile) = diskBlockManager.createTempLocalBlock()
+    val channel = new CountingWritableChannel(
+      Channels.newChannel(serializerManager.wrapForEncryption(new FileOutputStream(tmpFile))))
+    logTrace(s"Streaming block $blockId to tmp file $tmpFile")
+    2. 获取带有回调函数的流
+    val= new StreamCallbackWithID {
+      override def getID: String = blockId.name
+      override def onData(streamId: String, buf: ByteBuffer): Unit = {
+        while (buf.hasRemaining) {
+          channel.write(buf)
+        }
+      }
+      override def onComplete(streamId: String): Unit = {
+        logTrace(s"Done receiving block $blockId, now putting into local blockManager")
+        channel.close()
+        val blockSize = channel.getCount
+        TempFileBasedBlockStoreUpdater(blockId, level, classTag, tmpFile, blockSize).save()
+      }
+      override def onFailure(streamId: String, cause: Throwable): Unit = {
+        channel.close()
+        tmpFile.delete()
+      }
+    }
+}
+```
+
+
+
 #### BlockManagerId
 
 ```markdown
