@@ -1899,6 +1899,1091 @@ extends BlockDataManager with BlockEvictionHandler with Logging {
         tmpFile.delete()
       }
     }
+    
+    def getStatus(blockId: BlockId): Option[BlockStatus]
+    功能: 获取指定数据块对应的数据块状态@BlockStatus
+    val= blockInfoManager.get(blockId).map { info =>
+      // 确定内存空间大小
+      val memSize = 
+        if (memoryStore.contains(blockId)) memoryStore.getSize(blockId) else 0L
+      // 确定磁盘空间大小
+      val diskSize = if (diskStore.contains(blockId)) diskStore.getSize(blockId) else 0L
+      BlockStatus(info.level, memSize = memSize, diskSize = diskSize)
+    }
+    
+    def getMatchingBlockIds(filter: BlockId => Boolean): Seq[BlockId] 
+    功能: 获取存在数据块的数据块编号列表(满足指定条件@filter),注意到这个会查询存储在磁盘数据块(数据块管理器可能不知道数据块的类型)
+    val= (blockInfoManager.entries.map(_._1) ++ diskBlockManager.getAllBlocks())
+      .filter(filter)
+      .toArray
+      .toSeq
+    
+    def reportBlockStatus(
+      blockId: BlockId,
+      status: BlockStatus,
+      droppedMemorySize: Long = 0L): Unit
+    功能: 汇报数据块信息
+    向master汇报指定数据块存储状态,会发送一个数据块更新消息,不是需要的存储等级,例如@MEMORY_AND_DISK的数据块可能仅仅落在磁盘上.抛弃的内存大小@droppedMemorySize 用于计算内存转换到磁盘的内存量.保证master的更新会弥补slave节点中的内存增长(slave内存增长-> master 内存数据转换到磁盘)
+    输入参数:
+    status	数据块状态
+    droppedMemorySize	master端需要转换到磁盘的内存量
+    0. 确定数据块是否需要注册
+    val needReregister = !tryToReportBlockStatus(blockId, status, droppedMemorySize)
+    1. 重新进行数据块的注册,并异步汇报新的数据块
+    if (needReregister) {
+      logInfo(s"Got told to re-register updating block $blockId")
+      asyncReregister()
+    }
+    2. 显示信息
+    logDebug(s"Told master about block $blockId")
+    
+    def tryToReportBlockStatus(
+      blockId: BlockId,
+      status: BlockStatus,
+      droppedMemorySize: Long = 0L): Boolean
+    功能: 尝试汇报数据块@blockId状态@status,返回master的响应,如果是true则表明,master成功接收到更新信息.如果是false表明,slave需要重新注册.
+    1. 确定内存存储空间和磁盘存储空间
+    val storageLevel = status.storageLevel
+    val inMemSize = Math.max(status.memSize, droppedMemorySize)
+    val onDiskSize = status.diskSize
+    2. master端更新数据块,并返回更新的响应(成功与否)
+    val= master.updateBlockInfo(
+        blockManagerId, blockId, storageLevel, inMemSize, onDiskSize)
+    
+    def getCurrentBlockStatus(blockId: BlockId, info: BlockInfo): BlockStatus
+    功能: 获取当前数据块状态
+    返回给定数据块@blockId的更新状态@BlockStatus,如果释放内存存储并将其存储到磁盘中的时候,返回存储等级和相应的内存和磁盘存储空间大小.
+    val= info.synchronized {
+      info.level match {
+        case null =>
+          BlockStatus.empty
+        case level =>
+          // 确定存储等级需要的参数
+          val inMem = level.useMemory && memoryStore.contains(blockId)
+          val onDisk = level.useDisk && diskStore.contains(blockId)
+          val deserialized = if (inMem) level.deserialized else false
+          val replication = if (inMem  || onDisk) level.replication else 1
+          val storageLevel = StorageLevel(
+            useDisk = onDisk,
+            useMemory = inMem,
+            useOffHeap = level.useOffHeap,
+            deserialized = deserialized,
+            replication = replication)
+          // 统计内存/磁盘存储量
+          val memSize = if (inMem) memoryStore.getSize(blockId) else 0L
+          val diskSize = if (onDisk) diskStore.getSize(blockId) else 0L
+          BlockStatus(storageLevel, memSize, diskSize)
+      }
+    }	
+    
+    def getLocationBlockIds(blockIds: Array[BlockId]): Array[Seq[BlockManagerId]]
+    功能: 获取数据块列表的存储位置列表
+    val startTimeNs = System.nanoTime()
+    val locations = master.getLocations(blockIds).toArray
+    logDebug(s"Got multiple block location in ${Utils.getUsedTimeNs(startTimeNs)}")
+    val= locations
+    
+    def handleLocalReadFailure(blockId: BlockId): Nothing
+    功能: 处理本地读取失败,清空代码用于回应失败的本地读取,必须持有数据块读取锁才可以读取,当然在这里处理失败逻辑需要释放掉这个锁.
+    1. 释放数据块读取锁
+    releaseLock(blockId)
+    2. 移除处理失败的数据块
+    removeBlock(blockId)
+    throw new SparkException(s"Block $blockId was not found even though it's read-locked")
+    
+    def getLocalValues(blockId: BlockId): Option[BlockResult] 
+    功能: 从本地数据块管理器获取指定数据块@blockId
+    0. 起始日志显示
+    logDebug(s"Getting local block $blockId")
+    1. 读取指定数据块,并进行处理
+    blockInfoManager.lockForReading(blockId) match {
+      case None => // 没有读取到数据块
+        logDebug(s"Block $blockId was not found")
+        None
+      case Some(info) => // 读取当数据块信息@BlockInfo
+        val level = info.level
+        logDebug(s"Level for block $blockId is $level")
+        val taskContext = Option(TaskContext.get())
+        if (level.useMemory && memoryStore.contains(blockId)) {
+            // 存储等级为内存,获取内存相关的数据块结果@BlockResult信息
+          val iter: Iterator[Any] = if (level.deserialized) {
+            memoryStore.getValues(blockId).get
+          } else {
+            serializerManager.dataDeserializeStream(
+              blockId, memoryStore.getBytes(blockId).get.toInputStream())(info.classTag)
+          }
+          val ci = CompletionIterator[Any, Iterator[Any]](iter, {
+            releaseLock(blockId, taskContext)
+          })
+          Some(new BlockResult(ci, DataReadMethod.Memory, info.size))
+        } else if (level.useDisk && diskStore.contains(blockId)) {
+            // 处理存储在磁盘的数据块结果@BlockResult
+          val diskData = diskStore.getBytes(blockId)
+          val iterToReturn: Iterator[Any] = {
+            if (level.deserialized) {
+              val diskValues = serializerManager.dataDeserializeStream(
+                blockId,
+                diskData.toInputStream())(info.classTag)
+              maybeCacheDiskValuesInMemory(info, blockId, level, diskValues)
+            } else {
+              val stream = maybeCacheDiskBytesInMemory(info, blockId, level, diskData)
+                .map { _.toInputStream(dispose = false) }
+                .getOrElse { diskData.toInputStream() }
+              serializerManager.dataDeserializeStream(blockId, stream)(info.classTag)
+            }
+          }
+          val ci = CompletionIterator[Any, Iterator[Any]](iterToReturn, {
+            releaseLockAndDispose(blockId, diskData, taskContext)
+          })
+          Some(new BlockResult(ci, DataReadMethod.Disk, info.size))
+        } else {
+            // 获取失败处理
+          handleLocalReadFailure(blockId)
+        }
+    }
+    
+    def getLocalBytes(blockId: BlockId): Option[BlockData]
+    功能: 获取本地数据块内容@BlockData
+    logDebug(s"Getting local block $blockId as bytes")
+    assert(!blockId.isShuffle, s"Unexpected ShuffleBlockId $blockId")
+    val=blockInfoManager.lockForReading(blockId).map{info=>doGetLocalBytes(blockId,info)}
+    
+    def doGetLocalBytes(blockId: BlockId, info: BlockInfo): BlockData
+    功能: 获取本地数据块管理器的数据,必须持有读取锁才可以访问,保持直到执行成功,除非出现异常处理需要释放锁.
+    1. 获取存储等级
+    val level = info.level
+    logDebug(s"Level for block $blockId is $level")
+    2. 尝试按照内存-> 磁盘的顺序读取数据,返回序列化的内存对象.如果数据块不存在抛出异常
+    if (level.deserialized) {
+        //通过读取磁盘上预先序列化的副本，避免消耗过大的序列化
+      if (level.useDisk && diskStore.contains(blockId)) {
+        // 注意: 不需要再这里将数据块放回内存,因为数据块可能仅仅的存储到内存中,没有进行序列化,不需要将反序列化的结果缓存到内存中,因为没有什么好处,反倒占了内存
+        diskStore.getBytes(blockId)
+      } else if (level.useMemory && memoryStore.contains(blockId)) {
+        // 数据块在磁盘上找不到,序列化一个内存副本
+        new ByteBufferBlockData(serializerManager.dataSerializeWithExplicitClassTag(
+          blockId, memoryStore.getValues(blockId).get, info.classTag), true)
+      } else {
+        // 获取数据块失败,处理失败情况
+        handleLocalReadFailure(blockId)
+      }
+    } else {  // storage level is serialized
+        // 存储等级经过了序列化
+      if (level.useMemory && memoryStore.contains(blockId)) {
+        // 数据块处于内存中
+        new ByteBufferBlockData(memoryStore.getBytes(blockId).get, false)
+      } else if (level.useDisk && diskStore.contains(blockId)) {
+        // 数据块处于磁盘中,name需要尽可能的将磁盘数据缓存到内存中
+        val diskData = diskStore.getBytes(blockId)
+        maybeCacheDiskBytesInMemory(info, blockId, level, diskData)
+          .map(new ByteBufferBlockData(_, false))
+          .getOrElse(diskData)
+      } else {
+        handleLocalReadFailure(blockId)
+      }
+    }
+    
+    def getRemoteValues[T: ClassTag](blockId: BlockId): Option[BlockResult]
+    功能: 获取远端数据块的value@BlockResult
+    val ct = implicitly[ClassTag[T]]
+    val= getRemoteBlock(blockId, (data: ManagedBuffer) => {
+      val values =
+        serializerManager.dataDeserializeStream(blockId, data.createInputStream())(ct)
+      new BlockResult(values, DataReadMethod.Network, data.size)
+    })
+    
+    def getRemoteBlock[T](
+      blockId: BlockId,
+      bufferTransformer: ManagedBuffer => T): Option[T]
+    功能: 获取远端数据块@blockId,且使用转换函数@bufferTransformer 将其转换为指定数据类型
+    0. 数据块校验
+    logDebug(s"Getting remote block $blockId")
+    require(blockId != null, "BlockId is null")
+    1. 由于远端数据块都注册到驱动器中了,所以没有必要询问slave数据块的位置,只需要从驱动器中获取这个注册位置即可.
+    val locationsAndStatusOption = master.getLocationsAndStatus(
+        blockId, blockManagerId.host)
+    2. 获取远端数据结果
+    if (locationsAndStatusOption.isEmpty) {
+      logDebug(s"Block $blockId is unknown by block manager master")
+      None
+    } else {
+      // 确定远端数据元数据信息(文件大小/文件状态)
+      val locationsAndStatus = locationsAndStatusOption.get
+      val blockSize = locationsAndStatus.status.
+        diskSize.max(locationsAndStatus.status.memSize)
+      // 根据远端文件状态的本地目录,获取数据块数据@BlockData,并进行转换@bufferTransformer 获取结果
+      locationsAndStatus.localDirs.flatMap { localDirs =>
+        val blockDataOption =
+          readDiskBlockFromSameHostExecutor(
+              blockId, localDirs, locationsAndStatus.status.diskSize)
+        val res = blockDataOption.flatMap { blockData =>
+          try {
+            Some(bufferTransformer(blockData))
+          } catch {
+            case NonFatal(e) =>
+              logDebug("Block from the same host executor cannot be opened: ", e)
+              None
+          }
+        }
+        logInfo(s"Read $blockId from the disk of a same host executor is " +
+          (if (res.isDefined) "successful." else "failed."))
+        res
+      }.orElse {// 本地目录表中记录为空,则必须从远端管理器中获取数据块才行,效率低,需要进过网络传输
+        fetchRemoteManagedBuffer(
+            blockId, blockSize, locationsAndStatus).map(bufferTransformer)
+      }
+    }
+    
+    def preferExecutors(locations: Seq[BlockManagerId]): Seq[BlockManagerId]
+	功能: 获取之前数据块管理器@BlockManagerId 的最佳执行位置
+    1. 分割执行器和shuffle服务
+    val (executors, shuffleServers) = locations.partition(
+        _.port != externalShuffleServicePort)
+    2. 合并两部分内容并返回
+    val= executors ++ shuffleServers
+    
+    def sortLocations(locations: Seq[BlockManagerId]): Seq[BlockManagerId]
+    功能: 对给定数据块位置进行排序,优先使用本地机器.因为多个数据块管理器可以共享一台主机,然后多台主机可以共享一台机架.在每个原则信息(同主机,同机架,其他)在外部shuffle中也是需要使用的.
+    1. 位置随机
+    val locs = Random.shuffle(locations)
+    2. 安装是否为本机进行分类
+    val (preferredLocs, otherLocs) = locs.partition(_.host == blockManagerId.host)
+    3. 再安装本地-> 同一个机架 -> 其他关键字进行排序
+    val orderedParts = blockManagerId.topologyInfo match {
+      case None => Seq(preferredLocs, otherLocs)
+      case Some(_) =>
+        val (sameRackLocs, differentRackLocs) = otherLocs.partition {
+          loc => blockManagerId.topologyInfo == loc.topologyInfo
+        }
+        Seq(preferredLocs, sameRackLocs, differentRackLocs)
+    }
+    4. 按照执行位置的顺序,进行聚合
+    val= orderedParts.map(preferExecutors).reduce(_ ++ _) // 安装@preferExecutors 聚合
+    
+    def fetchRemoteManagedBuffer(
+      blockId: BlockId,
+      blockSize: Long,
+      locationsAndStatus: BlockManagerMessages.BlockLocationsAndStatus):
+    Option[ManagedBuffer]
+    功能: 获取远端数据块(以@ManagedBuffer 形式)
+    1. 如果数据块大小超出了容量,需要将@FileManger 传递给数据块传输服务@BlockTransferService,这个会平衡溢写的数据块,如果不这样做会返回一个空值,表示数据块已经持久化到内存中.
+    val tempFileManager = if (blockSize > maxRemoteBlockToMem) {
+      remoteBlockTempFileManager // 用于平衡溢写的数据块
+    } else {
+      null // 表示持久化到内存中
+    }
+    2. 确定元数据信息和容错参数
+    var runningFailureCount = 0 
+    var totalFailureCount = 0
+    val locations = sortLocations(locationsAndStatus.locations)
+    val maxFetchFailures = locations.size
+    var locationIterator = locations.iterator
+    3. 计算数据块数据
+    while (locationIterator.hasNext) {
+      // 获取缓冲数据并返回
+      val loc = locationIterator.next()
+      logDebug(s"Getting remote block $blockId from $loc")
+      val data = try {
+        val buf = blockTransferService.fetchBlockSync(loc.host, loc.port, loc.executorId,
+          blockId.toString, tempFileManager)
+        if (blockSize > 0 && buf.size() == 0) {
+          throw new IllegalStateException("Empty buffer received for non empty block")
+        }
+        buf
+      } catch {
+        case NonFatal(e) =>
+          runningFailureCount += 1
+          totalFailureCount += 1
+          if (totalFailureCount >= maxFetchFailures) {
+              // 容错超限处理
+            logWarning(s"Failed to fetch block after $totalFailureCount
+            fetch failures. " +
+              s"Most recent failure cause:", e)
+            return None
+          }
+          logWarning(s"Failed to fetch remote block $blockId " +
+            s"from $loc (failed attempt $runningFailureCount)", e)
+          // 容错超限处理
+          if (runningFailureCount >= maxFailuresBeforeLocationRefresh) {
+            locationIterator = sortLocations(master.getLocations(blockId)).iterator
+            logDebug(s"Refreshed locations from the driver " +
+              s"after ${runningFailureCount} fetch failures.")
+            runningFailureCount = 0
+          }
+          null
+      }
+      if (data != null) {
+        // 如果@ManagedBuffer是@BlockManagerManagedBuffer,name读取数据之后就会将其返回,在这种情		// 况下仅仅从远端获取结果,所以这里对类型进行了断言
+        assert(!data.isInstanceOf[BlockManagerManagedBuffer])
+        return Some(data)
+      }
+      logDebug(s"The value of block $blockId is null")
+    }
+    4.缺省值处理
+    logDebug(s"Block $blockId not found")
+    val= None
+    
+    def readDiskBlockFromSameHostExecutor(
+      blockId: BlockId,
+      localDirs: Array[String],
+      blockSize: Long): Option[ManagedBuffer]
+    功能: 从同一个主机执行器读取磁盘数据块
+    1. 获取指定目录@localDirs的文件列表
+    val file = ExecutorDiskUtils.getFile(localDirs, subDirsPerLocalDir, blockId.name)
+    2. 读取数据对应的数据块数据,使用@ManagedBuffer 返回
+    val= if (file.exists()) {
+      val mangedBuffer = securityManager.getIOEncryptionKey() match {
+        case Some(key) =>
+          new EncryptedManagedBuffer(
+            new EncryptedBlockData(file, blockSize, conf, key))
+        case _ =>
+          val transportConf = SparkTransportConf.fromSparkConf(conf, "shuffle")
+          new FileSegmentManagedBuffer(transportConf, file, 0, file.length)
+      }
+      Some(mangedBuffer)
+    } else {
+      None
+    }
+    
+    def getRemoteBytes(blockId: BlockId): Option[ChunkedByteBuffer] 
+    功能: 获取远端数据,以@ChunkedByteBuffer 字节缓冲区形式存储
+    getRemoteBlock(blockId, (data: ManagedBuffer) => {
+      if (remoteReadNioBufferConversion) {
+        new ChunkedByteBuffer(data.nioByteBuffer())
+      } else {
+        ChunkedByteBuffer.fromManagedBuffer(data)
+      }
+    })
+    
+    def get[T: ClassTag](blockId: BlockId): Option[BlockResult] 
+    功能: 从数据块管理器中获取数据块(本地/远端),如果是本地文件系统需要获取读取锁才可以进行,只有全部读取完毕才可以释放锁.
+    val local = getLocalValues(blockId)
+    if (local.isDefined) {
+      logInfo(s"Found block $blockId locally")
+      return local
+    }
+    val remote = getRemoteValues[T](blockId)
+    if (remote.isDefined) {
+      logInfo(s"Found block $blockId remotely")
+      return remote
+    }
+    None
+    
+    def downgradeLock(blockId: BlockId): Unit
+    功能: 将写排它锁降级为读取共享锁
+    blockInfoManager.downgradeLock(blockId)
+    
+    def releaseLock(blockId: BlockId, taskContext: Option[TaskContext] = None): Unit
+    功能: 释放指定数据块的读取锁,@taskContext在获取不到正确的任务上下文时需要传入
+     val taskAttemptId = taskContext.map(_.taskAttemptId())
+    // 注意到,当任务完成时候,spark会释放所有任务数据块的锁.如果@isCompleted=true表示不能再释放锁了
+    // 参考SPARK-27666
+    if (taskContext.isDefined && taskContext.get.isCompleted) {
+      logWarning(s"Task ${taskAttemptId.get} already completed, 
+      not releasing lock for $blockId")
+    } else {
+      blockInfoManager.unlock(blockId, taskAttemptId)
+    }
+    
+    def registerTask(taskAttemptId: Long): Unit 
+    功能: 使用数据块管理器注册指定任务
+    blockInfoManager.registerTask(taskAttemptId)
+    
+    def releaseAllLocksForTask(taskAttemptId: Long): Seq[BlockId] 
+    功能: 释放指定任务的所有锁,返回释放锁的数据块
+    val= blockInfoManager.releaseAllLocksForTask(taskAttemptId)
+    
+    def getOrElseUpdate[T](
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[T],
+      makeIterator: () => Iterator[T]): Either[BlockResult, Iterator[T]]
+    功能: 检索指定数据块,否则使用@makeIterator计算数据块,持久化(更新),并返回value值
+    1. 尝试获取数据块内容
+    get[T](blockId)(classTag) match {
+      case Some(block) =>
+        return Left(block)
+      case _ =>
+        // Need to compute the block.
+    }
+    2. 计算为空的时候的数据块内容,并持久化
+    doPutIterator(blockId, makeIterator, level, classTag, keepReadLock = true) match {
+      case None =>
+        val blockResult = getLocalValues(blockId).getOrElse {
+          releaseLock(blockId)
+          throw new SparkException(s"get() failed for block $blockId 
+          even though we held a lock")
+        }
+        releaseLock(blockId)
+        Left(blockResult)
+      case Some(iter) =>
+       Right(iter)
+    }
+    
+    def putIterator[T: ClassTag](
+      blockId: BlockId,
+      values: Iterator[T],
+      level: StorageLevel,
+      tellMaster: Boolean = true): Boolean 
+    功能: 对指定数据块@blockId 使用values进行持久化,成功则返回true
+    0. 参数校验
+    require(values != null, "Values is null")
+    1. 数据块持久化
+    doPutIterator(blockId, () => values, level, implicitly[ClassTag[T]], tellMaster)	 	 match {
+      case None =>
+        true
+      case Some(iter) =>
+        iter.close()
+        false
+    }
+    
+    def getDiskWriter(
+      blockId: BlockId,
+      file: File,
+      serializerInstance: SerializerInstance,
+      bufferSize: Int,
+      writeMetrics: ShuffleWriteMetricsReporter): DiskBlockObjectWriter
+    功能: 获取指定数据块的磁盘写出器
+    1. 确定是否需要同步写出(默认false,异步)
+    val syncWrites = conf.get(config.SHUFFLE_SYNC)
+    val= new DiskBlockObjectWriter(file, serializerManager, serializerInstance, bufferSize,syncWrites, writeMetrics, blockId)
+    
+    def doPut[T](
+      blockId: BlockId,
+      level: StorageLevel,
+      classTag: ClassTag[_],
+      tellMaster: Boolean,
+      keepReadLock: Boolean)(putBody: BlockInfo => Option[T]): Option[T]
+    功能: 持久化指定数据块@blockId,使用指定函数@putBody 函数进行持久化
+    1. 参数校验
+    require(blockId != null, "BlockId is null")
+    require(level != null && level.isValid, "StorageLevel is null or invalid")
+    2. 确定持久化数据块的数据块信息@BlockInfo
+    val putBlockInfo = {
+      val newInfo = new BlockInfo(level, classTag, tellMaster)
+      if (blockInfoManager.lockNewBlockForWriting(blockId, newInfo)) {
+        newInfo
+      } else {
+        logWarning(s"Block $blockId already exists on this machine; not re-adding it")
+        if (!keepReadLock) {
+          releaseLock(blockId)
+        }
+        return None
+      }
+    }
+    3. 持久化数据,并返回持久化的结果
+    val startTimeNs = System.nanoTime()
+    var exceptionWasThrown: Boolean = true
+    val result: Option[T] = try {
+      val res = putBody(putBlockInfo)
+      exceptionWasThrown = false
+      if (res.isEmpty) {
+        // the block was successfully stored
+        if (keepReadLock) {
+          blockInfoManager.downgradeLock(blockId)
+        } else {
+          blockInfoManager.unlock(blockId)
+        }
+      } else {
+        removeBlockInternal(blockId, tellMaster = false)
+        logWarning(s"Putting block $blockId failed")
+      }
+      res
+    } catch {
+      case NonFatal(e) =>
+        logWarning(s"Putting block $blockId failed due to exception $e.")
+        throw e
+    } finally {
+      if (exceptionWasThrown) { // 持久化失败处理
+        removeBlockInternal(blockId, tellMaster = tellMaster)
+        addUpdatedBlockStatusToTaskMetrics(blockId, BlockStatus.empty)
+      }
+    }
+    4. 备份参数显示
+    val usedTimeMs = Utils.getUsedTimeNs(startTimeNs)
+    if (level.replication > 1) {
+      logDebug(s"Putting block ${blockId} with replication took $usedTimeMs")
+    } else {
+      logDebug(s"Putting block ${blockId} without replication took ${usedTimeMs}")
+    }
+    val= result
+    
+    def putBytes[T: ClassTag](
+     blockId: BlockId,
+     bytes: ChunkedByteBuffer,
+     level: StorageLevel,
+     tellMaster: Boolean = true): Boolean
+    功能: 将指定数据缓冲区的数据@bytes 存储到数据块中
+    1. 更新数据块存储情况
+    val blockStoreUpdater =
+      ByteBufferBlockStoreUpdater(
+          blockId, level, implicitly[ClassTag[T]], bytes, tellMaster)
+    2. 保存更新
+    blockStoreUpdater.save()
+    
+    def doPutIterator[T](
+      blockId: BlockId,
+      iterator: () => Iterator[T],
+      level: StorageLevel,
+      classTag: ClassTag[T],
+      tellMaster: Boolean = true,
+      keepReadLock: Boolean = false): Option[PartiallyUnrolledIterator[T]]
+    功能: 存储迭代器信息@iterator,可以进行必要的备份,如果数据块已经存在,那么这个方法不会覆盖
+    如果数据块存在或者存储成功,那么返回None,如果存储失败则返回@Some(iterator)
+    doPut(
+        blockId, level, classTag, tellMaster = tellMaster, keepReadLock = keepReadLock) { 	  info =>
+      val startTimeNs = System.nanoTime()
+      var iteratorFromFailedMemoryStorePut: Option[PartiallyUnrolledIterator[T]] = None
+      var size = 0L
+      if (level.useMemory) {.
+        if (level.deserialized) {
+          memoryStore.putIteratorAsValues(blockId, iterator(), classTag) match {
+            case Right(s) =>
+              size = s
+            case Left(iter) =>
+              if (level.useDisk) {
+                logWarning(s"Persisting block $blockId to disk instead.")
+                diskStore.put(blockId) { channel =>
+                  val out = Channels.newOutputStream(channel)
+                  serializerManager.dataSerializeStream(blockId, out, iter)(classTag)
+                }
+                size = diskStore.getSize(blockId)
+              } else {
+                iteratorFromFailedMemoryStorePut = Some(iter)
+              }
+          }
+        } else {
+          memoryStore.putIteratorAsBytes(
+              blockId, iterator(), classTag, level.memoryMode) match {
+            case Right(s) =>
+              size = s
+            case Left(partiallySerializedValues) =>
+              if (level.useDisk) {
+                logWarning(s"Persisting block $blockId to disk instead.")
+                diskStore.put(blockId) { channel =>
+                  val out = Channels.newOutputStream(channel)
+                  partiallySerializedValues.finishWritingToStream(out)
+                }
+                size = diskStore.getSize(blockId)
+              } else {
+                iteratorFromFailedMemoryStorePut =
+                  Some(partiallySerializedValues.valuesIterator)
+              }
+          }
+        }
+      } else if (level.useDisk) {
+        diskStore.put(blockId) { channel =>
+          val out = Channels.newOutputStream(channel)
+          serializerManager.dataSerializeStream(blockId, out, iterator())(classTag)
+        }
+        size = diskStore.getSize(blockId)
+      }
+      val putBlockStatus = getCurrentBlockStatus(blockId, info)
+      val blockWasSuccessfullyStored = putBlockStatus.storageLevel.isValid
+      if (blockWasSuccessfullyStored) {
+        info.size = size
+        if (tellMaster && info.tellMaster) {
+          reportBlockStatus(blockId, putBlockStatus)
+        }
+        addUpdatedBlockStatusToTaskMetrics(blockId, putBlockStatus)
+        logDebug(s"Put block $blockId locally took ${Utils.getUsedTimeNs(startTimeNs)}")
+        if (level.replication > 1) {
+          val remoteStartTimeNs = System.nanoTime()
+          val bytesToReplicate = doGetLocalBytes(blockId, info)
+          val remoteClassTag = if (!serializerManager.canUseKryo(classTag)) {
+            scala.reflect.classTag[Any]
+          } else {
+            classTag
+          }
+          try {
+            replicate(blockId, bytesToReplicate, level, remoteClassTag)
+          } finally {
+            bytesToReplicate.dispose()
+          }
+          logDebug(s"Put block $blockId remotely took
+          ${Utils.getUsedTimeNs(remoteStartTimeNs)}")
+        }
+      }
+      assert(blockWasSuccessfullyStored == iteratorFromFailedMemoryStorePut.isEmpty)
+      iteratorFromFailedMemoryStorePut
+    }
+    
+    def maybeCacheDiskBytesInMemory(
+      blockInfo: BlockInfo,
+      blockId: BlockId,
+      level: StorageLevel,
+      diskData: BlockData): Option[ChunkedByteBuffer]
+    功能: 将磁盘移除数据缓存到内存中,为了加速读取,这个方法需要调用者持有读取锁
+    返回: 存储成功则返回内存存储器的副本数据,否则为None
+    1. 存储等级断言
+    require(!level.deserialized)
+    2. 请求获取磁盘移除数据对应内存存储器副本
+    if (level.useMemory) {
+      // 使用@blockInfo用于避免两个读取线程间的竞争条件(竞争读取磁盘内容写到内存中)
+      blockInfo.synchronized {
+        if (memoryStore.contains(blockId)) {
+          diskData.dispose()
+          Some(memoryStore.getBytes(blockId).get)
+        } else {
+          val allocator = level.memoryMode match {
+            case MemoryMode.ON_HEAP => ByteBuffer.allocate _
+            case MemoryMode.OFF_HEAP => Platform.allocateDirectBuffer _
+          }
+          val putSucceeded = memoryStore.putBytes(
+              blockId, diskData.size, level.memoryMode, () => {
+            diskData.toChunkedByteBuffer(allocator)
+          })
+          if (putSucceeded) {
+            diskData.dispose()
+            Some(memoryStore.getBytes(blockId).get)
+          } else {
+            None
+          }
+        }
+      }
+    } else {
+      None
+    }
+    
+    def maybeCacheDiskValuesInMemory[T](
+      blockInfo: BlockInfo,
+      blockId: BlockId,
+      level: StorageLevel,
+      diskIterator: Iterator[T]): Iterator[T]
+    功能: 同上,但是返回的是迭代器的副本(返回后原先数据将不存在)
+    1. 参数校验
+    require(level.deserialized)
+    2. 将磁盘数据持久化到内存中,并返回
+    if (level.useMemory) {
+        // 需要同步读取数据信息,避免线程竞争
+      blockInfo.synchronized {
+        if (memoryStore.contains(blockId)) {
+          memoryStore.getValues(blockId).get
+        } else {
+          memoryStore.putIteratorAsValues(blockId, diskIterator, classTag) match {
+            case Left(iter) =>
+              iter
+            case Right(_) =>
+              memoryStore.getValues(blockId).get
+          }
+        }
+      }.asInstanceOf[Iterator[T]]
+    } else {
+      diskIterator
+    }
+    
+    def getPeers(forceFetch: Boolean): Seq[BlockManagerId]
+    功能: 获取系统中同一个等级的数据块管理器
+    val= peerFetchLock.synchronized {
+      val cachedPeersTtl = conf.get(config.STORAGE_CACHED_PEERS_TTL) // milliseconds
+      val diff = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastPeerFetchTimeNs)
+      val timeout = diff > cachedPeersTtl
+      if (cachedPeers == null || forceFetch || timeout) {
+        cachedPeers = master.getPeers(blockManagerId).sortBy(_.hashCode)
+        lastPeerFetchTimeNs = System.nanoTime()
+        logDebug("Fetched peers from master: " + cachedPeers.mkString("[", ",", "]"))
+      }
+      cachedPeers
+    }
+    
+    def replicateBlock(
+      blockId: BlockId,
+      existingReplicas: Set[BlockManagerId],
+      maxReplicas: Int): Unit
+    功能: 备份指定数据块
+    输入参数:
+    existingReplicas	存在有副本的数据块管理器标识符集合
+    maxReplicas	最大失败次数
+    logInfo(s"Using $blockManagerId to pro-actively replicate $blockId")
+    val= blockInfoManager.lockForReading(blockId).foreach { info =>
+      val data = doGetLocalBytes(blockId, info)
+      val storageLevel = StorageLevel(
+        useDisk = info.level.useDisk,
+        useMemory = info.level.useMemory,
+        useOffHeap = info.level.useOffHeap,
+        deserialized = info.level.deserialized,
+        replication = maxReplicas)
+      getPeers(forceFetch = true)
+      try {
+        replicate(blockId, data, storageLevel, info.classTag, existingReplicas)
+      } finally {
+        logDebug(s"Releasing lock for $blockId")
+        releaseLockAndDispose(blockId, data)
+      }
+    }
+    
+    def replicate(
+      blockId: BlockId,
+      data: BlockData,
+      level: StorageLevel,
+      classTag: ClassTag[_],
+      existingReplicas: Set[BlockManagerId] = Set.empty): Unit
+    功能: 将数据块备份到其他节点上,注意这个是阻塞调用,数据块备份完毕之后才会返回
+    1. 获取备份参数
+    val maxReplicationFailures = conf.get(config.STORAGE_MAX_REPLICATION_FAILURE)
+    val tLevel = StorageLevel(
+      useDisk = level.useDisk,
+      useMemory = level.useMemory,
+      useOffHeap = level.useOffHeap,
+      deserialized = level.deserialized,
+      replication = 1)
+    val numPeersToReplicateTo = level.replication - 1
+    val startTime = System.nanoTime
+    2. 获取需要备份的节点参数
+    val peersReplicatedTo = mutable.HashSet.empty ++ existingReplicas
+    val peersFailedToReplicateTo = mutable.HashSet.empty[BlockManagerId]
+    var numFailures = 0
+    val initialPeers = getPeers(false).filterNot(existingReplicas.contains)
+    var peersForReplication = blockReplicationPolicy.prioritize(
+      blockManagerId,
+      initialPeers,
+      peersReplicatedTo,
+      blockId,
+      numPeersToReplicateTo)
+    3. 备份数据块数据(带容错)
+    while(numFailures <= maxReplicationFailures &&
+      !peersForReplication.isEmpty &&
+      peersReplicatedTo.size < numPeersToReplicateTo) {
+      val peer = peersForReplication.head
+      try {
+        val onePeerStartTime = System.nanoTime
+        logTrace(s"Trying to replicate $blockId of ${data.size} bytes to $peer")
+        val buffer = new BlockManagerManagedBuffer(
+            blockInfoManager, blockId, data, false,unlockOnDeallocate = false)
+        blockTransferService.uploadBlockSync(
+          peer.host,
+          peer.port,
+          peer.executorId,
+          blockId,
+          buffer,
+          tLevel,
+          classTag)
+        logTrace(s"Replicated $blockId of ${data.size} bytes to $peer" +
+          s" in ${(System.nanoTime - onePeerStartTime).toDouble / 1e6} ms")
+        peersForReplication = peersForReplication.tail
+        peersReplicatedTo += peer
+      } catch {
+        case NonFatal(e) =>
+          logWarning(s"Failed to replicate $blockId to $peer, failure #$numFailures", e)
+          peersFailedToReplicateTo += peer
+          val filteredPeers = getPeers(true).filter { p =>
+            !peersFailedToReplicateTo.contains(p) && !peersReplicatedTo.contains(p)
+          }
+          numFailures += 1
+          peersForReplication = blockReplicationPolicy.prioritize(
+            blockManagerId,
+            filteredPeers,
+            peersReplicatedTo,
+            blockId,
+            numPeersToReplicateTo - peersReplicatedTo.size)
+      }
+    }
+    4. 显示备份相关信息
+    logDebug(s"Replicating $blockId of ${data.size} bytes to " +
+      s"${peersReplicatedTo.size} peer(s) took 
+      ${(System.nanoTime - startTime) / 1e6} ms")
+    if (peersReplicatedTo.size < numPeersToReplicateTo) {
+      logWarning(s"Block $blockId replicated to only " +
+        s"${peersReplicatedTo.size} peer(s) instead of $numPeersToReplicateTo peers")
+    }
+    logDebug(s"block $blockId replicated to ${peersReplicatedTo.mkString(", ")}")
+    
+    def getSingle[T: ClassTag](blockId: BlockId): Option[T]
+    功能: 读取包含单个对象的数据块(读取数据块-> 转换为类型T)
+    val= get[T](blockId).map(_.data.next().asInstanceOf[T])
+    
+    def putSingle[T: ClassTag](
+      blockId: BlockId,
+      value: T,
+      level: StorageLevel,
+      tellMaster: Boolean = true): Boolean 
+    功能: 写入一个@value 到指定数据块中
+    val= putIterator(blockId, Iterator(value), level, tellMaster)
+    
+    def dropFromMemory[T: ClassTag](
+      blockId: BlockId,
+      data: () => Either[Array[T], ChunkedByteBuffer]): StorageLevel
+    功能: 从内存中移除指定数据块,如果磁盘可以接受就存放到磁盘中,在内存容量不足的时候调用.用于释放内存.
+    如果@data 没有存放到磁盘上,那么数据就不会被创建,这个方法调用者必须持有一个可写锁.这个方法不会释放这个写锁.
+    1. 如果可以释放的数据块存储到数据块上
+    logInfo(s"Dropping block $blockId from memory")
+    val info = blockInfoManager.assertBlockIsLockedForWriting(blockId)
+    var blockIsUpdated = false
+    val level = info.level
+    if (level.useDisk && !diskStore.contains(blockId)) {
+      logInfo(s"Writing block $blockId to disk")
+      data() match {
+        case Left(elements) =>
+          diskStore.put(blockId) { channel =>
+            val out = Channels.newOutputStream(channel)
+            serializerManager.dataSerializeStream(
+              blockId,
+              out,
+              elements.toIterator)(info.classTag.asInstanceOf[ClassTag[T]])
+          }
+        case Right(bytes) =>
+          diskStore.putBytes(blockId, bytes)
+      }
+      blockIsUpdated = true
+    }
+    2. 从内存区域移除数据块
+    val droppedMemorySize =
+      if (memoryStore.contains(blockId)) memoryStore.getSize(blockId) else 0L
+    val blockIsRemoved = memoryStore.remove(blockId)
+    if (blockIsRemoved) {
+      blockIsUpdated = true
+    } else {
+      logWarning(s"Block $blockId could not be dropped from memory as it does not exist")
+    }
+    3. 获取数据块的存储等级,并返回
+    val status = getCurrentBlockStatus(blockId, info)
+    if (info.tellMaster) {
+      reportBlockStatus(blockId, status, droppedMemorySize)
+    }
+    if (blockIsUpdated) {
+      addUpdatedBlockStatusToTaskMetrics(blockId, status)
+    }
+    val= status.storageLevel
+    
+    def removeRdd(rddId: Int): Int
+    功能: 移除指定RDD的数据块
+    logInfo(s"Removing RDD $rddId")
+    val blocksToRemove = blockInfoManager.entries.flatMap(
+        _._1.asRDDId).filter(_.rddId == rddId)
+    blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster = false) }
+    val= blocksToRemove.size
+    
+    def removeBroadcast(broadcastId: Long, tellMaster: Boolean): Int
+    功能: 移除指定广播变量的数据块
+    logDebug(s"Removing broadcast $broadcastId")
+    val blocksToRemove = blockInfoManager.entries.map(_._1).collect {
+      case bid @ BroadcastBlockId(`broadcastId`, _) => bid
+    }
+    blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster) }
+    val= blocksToRemove.size
+    
+    def removeBlock(blockId: BlockId, tellMaster: Boolean = true): Unit
+    功能: 从内存和磁盘上移除指定数据块
+    logDebug(s"Removing block $blockId")
+    blockInfoManager.lockForWriting(blockId) match {
+      case None =>
+        logWarning(s"Asked to remove block $blockId, which does not exist")
+      case Some(info) =>
+        removeBlockInternal(blockId, tellMaster = tellMaster && info.tellMaster)
+        addUpdatedBlockStatusToTaskMetrics(blockId, BlockStatus.empty)
+    }
+ 
+    def removeBlockInternal(blockId: BlockId, tellMaster: Boolean): Unit
+    功能: 内部移除数据块@blockId,假定调用者持有了写出锁
+    1. 获取移除数据块的状态
+     val blockStatus = if (tellMaster) {
+      val blockInfo = blockInfoManager.assertBlockIsLockedForWriting(blockId)
+      Some(getCurrentBlockStatus(blockId, blockInfo))
+    } else None
+    2. 确定移除数据块的大小(内存,磁盘)
+    val removedFromMemory = memoryStore.remove(blockId)
+    val removedFromDisk = diskStore.remove(blockId)
+    if (!removedFromMemory && !removedFromDisk) {
+      logWarning(s"Block $blockId could not be removed as 
+      it was not found on disk or in memory")
+    }
+    3. 移除数据块
+    blockInfoManager.removeBlock(blockId)
+    if (tellMaster) {
+      reportBlockStatus(blockId, blockStatus.get.copy(storageLevel = StorageLevel.NONE))
+    }
+    
+    def addUpdatedBlockStatusToTaskMetrics(blockId: BlockId, status: BlockStatus): Unit
+    功能: 添加更新的数据块到任务度量器中
+    if (conf.get(config.TASK_METRICS_TRACK_UPDATED_BLOCK_STATUSES)) {
+      Option(TaskContext.get()).foreach { c =>
+        c.taskMetrics().incUpdatedBlockStatuses(blockId -> status)
+      }
+    }
+    
+    def releaseLockAndDispose(
+      blockId: BlockId,
+      data: BlockData,
+      taskContext: Option[TaskContext] = None): Unit
+    功能: 释放锁并暴露数据
+    releaseLock(blockId, taskContext)
+    data.dispose()
+    
+    def stop(): Unit
+    功能: 停止数据块管理器
+    blockTransferService.close()
+    if (blockStoreClient ne blockTransferService) {
+      blockStoreClient.close()
+    }
+    remoteBlockTempFileManager.stop()
+    diskBlockManager.stop()
+    rpcEnv.stop(slaveEndpoint)
+    blockInfoManager.clear()
+    memoryStore.clear()
+    futureExecutionContext.shutdownNow()
+    logInfo("BlockManager stopped")
+}
+```
+
+```scala
+private[spark] object BlockManager {
+    属性:
+    #name @ID_GENERATOR = new IdGenerator	ID生成器
+    操作集:
+    def blockIdsToLocations(
+      blockIds: Array[BlockId],
+      env: SparkEnv,
+      blockManagerMaster: BlockManagerMaster = null): Map[BlockId, Seq[String]]
+    功能: 获取数据块--> 执行位置映射表
+    0. 参数断言
+    assert(env != null || blockManagerMaster != null)
+    1. 获取指定数据块的执行位置列表
+    val blockLocations: Seq[Seq[BlockManagerId]] = if (blockManagerMaster == null) {
+      env.blockManager.getLocationBlockIds(blockIds)
+    } else {
+      blockManagerMaster.getLocations(blockIds)
+    }
+    2. 形成映射关系,并返回
+    val blockManagers = new HashMap[BlockId, Seq[String]]
+    for (i <- 0 until blockIds.length) {
+      blockManagers(blockIds(i)) = blockLocations(i).map { loc =>
+        ExecutorCacheTaskLocation(loc.host, loc.executorId).toString
+      }
+    }
+    val= blockManagers.toMap
+    
+    内部类:
+    private class ShuffleMetricsSource(
+      override val sourceName: String,
+      metricSet: MetricSet) extends Source {
+        介绍: shuffle度量资源
+        属性:
+        #name @metricRegistry = new MetricRegistry	度量注册器
+        初始化操作:
+        metricRegistry.registerAll(metricSet)
+        功能: 注册度量集@metricSet
+    }
+    
+    class RemoteBlockDownloadFileManager(blockManager: BlockManager)
+    extends DownloadFileManager with Logging {
+        介绍: 远端数据块下载管理器
+        属性:
+        #name @encryptionKey = SparkEnv.get.securityManager.getIOEncryptionKey()
+        	加密密钥
+        #name @referenceQueue = new JReferenceQueue[DownloadFile]	下载文件引用队列
+        #name @referenceBuffer	引用缓冲区
+        val= Collections.newSetFromMap[ReferenceWithCleanup](new ConcurrentHashMap)
+        #name @POLL_TIMEOUT = 1000	轮询周期
+        #name @stopped = false	轮询周期 volatile
+        #name @cleaningThread 清理线程
+        val= new Thread() { override def run(): Unit = { keepCleaning() } }
+        初始化操作:
+        cleaningThread.setDaemon(true)
+        cleaningThread.setName("RemoteBlock-temp-file-clean-thread")
+        cleaningThread.start()
+        功能: 清理线程设置
+        
+        def createTempFile(transportConf: TransportConf): DownloadFile 
+        功能: 创建临时文件
+        1. 获取需要创建的文件
+        val file = blockManager.diskBlockManager.createTempLocalBlock()._2
+        2. 对文件进行加密
+        val= encryptionKey match {
+            case Some(key) =>
+            new EncryptedDownloadFile(file, key)
+            case None =>
+            new SimpleDownloadFile(file, transportConf)
+        }
+        
+        def registerTempFileToClean(file: DownloadFile): Boolean 
+        功能: 注册需要清理的临时文件
+        referenceBuffer.add(new ReferenceWithCleanup(file, referenceQueue))
+        
+        def stop(): Unit
+        功能: 停止远端数据块管理器
+        stopped = true
+        cleaningThread.interrupt()
+        cleaningThread.join()
+        
+        def keepCleaning(): Unit 
+        功能: 周期性的处理对文件引用队列的清除
+        while (!stopped) {
+            try {
+              Option(referenceQueue.remove(POLL_TIMEOUT))
+                .map(_.asInstanceOf[ReferenceWithCleanup])
+                .foreach { ref =>
+                  referenceBuffer.remove(ref)
+                  ref.cleanUp()
+                }
+            } catch {
+              case _: InterruptedException =>
+                // no-op
+              case NonFatal(e) =>
+                logError("Error in cleaning thread", e)
+            }
+        }
+        
+        内部类:
+        private class ReferenceWithCleanup(
+            file: DownloadFile,
+            referenceQueue: JReferenceQueue[DownloadFile]
+            ) extends WeakReference[DownloadFile](file, referenceQueue) {
+            介绍: 清除引用(弱引用)
+            属性:
+            #name @filePath = file.path()	文件路径
+            def cleanUp(): Unit
+            功能: 清空文件
+            logDebug(s"Clean up file $filePath")
+            if (!file.delete()) {
+              logDebug(s"Fail to delete file $filePath")
+            }
+        }
+    }
+}
+```
+
+```scala
+private class EncryptedDownloadFile(
+      file: File,
+      key: Array[Byte]) extends DownloadFile {
+    介绍: 加密的下载文件
+    构造器参数:
+    file	文件
+    key	加密密钥
+    属性:
+    #name @env = SparkEnv.get	spark配置
+    #name @def delete(): Boolean = file.delete()	删除文件
+    操作集:
+    def openForWriting(): DownloadFileWritableChannel
+    功能: 获取可写的文件通道
+    val= new EncryptedDownloadWritableChannel()
+    
+    def path(): String = file.getAbsolutePath
+    功能: 获取文件路径
+    
+    内部类:
+    class EncryptedDownloadWritableChannel extends DownloadFileWritableChannel{
+        介绍: 可写文件通道
+        #name @countingOutput: CountingWritableChannel	输出通道
+        val= new CountingWritableChannel(
+        	Channels.newChannel(
+            env.serializerManager.wrapForEncryption(new FileOutputStream(file))))
+        操作集:
+        def closeAndRead(): ManagedBuffer
+        功能: 关闭写出同步,并开启读取,提供相应的缓冲区供读取
+        countingOutput.close()
+        val size = countingOutput.getCount
+        new EncryptedManagedBuffer(new EncryptedBlockData(file, size, env.conf, key))
+        
+        def write(src: ByteBuffer): Int = countingOutput.write(src)
+        功能: 写出指定内容@src
+        
+        def isOpen: Boolean = countingOutput.isOpen()
+        功能: 确定通道是否启动
+        
+        def close(): Unit = countingOutput.close()
+        功能: 关闭通道
+    }
 }
 ```
 
@@ -5151,3 +6236,5 @@ class FileBasedTopologyMapper(conf: SparkConf) extends TopologyMapper(conf) with
 
 1.  容错性的保证 -- 冗余策略
 2.  [Robert Floyd采样算法](# https://math.stackexchange.com/q/178690)
+3.  TTL
+4.  弱引用
