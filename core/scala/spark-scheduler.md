@@ -2306,6 +2306,9 @@ extends Logging {
     taskScheduler.setDAGScheduler(this)
     功能: 设置dag调度器
     
+    eventProcessLoop.start()
+    功能: 启动消息环
+    
     操作集:
     def numTotalJobs: Int = nextJobId.get()
     功能: 获取job数量
@@ -3279,11 +3282,621 @@ extends Logging {
       failedEpoch -= execId
     }
     
+    def handleStageCancellation(stageId: Int, reason: Option[String]): Unit
+    功能: 处理指定stage 的放弃,原因为@reason
+    stageIdToStage.get(stageId) match {
+      case Some(stage) =>
+        val jobsThatUseStage: Array[Int] = stage.jobIds.toArray
+        jobsThatUseStage.foreach { jobId =>
+          val reasonStr = reason match {
+            case Some(originalReason) =>
+              s"because $originalReason"
+            case None =>
+              s"because Stage $stageId was cancelled"
+          }
+          handleJobCancellation(jobId, Option(reasonStr))
+        }
+      case None =>
+        logInfo("No active jobs to kill for Stage " + stageId)
+    }
+    
+    def handleJobCancellation(jobId: Int, reason: Option[String]): Unit
+    功能: 处理job的放弃
+    if (!jobIdToStageIds.contains(jobId)) {
+      logDebug("Trying to cancel unregistered job " + jobId)
+    } else {
+      failJobAndIndependentStages(
+        jobIdToActiveJob(jobId), "Job %d cancelled %s".format(jobId, reason.getOrElse("")))
+    }
+    
+    def markStageAsFinished(
+      stage: Stage,
+      errorMessage: Option[String] = None,
+      willRetry: Boolean = false): Unit
+    功能: 标记stage为完成状态,并从运行的stage列表中移除当前stage
+    1. 求取服务运行的时间
+    val serviceTime = stage.latestInfo.submissionTime match {
+      case Some(t) => "%.03f".format((clock.getTimeMillis() - t) / 1000.0)
+      case _ => "Unknown"
+    }
+    2. 如果错误信息为空,则清除当前stage的失败计数器
+    if (errorMessage.isEmpty) {
+      logInfo("%s (%s) finished in %s s".format(stage, stage.name, serviceTime))
+      stage.latestInfo.completionTime = Some(clock.getTimeMillis())
+      stage.clearFailures()
+    } else {
+        // 存在错误信息,设置最近一次请求为失败消息@errorMessage
+      stage.latestInfo.stageFailed(errorMessage.get)
+      logInfo(s"$stage (${stage.name}) failed in $serviceTime s due to ${errorMessage.get}")
+    }
+    3. 设定stage的结束点
+    if (!willRetry) {
+      outputCommitCoordinator.stageEnd(stage.id)
+    }
+    4. 监听总线发送stage完成的消息,并从运行中stage中移除当前的stage
+    listenerBus.post(SparkListenerStageCompleted(stage.latestInfo))
+    runningStages -= stage
+    
+    def abortStage(
+      failedStage: Stage,
+      reason: String,
+      exception: Option[Throwable]): Unit 
+    功能: 抛弃指定失败stage@failedStage
+    0. 如果注册表@stageIdToStage中不包含当前失败的stage,直接返回
+    if (!stageIdToStage.contains(failedStage.id)) {
+      return
+    }
+    1. 获取与失败stage相关的job列表
+    val dependentJobs: Seq[ActiveJob] =
+      activeJobs.filter(job => stageDependsOn(job.finalStage, failedStage)).toSeq
+    failedStage.latestInfo.completionTime = Some(clock.getTimeMillis())
+    2. 对失败的job进行处理
+    for (job <- dependentJobs) {
+      failJobAndIndependentStages(job, s"Job aborted due to stage failure: $reason", exception)
+    }
+    if (dependentJobs.isEmpty) {
+      logInfo("Ignoring failure of " + failedStage + " because all jobs depending on it are done")
+    }
+    
+    def failJobAndIndependentStages(
+      job: ActiveJob,
+      failureReason: String,
+      exception: Option[Throwable] = None): Unit
+    功能: 将指定job失败,并将相关的stage设置失败,清除相关的状态信息.
+    1. 获取当前job相关的stage列表
+    val error = new SparkException(failureReason, exception.orNull)
+    var ableToCancelStages = true
+    val stages = jobIdToStageIds(job.jobId)
+    if (stages.isEmpty) {
+      logError("No stages registered for job " + job.jobId)
+    }
+    2. 放弃指定stage中的所有任务,并标记这些stage失败
+    stages.foreach { stageId =>
+      val jobsForStage: Option[HashSet[Int]] = stageIdToStage.get(stageId).map(_.jobIds)
+      if (jobsForStage.isEmpty || !jobsForStage.get.contains(job.jobId)) {
+        logError(
+          "Job %d not registered for stage %d even though that stage was registered for the job"
+            .format(job.jobId, stageId))
+      } else if (jobsForStage.get.size == 1) {
+        if (!stageIdToStage.contains(stageId)) {
+          logError(s"Missing Stage for stage with id $stageId")
+        } else {
+          val stage = stageIdToStage(stageId)
+          if (runningStages.contains(stage)) {
+            try { 
+              // 放弃执行当前stage下的任务，并标记当前stage失败
+              taskScheduler.cancelTasks(stageId, shouldInterruptTaskThread(job))
+              markStageAsFinished(stage, Some(failureReason))
+            } catch {
+              case e: UnsupportedOperationException =>
+                logWarning(s"Could not cancel tasks for stage $stageId", e)
+                ableToCancelStages = false
+            }
+          }
+        }
+      }
+    }
+    3. 释放相关的状态，并发送任务完成消息
+    if (ableToCancelStages) {
+      cleanupStateForJobAndIndependentStages(job)
+      job.listener.jobFailed(error)
+      listenerBus.post(SparkListenerJobEnd(job.jobId, clock.getTimeMillis(), JobFailed(error)))
+    }
+    
+    def stageDependsOn(stage: Stage, target: Stage): Boolean
+    功能: 确定指定@stage的祖先是否为@target
+    0. 初始校验
+    if (stage == target) {
+      return true
+    }
+    1. 初始化数据结构
+    val visitedRdds = new HashSet[RDD[_]]
+    val waitingForVisit = new ListBuffer[RDD[_]]
+    waitingForVisit += stage.rdd
+    2. 定义指定@rdd的依赖RDD
+    def visit(rdd: RDD[_]): Unit = {
+      if (!visitedRdds(rdd)) {
+        visitedRdds += rdd
+        for (dep <- rdd.dependencies) {
+          dep match {
+            case shufDep: ShuffleDependency[_, _, _] =>
+              val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
+              if (!mapStage.isAvailable) {
+                waitingForVisit.prepend(mapStage.rdd)
+              }  // Otherwise there's no need to follow the dependency back
+            case narrowDep: NarrowDependency[_] =>
+              waitingForVisit.prepend(narrowDep.rdd)
+          }
+        }
+      }
+    }
+    3. 使用BFS搜索祖先RDD
+    while (waitingForVisit.nonEmpty) {
+      visit(waitingForVisit.remove(0))
+    }
+    4. 确定是否包含@target
+    val= visitedRdds.contains(target.rdd)
+    
+    def getPreferredLocs(rdd: RDD[_], partition: Int): Seq[TaskLocation]
+    功能： 获取指定rdd，指定分区号@partition的任务执行位置列表
+    输入参数:
+    	rdd	指定的RDD
+    	partition	查找位置的信息号
+    返回:
+    	最佳执行机器的位置
+    val= getPreferredLocsInternal(rdd, partition, new HashSet)
+    
+    def getPreferredLocsInternal(
+      rdd: RDD[_],
+      partition: Int,
+      visited: HashSet[(RDD[_], Int)]): Seq[TaskLocation]
+    功能: @getPreferredLocs的迭代实现,线程安全
+    1. 防止重复访问
+    if (!visited.add((rdd, partition))) {
+      return Nil
+    }
+    2. 检查当前分区是否在缓存中
+    val cached = getCacheLocs(rdd)(partition)
+    if (cached.nonEmpty) {
+      return cached
+    }
+    3. 缓存中没有的化,寻找最佳位置
+    val rddPrefs = rdd.preferredLocations(rdd.partitions(partition)).toList
+    if (rddPrefs.nonEmpty) {
+      return rddPrefs.map(TaskLocation(_))
+    }
+    4. 如果RDD含有窄依赖,找到窄依赖的第一个分区
+    rdd.dependencies.foreach {
+      case n: NarrowDependency[_] =>
+        for (inPart <- n.getParents(partition)) {
+          val locs = getPreferredLocsInternal(n.rdd, inPart, visited)
+          if (locs != Nil) { // 找到第一个分区的位置
+            return locs
+          }
+        }
+      case _ =>
+    }
+    val= Nil
+    
+    def markMapStageJobAsFinished(job: ActiveJob, stats: MapOutputStatistics): Unit
+    功能: 标记shuffle map stage完成
+    job.finished(0) = true
+    job.numFinished += 1
+    job.listener.taskSucceeded(0, stats)
+    cleanupStateForJobAndIndependentStages(job)
+    listenerBus.post(SparkListenerJobEnd(job.jobId, clock.getTimeMillis(), JobSucceeded))
+    
+    def stop(): Unit
+    功能: 停止DAG调度器
+    1. 停止消息调度器
+    messageScheduler.shutdownNow()
+    2. 事件环发送停止消息
+    eventProcessLoop.stop()
+    3. 停止任务调度器
+    taskScheduler.stop()
+    
+    def handleTaskCompletion(event: CompletionEvent): Unit
+    功能: 回应任务的完成,在事件环中调用,假定其可以修改调度器内部状态.使用@taskEnded()从外部发送任务和事件
+    1. 输出调节器处理当前事件的完成
+    val task = event.task
+    val stageId = task.stageId
+    outputCommitCoordinator.taskCompleted(
+      stageId,
+      task.stageAttemptId,
+      task.partitionId,
+      event.taskInfo.attemptNumber, // this is a task attempt number
+      event.reason)
+    2. 如果stage映射表@stageIdToStage 不包含当前任务所属的stage,则直接结束(发送任务结束事件)
+    if (!stageIdToStage.contains(task.stageId)) {
+      postTaskEnd(event)
+      return
+    }
+    3. 确保任务累加器在处理之前更新完毕,以便于在job和stage更新之前,发送任务和事件.累加器仅仅在一定的情况下才能更新
+    val stage = stageIdToStage(task.stageId)
+    event.reason match {
+      case Success => // 事件执行成功,则对任务进行处理,从task->stage->job.(更新累加器信息)
+        task match {
+          case rt: ResultTask[_, _] =>
+            val resultStage = stage.asInstanceOf[ResultStage]
+            resultStage.activeJob match {
+              case Some(job) => 
+                if (!job.finished(rt.outputId)) {
+                  updateAccumulators(event)
+                }
+              case None => // Ignore update if task's job has finished.
+            }
+          case _ =>
+            updateAccumulators(event)
+        }
+      case _: ExceptionFailure | _: TaskKilled => updateAccumulators(event)
+      case _ =>
+    }
+    postTaskEnd(event) // 发送任务结束事件
+    4. 根据任务的执行情况进行处理
+    event.reason match {
+      case Success =>
+        if (task.stageAttemptId < stage.latestInfo.attemptNumber()) {
+          taskScheduler.notifyPartitionCompletion(stageId, task.partitionId)
+        }
+        task match {
+          case rt: ResultTask[_, _] =>
+            val resultStage = stage.asInstanceOf[ResultStage]
+            resultStage.activeJob match {
+              case Some(job) =>
+                if (!job.finished(rt.outputId)) {
+                  job.finished(rt.outputId) = true
+                  job.numFinished += 1
+                  // If the whole job has finished, remove it
+                  if (job.numFinished == job.numPartitions) {
+                    markStageAsFinished(resultStage)
+                    cleanupStateForJobAndIndependentStages(job)
+                    try {
+                      logInfo(s"Job ${job.jobId} is finished. Cancelling potential speculative " +
+                        "or zombie tasks for this job")
+                      taskScheduler.killAllTaskAttempts(
+                        stageId,
+                        shouldInterruptTaskThread(job),
+                        reason = "Stage finished")
+                    } catch {
+                      case e: UnsupportedOperationException =>
+                        logWarning(s"Could not cancel tasks for stage $stageId", e)
+                    }
+                    listenerBus.post(
+                      SparkListenerJobEnd(job.jobId, clock.getTimeMillis(), JobSucceeded))
+                  }.
+                  try {
+                    job.listener.taskSucceeded(rt.outputId, event.result)
+                  } catch {
+                    case e: Throwable if !Utils.isFatalError(e) =>
+                      // TODO: Perhaps we want to mark the resultStage as failed?
+                      job.listener.jobFailed(new SparkDriverExecutionException(e))
+                  }
+                }
+              case None =>
+                logInfo("Ignoring result from " + rt + " because its job has finished")
+            }
+          case smt: ShuffleMapTask =>
+            val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
+            shuffleStage.pendingPartitions -= task.partitionId
+            val status = event.result.asInstanceOf[MapStatus]
+            val execId = status.location.executorId
+            logDebug("ShuffleMapTask finished on " + execId)
+            if (failedEpoch.contains(execId) && smt.epoch <= failedEpoch(execId)) {
+              logInfo(s"Ignoring possibly bogus $smt completion from executor $execId")
+            } else {
+              mapOutputTracker.registerMapOutput(
+                shuffleStage.shuffleDep.shuffleId, smt.partitionId, status)
+            }
+            if (runningStages.contains(shuffleStage) && shuffleStage.pendingPartitions.isEmpty) {
+              markStageAsFinished(shuffleStage)
+              logInfo("looking for newly runnable stages")
+              logInfo("running: " + runningStages)
+              logInfo("waiting: " + waitingStages)
+              logInfo("failed: " + failedStages)
+              mapOutputTracker.incrementEpoch()
+              clearCacheLocs()
+              if (!shuffleStage.isAvailable) {
+                logInfo("Resubmitting " + shuffleStage + " (" + shuffleStage.name +
+                  ") because some of its tasks had failed: " +
+                  shuffleStage.findMissingPartitions().mkString(", "))
+                submitStage(shuffleStage)
+              } else {
+                markMapStageJobsAsFinished(shuffleStage)
+                submitWaitingChildStages(shuffleStage)
+              }
+            }
+        }
+      /*处理获取数据块失败的情况*/
+      case FetchFailed(bmAddress, shuffleId, _, mapIndex, _, failureMessage) =>
+        val failedStage = stageIdToStage(task.stageId)
+        val mapStage = shuffleIdToMapStage(shuffleId)
+        if (failedStage.latestInfo.attemptNumber != task.stageAttemptId) {
+          logInfo(s"Ignoring fetch failure from $task as it's from $failedStage attempt" +
+            s" ${task.stageAttemptId} and there is a more recent attempt for that stage " +
+            s"(attempt ${failedStage.latestInfo.attemptNumber}) running")
+        } else {
+          failedStage.failedAttemptIds.add(task.stageAttemptId)
+          val shouldAbortStage =
+            failedStage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
+            disallowStageRetryForTest
+		 // 如果运行stage中包含了失败stage,则直接将失败stage标记为完成
+          if (runningStages.contains(failedStage)) {
+            logInfo(s"Marking $failedStage (${failedStage.name}) as failed " +
+              s"due to a fetch failure from $mapStage (${mapStage.name})")
+            markStageAsFinished(failedStage, errorMessage = Some(failureMessage),
+              willRetry = !shouldAbortStage)
+          } else {
+            logDebug(s"Received fetch failure from $task, but it's from $failedStage which is no " +
+              "longer running")
+          }
+		// 解除当前shuffle的输出定位器注册
+          if (mapStage.rdd.isBarrier()) {
+            mapOutputTracker.unregisterAllMapOutput(shuffleId)
+          } else if (mapIndex != -1) { 
+            mapOutputTracker.unregisterMapOutput(shuffleId, mapIndex, bmAddress)
+          }
+          if (failedStage.rdd.isBarrier()) {
+            failedStage match {
+              case failedMapStage: ShuffleMapStage =>
+                mapOutputTracker.unregisterAllMapOutput(failedMapStage.shuffleDep.shuffleId)
+              case failedResultStage: ResultStage =>
+                val reason = "Could not recover from a failed barrier ResultStage. Most recent " +
+                  s"failure reason: $failureMessage"
+                abortStage(failedResultStage, reason, None)
+            }
+          }
+          if (shouldAbortStage) {
+            val abortMessage = if (disallowStageRetryForTest) {
+              "Fetch failure will not retry stage due to testing config"
+            } else {
+              s"""$failedStage (${failedStage.name})
+                 |has failed the maximum allowable number of
+                 |times: $maxConsecutiveStageAttempts.
+                 |Most recent failure reason: $failureMessage""".stripMargin.replaceAll("\n", " ")
+            }
+            abortStage(failedStage, abortMessage, None)
+          } else { // update failedStages and make sure a ResubmitFailedStages event is enqueued
+            // TODO: Cancel running tasks in the failed stage -- cf. SPARK-17064
+            val noResubmitEnqueued = !failedStages.contains(failedStage)
+            failedStages += failedStage
+            failedStages += mapStage
+            if (noResubmitEnqueued) {
+              if (mapStage.isIndeterminate) {
+                val stagesToRollback = HashSet[Stage](mapStage)
+                def collectStagesToRollback(stageChain: List[Stage]): Unit = {
+                  if (stagesToRollback.contains(stageChain.head)) {
+                    stageChain.drop(1).foreach(s => stagesToRollback += s)
+                  } else {
+                    stageChain.head.parents.foreach { s =>
+                      collectStagesToRollback(s :: stageChain)
+                    }
+                  }
+                }
+                def generateErrorMessage(stage: Stage): String = {
+                  "A shuffle map stage with indeterminate output was failed and retried. " +
+                    s"However, Spark cannot rollback the $stage to re-process the input data, " +
+                    "and has to fail this job. Please eliminate the indeterminacy by " +
+                    "checkpointing the RDD before repartition and try again."
+                }
+                activeJobs.foreach(job => collectStagesToRollback(job.finalStage :: Nil))
+                // 设置滚动stage,在检查之后运行
+                val rollingBackStages = HashSet[Stage](mapStage)
+                stagesToRollback.foreach {
+                  case mapStage: ShuffleMapStage =>
+                    val numMissingPartitions = mapStage.findMissingPartitions().length
+                    if (numMissingPartitions < mapStage.numTasks) {
+                      if (sc.getConf.get(config.SHUFFLE_USE_OLD_FETCH_PROTOCOL)) {
+                        val reason = "A shuffle map stage with indeterminate output was failed " +
+                          "and retried. However, Spark can only do this while using the new " +
+                          "shuffle block fetching protocol. Please check the config " +
+                          "'spark.shuffle.useOldFetchProtocol', see more detail in " +
+                          "SPARK-27665 and SPARK-25341."
+                        abortStage(mapStage, reason, None)
+                      } else {
+                        rollingBackStages += mapStage
+                      }
+                    }
+                  case resultStage: ResultStage if resultStage.activeJob.isDefined =>
+                    val numMissingPartitions = resultStage.findMissingPartitions().length
+                    if (numMissingPartitions < resultStage.numTasks) {
+                      // TODO: support to rollback result tasks.
+                      abortStage(resultStage, generateErrorMessage(resultStage), None)
+                    }
+
+                  case _ =>
+                }
+                logInfo(s"The shuffle map stage $mapStage with indeterminate output was failed, " +
+                  s"we will roll back and rerun below stages which include itself and all its " +
+                  s"indeterminate child stages: $rollingBackStages")
+              }
+              logInfo(
+                s"Resubmitting $mapStage (${mapStage.name}) and " +
+                  s"$failedStage (${failedStage.name}) due to fetch failure"
+              )
+              messageScheduler.schedule(
+                new Runnable {
+                  override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
+                },
+                DAGScheduler.RESUBMIT_TIMEOUT,
+                TimeUnit.MILLISECONDS
+              )
+            }
+          }
+          // 当有许多失败在执行器的时候,标记执行器的失败,并将执行器移除
+          if (bmAddress != null) {
+            val hostToUnregisterOutputs = if (env.blockManager.externalShuffleServiceEnabled &&
+              unRegisterOutputOnHostOnFetchFailure) {
+              Some(bmAddress.host)
+            } else {
+              None
+            }
+            // 由于执行器上有许多的失败,故将其执行器移除,并将相应的输出移除
+            removeExecutorAndUnregisterOutputs(
+              execId = bmAddress.executorId,
+              fileLost = true,
+              hostToUnregisterOutputs = hostToUnregisterOutputs,
+              maybeEpoch = Some(task.epoch))
+          }
+        }
+      case failure: TaskFailedReason if task.isBarrier =>
+        // Also handle the task failed reasons here.
+        failure match {
+          case Resubmitted =>
+            handleResubmittedFailure(task, stage)
+          case _ => // Do nothing.
+        }
+        /* 当屏蔽任务失败的时候,总是将当前stage设置为失败,并重新尝试这个stage*/
+        val failedStage = stageIdToStage(task.stageId)
+        if (failedStage.latestInfo.attemptNumber != task.stageAttemptId) {
+          logInfo(s"Ignoring task failure from $task as it's from $failedStage attempt" +
+            s" ${task.stageAttemptId} and there is a more recent attempt for that stage " +
+            s"(attempt ${failedStage.latestInfo.attemptNumber}) running")
+        } else {
+          logInfo(s"Marking $failedStage (${failedStage.name}) as failed due to a barrier task " +
+            "failed.")
+          val message = s"Stage failed because barrier task $task finished unsuccessfully.\n" +
+            failure.toErrorString
+          try {
+            // killAllTaskAttempts will fail if a SchedulerBackend does not implement killTask.
+            val reason = s"Task $task from barrier stage $failedStage (${failedStage.name}) " +
+              "failed."
+            taskScheduler.killAllTaskAttempts(stageId, interruptThread = false, reason)
+          } catch {
+            case e: UnsupportedOperationException =>
+              logWarning(s"Could not kill all tasks for stage $stageId", e)
+              abortStage(failedStage, "Could not kill zombie barrier tasks for stage " +
+                s"$failedStage (${failedStage.name})", Some(e))
+          }
+          markStageAsFinished(failedStage, Some(message))
+          failedStage.failedAttemptIds.add(task.stageAttemptId)
+          /*处理stage的放弃情景*/
+          val shouldAbortStage =
+            failedStage.failedAttemptIds.size >= maxConsecutiveStageAttempts ||
+              disallowStageRetryForTest
+          if (shouldAbortStage) {
+            // 放弃当前stage,并显示出放弃的信息
+            val abortMessage = if (disallowStageRetryForTest) {
+              "Barrier stage will not retry stage due to testing config. Most recent failure " +
+                s"reason: $message"
+            } else {
+              s"""$failedStage (${failedStage.name})
+                 |has failed the maximum allowable number of
+                 |times: $maxConsecutiveStageAttempts.
+                 |Most recent failure reason: $message
+               """.stripMargin.replaceAll("\n", " ")
+            }
+            abortStage(failedStage, abortMessage, None)
+          } else {
+            failedStage match {
+              case failedMapStage: ShuffleMapStage =>
+                // 标记shuffle map stage中的所有的map为破损的.保证重试重新提交的stage
+                mapOutputTracker.unregisterAllMapOutput(failedMapStage.shuffleDep.shuffleId)
+              case failedResultStage: ResultStage =>
+                // 放弃失败的stage，因为已经提交一些分区的执行。
+                val reason = "Could not recover from a failed barrier ResultStage. Most recent " +
+                  s"failure reason: $message"
+                abortStage(failedResultStage, reason, None)
+            }
+            // 这种情况下,任务失败会触发单个stage的请求,保证之后重新提交失败stage一次
+            val noResubmitEnqueued = !failedStages.contains(failedStage)
+            failedStages += failedStage
+            if (noResubmitEnqueued) {
+              logInfo(s"Resubmitting $failedStage (${failedStage.name}) due to barrier stage " +
+                "failure.")
+              messageScheduler.schedule(new Runnable {
+                override def run(): Unit = eventProcessLoop.post(ResubmitFailedStages)
+              }, DAGScheduler.RESUBMIT_TIMEOUT, TimeUnit.MILLISECONDS)
+            }
+          }
+        }
+      case Resubmitted =>
+        handleResubmittedFailure(task, stage) // 处理任务的重新提交
+      case _: TaskCommitDenied =>// nop,需要任务调度器决定如果处理权限质疑的问题
+      case _: ExceptionFailure | _: TaskKilled => // nop,在累加器更新的时候已经处理了
+      case TaskResultLost => // 任务结果丢失,什么都不做,任务调度器会处理失败,并重新提交
+      case _: ExecutorLostFailure | UnknownReason => //执行器丢失或者未知原因,任务调度器会放弃这个job
+    }
     
 }
 ```
 
+```scala
+private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler)
+extends EventLoop[DAGSchedulerEvent]("dag-scheduler-event-loop") with Logging {
+    介绍: DAG调度器事件环
+    属性:
+    #name @timer = dagScheduler.metricsSource.messageProcessingTimer	计时器
+    操作集:
+    def onReceive(event: DAGSchedulerEvent): Unit
+    功能: 调度器接受消息函数
+    val timerContext = timer.time()
+    try {
+      doOnReceive(event)
+    } finally {
+      timerContext.stop()
+    }
+    
+    def doOnReceive(event: DAGSchedulerEvent): Unit
+    功能: 处理消息的接受
+    event match {
+    case JobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties) =>
+      dagScheduler.handleJobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties)
+    case MapStageSubmitted(jobId, dependency, callSite, listener, properties) =>
+      dagScheduler.handleMapStageSubmitted(jobId, dependency, callSite, listener, properties)
+    case StageCancelled(stageId, reason) =>
+      dagScheduler.handleStageCancellation(stageId, reason)
+    case JobCancelled(jobId, reason) =>
+      dagScheduler.handleJobCancellation(jobId, reason)
+    case JobGroupCancelled(groupId) =>
+      dagScheduler.handleJobGroupCancelled(groupId)
+    case AllJobsCancelled =>
+      dagScheduler.doCancelAllJobs()
+    case ExecutorAdded(execId, host) =>
+      dagScheduler.handleExecutorAdded(execId, host)
+    case ExecutorLost(execId, reason) =>
+      val workerLost = reason match {
+        case SlaveLost(_, true) => true
+        case _ => false
+      }
+      dagScheduler.handleExecutorLost(execId, workerLost)
+    case WorkerRemoved(workerId, host, message) =>
+      dagScheduler.handleWorkerRemoved(workerId, host, message)
+    case BeginEvent(task, taskInfo) =>
+      dagScheduler.handleBeginEvent(task, taskInfo)
+    case SpeculativeTaskSubmitted(task) =>
+      dagScheduler.handleSpeculativeTaskSubmitted(task)
+    case GettingResultEvent(taskInfo) =>
+      dagScheduler.handleGetTaskResult(taskInfo)
+    case completion: CompletionEvent =>
+      dagScheduler.handleTaskCompletion(completion)
+    case TaskSetFailed(taskSet, reason, exception) =>
+      dagScheduler.handleTaskSetFailed(taskSet, reason, exception)
+    case ResubmitFailedStages =>
+      dagScheduler.resubmitFailedStages()
+  }
+    
+    def onError(e: Throwable): Unit 
+    功能: 失败处理
+    logError("DAGSchedulerEventProcessLoop failed; shutting down SparkContext", e)
+    try {
+      dagScheduler.doCancelAllJobs()
+    } catch {
+      case t: Throwable => logError("DAGScheduler failed to cancel all jobs.", t)
+    }
+    dagScheduler.sc.stopInNewThread()
+    
+    def onStop(): Unit
+    功能: 消息环停止处理
+    dagScheduler.cleanUpAfterSchedulerStop()
+}
+```
 
+```scala
+private[spark] object DAGScheduler {
+    #name @RESUBMIT_TIMEOUT = 200	重新提交的超时时间
+    #name @DEFAULT_MAX_CONSECUTIVE_STAGE_ATTEMPTS = 4	默认的最大连续stage请求
+}
+```
 
 #### DAGSchedulerEvent
 
