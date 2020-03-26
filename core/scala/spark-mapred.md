@@ -9,7 +9,7 @@
 
 #### SparkHadoopMapRedUtil
 
-```markdown
+```scala
 object SparkHadoopMapRedUtil{
 	关系: father -> Logging
 	操作集:

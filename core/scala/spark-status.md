@@ -689,7 +689,7 @@
    	每个资源需要返回public的端点，定义在api.scala中。二进制比较(文件一致性校验)检查能够确保不会无意间的变化会使得打断api工作。返回的对象会由jackson使用@JacksonMessageWriter 自动转化为json。除此之外，存在有在@HistoryServerSuite大量测试，比较json和""golden files".任何的改变和添加都会反馈到那儿，请参照@HistoryServerSuite
    ```
 
-   ```markdown
+   ```scala
    @Path("/v1")
    private[v1] class ApiRootResource extends ApiRequestContext {
    	操作集:
@@ -708,7 +708,7 @@
    }
    ```
 
-   ```markdown
+   ```scala
    private[spark] object ApiRootResource {
    	操作集:
    	def getServletHandler(uiRoot: UIRoot): ServletContextHandler 
@@ -726,7 +726,7 @@
    }
    ```
 
-   ```markdown
+   ```scala
    private[spark] trait UIRoot {
    	介绍: 这个特征被所有根目录容器所共享,共享内容为应用UI信息(历史信息服务器@HistoryServer和应用UI)。提供通用接口，且使用json的形式暴露给外面。
    	操作集:
@@ -1439,7 +1439,7 @@ private[spark] trait AppHistoryServerPlugin {
 	功能: 设置这个插件的UI和历史信息的UI
 	
 	def displayOrder: Int = Integer.MAX_VALUE
-	功能: 插件标签位置与其他插件标签位置的差距
+	功能: 插件标签位置与其他插件标签位置的差距	
 }
 ```
 
@@ -2462,7 +2462,7 @@ private [spark] class JobDuration(val value: AtomicLong) extends Gauge[Long] {
 }
 ```
 
-```markdown
+```scala
 private[spark] class AppStatusSource extends Source {
 	功能: APP状态资源
 	属性:

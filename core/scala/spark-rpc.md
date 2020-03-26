@@ -33,7 +33,7 @@
 
 ####  Dispatcher
 
-```markdown
+```scala
 private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int){
 	介绍: 消息分配器，用于定为RPC消息到合适的RPC端点
 	关系: father --> Logging
@@ -192,7 +192,7 @@ private[netty] class Dispatcher(nettyEnv: NettyRpcEnv, numUsableCores: Int){
 
 收件箱
 
-```markdown
+```scala
 private[netty] sealed trait InboxMessage 
 介绍: 收件箱消息
 
@@ -227,7 +227,7 @@ private[netty] case class RemoteProcessConnectionError(cause: Throwable, remoteA
 功能: 远端连接错误
 ```
 
-```markdown
+```scala
 private[netty] class Inbox(val endpointName: String, val endpoint: RpcEndpoint){
 	关系: father --> Logging
 	构造器属性：
@@ -358,7 +358,7 @@ private[netty] class Inbox(val endpointName: String, val endpoint: RpcEndpoint){
 
 消息环
 
-```markdown
+```scala
 private sealed abstract class MessageLoop(dispatcher: Dispatcher) {
 	关系: father --> Logging
 	介绍: 分配器@Dispatcher所使用的消息环，用于发送数据到RPC端点
@@ -413,7 +413,7 @@ private sealed abstract class MessageLoop(dispatcher: Dispatcher) {
 }
 ```
 
-```markdown
+```scala
 private object MessageLoop {
 	属性:
 	#name @PoisonPill = new Inbox(null, null) 
@@ -421,7 +421,7 @@ private object MessageLoop {
 }
 ```
 
-```markdown
+```scala
 private class SharedMessageLoop(conf: SparkConf,dispatcher: Dispatcher,numUsableCores: Int){
 	关系: father --> MessageLoop(dispatcher)
 	介绍: 服务于多个RPC端点的消息环，使用共享线程池
@@ -481,7 +481,7 @@ private class SharedMessageLoop(conf: SparkConf,dispatcher: Dispatcher,numUsable
 }
 ```
 
-```markdown
+```scala
 private class DedicatedMessageLoop(name: String,endpoint: IsolatedRpcEndpoint,dispatcher: Dispatcher){
 	介绍: 专用消息环，用于处理单个RPC端点问题
 	关系: father --> MessageLoop(dispatcher)
@@ -529,7 +529,7 @@ private class DedicatedMessageLoop(name: String,endpoint: IsolatedRpcEndpoint,di
 
 #### NettyRpcCallContext
 
-```markdown
+```scala
 private[netty] abstract class NettyRpcCallContext(override val senderAddress: RpcAddress){
 	关系: father --> RpcCallContext
 		sibling --> Logging
@@ -545,7 +545,7 @@ private[netty] abstract class NettyRpcCallContext(override val senderAddress: Rp
 }
 ```
 
-```markdown
+```scala
 private[netty] class LocalNettyRpcCallContext(senderAddress: RpcAddress,p: Promise[Any]){
 	关系: father --> NettyRpcCallContext(senderAddress)
 	构造器参数:
@@ -558,7 +558,7 @@ private[netty] class LocalNettyRpcCallContext(senderAddress: RpcAddress,p: Promi
 }
 ```
 
-```markdown
+```scala
 private[netty] class RemoteNettyRpcCallContext(nettyEnv: NettyRpcEnv,callback: RpcResponseCallback,
     senderAddress: RpcAddress){
 	关系: father --> NettyRpcCallContext(senderAddress)
@@ -578,7 +578,7 @@ private[netty] class RemoteNettyRpcCallContext(nettyEnv: NettyRpcEnv,callback: R
 
 #### NettyRpcEnv
 
-```markdown
+```scala
 private[netty] class NettyRpcEnv(val conf: SparkConf,javaSerializerInstance: JavaSerializerInstance,
     host: String,securityManager: SecurityManager,numUsableCores: Int){
 	关系: father --> RpcEnv(conf)
@@ -935,7 +935,7 @@ private[netty] class NettyRpcEnv(val conf: SparkConf,javaSerializerInstance: Jav
 ```
 #subclass @NettyRpcEnv.FileDownloadChannel
 
-```markdown
+```scala
 private class FileDownloadChannel(source: Pipe.SourceChannel){
 	关系: father --> ReadableByteChannel
 	介绍: 文件下载通道 
@@ -965,7 +965,7 @@ private class FileDownloadChannel(source: Pipe.SourceChannel){
 
 #subclass @NettyRpcEnv.FileDownloadCallback
 
-```markdown
+```scala
 private class FileDownloadCallback(sink: WritableByteChannel,source: FileDownloadChannel,
       client: TransportClient){
 	介绍: 文件下载回调信息处理
@@ -990,7 +990,7 @@ private class FileDownloadCallback(sink: WritableByteChannel,source: FileDownloa
 }
 ```
 
-```markdown
+```scala
 private[netty] object NettyRpcEnv{
 	关系: father --> Logging
 	属性:
@@ -1006,7 +1006,7 @@ private[netty] object NettyRpcEnv{
 		与当前环境变量@currentEnv相似,这个可变的参考客户端实例，与RPC相关，在这种情况下，需要在反序列化过	程中找到远端地址
 }
 ```
-```markdown
+```scala
 private[netty] class NettyRpcEndpointRef(@transient private val conf: SparkConf,
     private val endpointAddress: RpcEndpointAddress,
     @transient @volatile private var nettyEnv: NettyRpcEnv){
@@ -1067,7 +1067,7 @@ private[netty] class NettyRpcEndpointRef(@transient private val conf: SparkConf,
 }
 ```
 
-```markdown
+```scala
 private[rpc] class NettyRpcEnvFactory{
 	关系: father --> RpcEnvFactory
 		sibling --> Logging
@@ -1101,7 +1101,7 @@ private[rpc] class NettyRpcEnvFactory{
     }
 }
 ```
-```markdown
+```scala
 private[netty] object RequestMessage{
 	操作集:
 	def readRpcAddress(in: DataInputStream): RpcAddress
@@ -1136,7 +1136,7 @@ private[netty] object RequestMessage{
         nettyEnv.deserialize(client, bytes))
 }
 ```
-```markdown
+```scala
 private[netty] class RequestMessage(val senderAddress: RpcAddress,val receiver: NettyRpcEndpointRef,
     val content: Any){
 	介绍: 请求消息
@@ -1186,7 +1186,7 @@ private[netty] case class RpcFailure(e: Throwable)
 功能: 接受侧异常的回应表示
 ```
 
-```markdown
+```scala
 private[netty] class NettyRpcHandler(dispatcher: Dispatcher,nettyEnv: NettyRpcEnv,
     streamManager: StreamManager){
 	关系: father --> RPCHandler
@@ -1270,7 +1270,7 @@ private[netty] class NettyRpcHandler(dispatcher: Dispatcher,nettyEnv: NettyRpcEn
 #### NettyStreamManager
 
 
-```markdown
+```scala
 private[netty] class NettyStreamManager(rpcEnv: NettyRpcEnv){
 	关系: father --> StreamManager
 		sibling --> RpcEnvFileServer
@@ -1325,7 +1325,7 @@ private[netty] class NettyStreamManager(rpcEnv: NettyRpcEnv){
 
 发件箱
 
-```markdown
+```scala
 private[netty] sealed trait OutboxMessage {
 	介绍: 发件箱消息
 	操作集:
@@ -1395,7 +1395,7 @@ private[netty] case class RpcOutboxMessage(content: ByteBuffer,
 }
 ```
 
-```markdown
+```scala
 private[netty] class Outbox(nettyEnv: NettyRpcEnv, val address: RpcAddress) {
 	介绍: RPC收件箱
 	构造器参数:
@@ -1559,7 +1559,7 @@ private[netty] class Outbox(nettyEnv: NettyRpcEnv, val address: RpcAddress) {
 
 #### RpcEndpointVerifier
 
-```markdown
+```scala
 private[netty] class RpcEndpointVerifier(override val rpcEnv: RpcEnv, dispatcher: Dispatcher){
 	关系： father --> RpcEndpoint
 	介绍: RPC 断点验证器
@@ -1575,7 +1575,7 @@ private[netty] class RpcEndpointVerifier(override val rpcEnv: RpcEnv, dispatcher
 }
 ```
 
-```markdown
+```scala
 private[netty] object RpcEndpointVerifier {
 	属性:
 	#name @NAME="endpoint-verifier"名称
@@ -1592,7 +1592,7 @@ private[netty] object RpcEndpointVerifier {
 	RPC环境的地址属性(主机名,端口)
 ```
 
-```markdown
+```scala
 private[spark] case class RpcAddress(host: String, port: Int) {
 	操作集:
 	def hostPort: String = host + ":" + port
@@ -1606,7 +1606,7 @@ private[spark] case class RpcAddress(host: String, port: Int) {
 }
 ```
 
-```markdown
+```scala
 private[spark] object RpcAddress {
 	操作集:
 	def fromURIString(uri: String): RpcAddress
@@ -1623,7 +1623,7 @@ private[spark] object RpcAddress {
 
 #### RpcCallContext
 
-```markdown
+```scala
 private[spark] trait RpcCallContext {
 	介绍: 这是@RpcEndpoint使用的回调，用户发送消息或者失败信息，这是线程安全的且可以在任		意线程调用。
 	
@@ -1642,7 +1642,7 @@ private[spark] trait RpcCallContext {
 
 #### RpcEndpoint
 
-```markdown
+```scala
 private[spark] trait RpcEnvFactory {
 	介绍: 创建@RpcEnv的工厂类,必须要有无参构造器以便反射
 	操作集:
@@ -1651,7 +1651,7 @@ private[spark] trait RpcEnvFactory {
 }
 ```
 
-```markdown
+```scala
 private[spark] trait RpcEndpoint{	
 	介绍:
         RPC端点,定义了什么函数会触发给定消息.这里确保@onStart,@receive,@onStop会被调用
@@ -1705,14 +1705,14 @@ private[spark] trait RpcEndpoint{
 }
 ```
 
-```markdown
+```scala
 private[spark] trait ThreadSafeRpcEndpoint extends RpcEndpoint
 介绍: 线程安全的RPC端点
 	线程安全意味着处理一条消息之后才会接受下一条消息.换句话说,改变@ThreadSafeRpcEndpoint的外部属性,使得当其处理下一条消息时能够看到这个属性,且在@ThreadSafeRpcEndpoint 不应当是不稳定的或是相等的.
 	然而并不保证同一个线程对于不同消息会执行同一个RPC端点@ThreadSafeRpcEndpoint.
 ```
 
-```markdown
+```scala
 private[spark] trait IsolatedRpcEndpoint extends RpcEndpoint {
 	介绍: 端点使用专用线程池发送消息
 	操作集:
@@ -1726,7 +1726,7 @@ private[spark] trait IsolatedRpcEndpoint extends RpcEndpoint {
 
 #### RpcEndpointAddress
 
-```markdown
+```scala
 private[spark] case class RpcEndpointAddress(rpcAddress: RpcAddress, name: String) {
 	属性: 
 	#name @toString #type @String	显示信息
@@ -1743,7 +1743,7 @@ private[spark] case class RpcEndpointAddress(rpcAddress: RpcAddress, name: Strin
 }
 ```
 
-```markdown
+```scala
 private[spark] object RpcEndpointAddress {
 	操作集:
     def apply(host: String, port: Int, name: String): RpcEndpointAddress
@@ -1773,7 +1773,7 @@ private[spark] object RpcEndpointAddress {
 
 #### RpcEndpointNotFoundException
 
-```markdown
+```scala
 private[rpc] class RpcEndpointNotFoundException(uri: String){
 	关系: father --> SparkException
 	介绍: 当找不到指定uri对应的RPC端点时抛出的异常
@@ -1782,7 +1782,7 @@ private[rpc] class RpcEndpointNotFoundException(uri: String){
 
 #### RpcEndpointRef
 
-```markdown
+```scala
 private[spark] abstract class RpcEndpointRef(conf: SparkConf){
 	关系: father --> Serializable
 		sibling --> Logging
@@ -1826,14 +1826,14 @@ private[spark] abstract class RpcEndpointRef(conf: SparkConf){
 }
 ```
 
-```markdown
+```scala
 class RpcAbortException(message: String){
 	关系: father --> Exception(message)
 	介绍: 如果RPC被废弃则抛出此异常
 }
 ```
 
-```markdown
+```scala
 private[spark] class AbortableRpcFuture[T: ClassTag] (future: Future[T],onAbort: String => Unit){
 	介绍: 添加@abort 方法的任务@Future,适用于长期允许的RPC,提供抛弃RPC的方法
 	构造器参数:
@@ -1853,7 +1853,7 @@ private[spark] class AbortableRpcFuture[T: ClassTag] (future: Future[T],onAbort:
 #### RpcEnv
 
 
-```markdown
+```scala
 private[spark] object RpcEnv {
 	介绍: RpcEnv的实现必须要含有一个带有无参构造器@RpcEnvFactory,以便于其可以通过反射创建.
 	操作集:
@@ -1874,7 +1874,7 @@ private[spark] object RpcEnv {
 }
 ```
 
-```markdown
+```scala
 private[spark] abstract class RpcEnv(conf: SparkConf) {
 	介绍: RPC环境,RPC端点@RpcEndpoint 需要注册自己的名字给RPC环境@RpcEnv,以便于接受信息.@RpcEnv 会加工来自于参考端点@RpcEndpointRef或者远程节点的消息.且发送消息通过相应的RPC端点@RpcEndpoint.对于维捕捉到的异常,@RpcEnv会使用RPC回调@RpcCallContext.sendFailure 去设置异常,并将异常信息发送回给发送器@sender.当然@RPCEnv也提供检索@RpcEndpointRef 名称的方法.
 	
@@ -1922,7 +1922,7 @@ private[spark] abstract class RpcEnv(conf: SparkConf) {
 	功能: 从指定@uri中,打开通道下载文件.如果文件服务器中的uri地址使用spark.的schema,该方法会调用工具类@Utils		去检索文件.
 }
 ```
-```markdown
+```scala
 private[spark] trait RpcEnvFileServer {
 	介绍: RPCEnv文件服务器(用于给该应用的其他进程提供文件服务)
 	文件服务器返回URI信息,可以是普通信息(http,hdfs)或者由@RpcEnv#fetchFile 处理的spark URI信息
@@ -1945,7 +1945,7 @@ private[spark] trait RpcEnvFileServer {
 	val= = "/" + baseUri.stripPrefix("/").stripSuffix("/")
 }
 ```
-```markdown
+```scala
 private[spark] case class RpcEnvConfig(
     conf: SparkConf,
     name: String,
@@ -1959,7 +1959,7 @@ private[spark] case class RpcEnvConfig(
 ```
 #### RpcEnvStoppedException
 
-```markdown
+```scala
 private[rpc] class RpcEnvStoppedException(){
 	关系: father --> IllegalStateException
 	介绍: rpc环境停止异常
@@ -1968,7 +1968,7 @@ private[rpc] class RpcEnvStoppedException(){
 
 #### RpcTimeout
 
-```markdown
+```scala
 private[rpc] class RpcTimeoutException(message: String, cause: TimeoutException){
 	关系: father --> TimeoutException(message)
 	初始化操作:
@@ -1977,14 +1977,14 @@ private[rpc] class RpcTimeoutException(message: String, cause: TimeoutException)
 }
 ```
 
-```markdown
+```scala
 private[spark] class RpcTimeout(val duration: FiniteDuration, val timeoutProp: String){
 	关系: father --> Serializable
 	构造器属性:
 		duration	限制周期
 		timeoutProp	超时属性
 	操作集:
-	createRpcTimeoutException(te: TimeoutException): RpcTimeoutException
+	def createRpcTimeoutException(te: TimeoutException): RpcTimeoutException
 	功能: 创建rpc超时异常
 	val=new RpcTimeoutException(te.getMessage + ". This timeout is controlled by " + timeoutProp, te)
 	
@@ -2006,7 +2006,7 @@ private[spark] class RpcTimeout(val duration: FiniteDuration, val timeoutProp: S
 }
 ```
 
-```markdown
+```scala
 private[spark] object RpcTimeout {
 	操作集:
 	 def apply(conf: SparkConf, timeoutProp: String): RpcTimeout
