@@ -19,7 +19,7 @@
 		因此只要将其使用在单个spark应用程序中,用于内部的压缩使用.
 ```
 
-```markdown
+```scala
 @DeveloperApi
 trait CompressionCodec{
 	def compressedOutputStream(s: OutputStream): OutputStream
@@ -36,7 +36,7 @@ trait CompressionCodec{
 }
 ```
 
-```markdown
+```scala
 private[spark] object CompressionCodec {
 	属性:
 		#name @configKey=IO_COMPRESSION_CODEC.key	属性key值
@@ -73,7 +73,7 @@ private[spark] object CompressionCodec {
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class LZ4CompressionCodec(conf: SparkConf) {
 	关系: father-> CompressionCodec
@@ -108,7 +108,7 @@ class LZ4CompressionCodec(conf: SparkConf) {
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class LZFCompressionCodec(conf: SparkConf){
 	关系: father --> CompressionCodec
@@ -125,7 +125,7 @@ class LZFCompressionCodec(conf: SparkConf){
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class SnappyCompressionCodec(conf: SparkConf){
 	关系: father--> CompressionCodec
@@ -147,7 +147,7 @@ class SnappyCompressionCodec(conf: SparkConf){
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class ZStdCompressionCodec(conf: SparkConf){
 	关系: father --> CompressionCodec
