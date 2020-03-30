@@ -23,7 +23,7 @@
 	详细请参照配置文档和集群特性文档。
 ```
 
-```markdown
+```scala
 private[spark] class ExecutorResourceRequest(val resourceName: String,val amount: Long,
     val discoveryScript: String = "",val vendor: String = ""){
 	关系: father --> Serializable
@@ -43,7 +43,7 @@ private[spark] class ExecutorResourceRequest(val resourceName: String,val amount
 
 #### ExecutorResourceRequests
 
-```markdown
+```scala
 private[spark] class ExecutorResourceRequests(){
 	关系: father --> Serializable
 	介绍: 一组执行器资源请求,用于连接@ResourceProfile对RDD进行资源指定，会反映到stage层级上。
@@ -110,7 +110,7 @@ private[spark] class ExecutorResourceRequests(){
 	这个特征用于帮助执行器/工作者(worker)分配资源，注意需要使用在单线程中
 ```
 
-```markdown
+```scala
 trait ResourceAllocator {
 	属性:
 	#name @addressAvailabilityMap (lazy)  
@@ -167,7 +167,7 @@ trait ResourceAllocator {
 	用于容纳与资源相关的信息，资源可以是GPU,FGPA等等。地址数组是指定的资源，取决于用户中断地址。
 	例如GPU,那么地址就是GPU的目录。(用于索引资源的下标参数)
 ```
-```markdown
+```scala
 @Evolving
 class ResourceInformation(val name: String,val addresses: Array[String]){
 	关系: father --> Serializable
@@ -190,7 +190,7 @@ class ResourceInformation(val name: String,val addresses: Array[String]){
 		功能: 计算当前对象所对应的hash值
 }
 ```
-```markdown
+```scala
 private case class ResourceInformationJson(name: String, addresses: Seq[String]){
 	介绍: 简单的对@ResourceInformation进行json序列化
 	构造器属性:
@@ -205,7 +205,7 @@ private case class ResourceInformationJson(name: String, addresses: Seq[String])
 	功能: 根据name和addresses转化为@ResourceInformation
 }
 ```
-```markdown
+```scala
 private[spark] object ResourceInformation{
 	属性:
 	#name @exampleJson	示例json对象
@@ -227,7 +227,7 @@ private[spark] object ResourceInformation{
 	这个类在初始开发的状态下时私有的，一旦起到作用，即表现为公有的。
 ```
 
-```markdown
+```scala
 @Evolving
 private[spark] class ResourceProfile(){
 	关系: father --> Serializable
@@ -275,7 +275,7 @@ private[spark] class ResourceProfile(){
 }
 ```
 
-```markdown
+```scala
 private[spark] object ResourceProfile{
 	关系: father --> Logging
 	属性:
@@ -345,7 +345,7 @@ private[spark] object ResourceProfile{
 
 #### ResourceUtils
 
-```markdown
+```scala
 private[spark] case class ResourceID(componentName: String, resourceName: String){
 	介绍: 这个类是用于标识资源的，保证资源id不会重复
 	构造器参数:
@@ -366,7 +366,7 @@ private[spark] case class ResourceID(componentName: String, resourceName: String
 }
 ```
 
-```markdown
+```scala
 private[spark] case class ResourceRequest(id: ResourceID,amount: Int,discoveryScript: Option[String],
     vendor: Option[String]){
 	介绍: 代表执行器层次的资源请求，这个类用于资源发现(使用查找脚本@discoveryScript)或者是通过转化配置信息得到的上下文对象@context
@@ -378,7 +378,7 @@ private[spark] case class ResourceRequest(id: ResourceID,amount: Int,discoverySc
 }
 ```
 
-```markdown
+```scala
 private[spark] case class ResourceRequirement(resourceName: String,amount: Int,numParts: Int = 1){
 	介绍: 表示一个组件的资源需求(这里的组件时执行器，驱动器，任务)
 	例如: 
@@ -394,7 +394,7 @@ private[spark] case class ResourceRequirement(resourceName: String,amount: Int,n
 }
 ```
 
-```markdown
+```scala
 private[spark] case class ResourceAllocation(id: ResourceID, addresses: Seq[String]){
 	介绍: 代表指定资源的已分配资源地址，集群管理器使用json序列化的方式将这个案例类去将地址传给执行器/驱动器
 	操作集:
@@ -404,7 +404,7 @@ private[spark] case class ResourceAllocation(id: ResourceID, addresses: Seq[Stri
 }
 ```
 
-```markdown
+```scala
 private[spark] object ResourceUtils{
 	关系: father --> Logging
 	属性:
@@ -564,7 +564,7 @@ private[spark] object ResourceUtils{
 这个api是私有的，直到其他块就位了，它就会变成共有的。
 ```
 
-```markdown
+```scala
 private[spark] class TaskResourceRequest(val resourceName: String, val amount: Double){
 	关系: father --> Serializable
 	操作条件: amount <= 0.5 || amount % 1 == 0
@@ -584,7 +584,7 @@ private[spark] class TaskResourceRequest(val resourceName: String, val amount: D
 	处理一系列任务资源请求，用于连接@ResourceProfile使用程序去指定RDD所需要的资源。这个会体现在storage级别上。这个API是私有的，知道所有资源准备完毕，才会变为共有。
 ```
 
-```markdown
+```scala
 private[spark] class TaskResourceRequests(){
 	关系: father --> Serializable
 	属性:
