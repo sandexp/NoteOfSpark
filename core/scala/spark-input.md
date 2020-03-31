@@ -6,7 +6,7 @@
 2.  [FixedLengthBinaryRecordReader](# FixedLengthBinaryRecordReader)
 3.  [PortableDataStream](# PortableDataStream)
 4.  [WholeTextFileInputFormat](# WholeTextFileInputFormat)
-5. [WholeTextFileyRecordReader](# WholeTextFileyRecordReader) 
+5. [WholeTextFileRecordReader](# WholeTextFileRecordReader) 
 6.  [scala基础拓展](# scala基础拓展)
 
 ---
@@ -18,7 +18,7 @@
 	这时一个用于读取和分割二进制文件的客户输入形式.这类二进制文件中包含有记录信息,且每个都是定长,这个定长的大小(size)通过设置Hadoop配置来指定.
 ```
 
-```markdown
+```scala
 private[spark] object FixedLengthBinaryInputFormat{
 	属性:
 	1. 记录长度参数@RECORD_LENGTH_PROPERTY 
@@ -31,7 +31,7 @@ private[spark] object FixedLengthBinaryInputFormat{
 }
 ```
 
-```markdown
+```scala
 private[spark] class FixedLengthBinaryInputFormat{
 	关系: father --> FileInputFormat[LongWritable, BytesWritable]
 		sibling --> Logging
@@ -77,7 +77,7 @@ private[spark] class FixedLengthBinaryInputFormat{
 			value = record	[BytesWritable]
 ```
 
-```markdown
+```scala
 private[spark] class FixedLengthBinaryRecordReader{
 	关系: father--> RecordReader[LongWritable, BytesWritable]
 	属性:
@@ -152,7 +152,7 @@ private[spark] class FixedLengthBinaryRecordReader{
 	这个类允许数据流序列化，且可以在不创建数据流的情况下保证数据的移动。除非它们需要被去读取。
 ```
 
-```markdown
+```scala
 class PortableDataStream(isplit: CombineFileSplit,context: TaskAttemptContext,index: Integer){
 	关系: father --> Serializable
 	构造器属性:
@@ -187,7 +187,7 @@ class PortableDataStream(isplit: CombineFileSplit,context: TaskAttemptContext,in
 }
 ```
 
-```markdown
+```scala
 private[spark] abstract class StreamFileInputFormat[T]{
 	关系: father --> CombineFileInputFormat[String,T]
 	介绍: 将全文读取成流，字节数组或者其他添加的函数形式的全局格式，
@@ -226,7 +226,7 @@ private[spark] abstract class StreamFileInputFormat[T]{
 }
 ```
 
-```markdown
+```scala
 private[spark] class StreamRecordReader(split: CombineFileSplit,context: TaskAttemptContext,
     index: Integer){
 	关系: father --> StreamBasedRecordReader[PortableDataStream](split,context,index)
@@ -237,7 +237,7 @@ private[spark] class StreamRecordReader(split: CombineFileSplit,context: TaskAtt
 }
 ```
 
-```markdown
+```scala
 private[spark] class StreamInputFormat{
 	关系: father --> StreamFileInputFormat[PortableDataStream]
 	介绍: @PortableDataStream文件的格式
@@ -250,7 +250,7 @@ private[spark] class StreamInputFormat{
 }
 ```
 
-```markdown
+```scala
 private[spark] abstract class StreamBasedRecordReader[T] (split: CombineFileSplit,
     context: TaskAttemptContext,index: Integer)
 {
@@ -299,7 +299,7 @@ private[spark] abstract class StreamBasedRecordReader[T] (split: CombineFileSpli
 	一个org.apache.hadoop.mapreduce.lib.input.CombineFileInputFormat的处理全文读取的类。每个文件读取按照kv形式存储，key是文件路径，value是文件的全文。
 ````
 
-```markdown
+```scala
 private[spark] class WholeTextFileInputFormat{
 	关系: father --> CombineFileInputFormat[Text, Text]
 		sibling --> Configurable
@@ -341,14 +341,14 @@ private[spark] class WholeTextFileInputFormat{
 }
 ```
 
-#### WholeTextFileyRecordReader
+#### WholeTextFileRecordReader
 
 ```markdown
 介绍:
 	这个类主要是用于处理: 读取全文文件kv对的措施(@org.apache.hadoop.mapreduce.RecordReader) ,其中key为文件路径，value为文件全文。
 ```
 
-```markdown
+```scala
 private[spark] class WholeTextFileRecordReader(split: CombineFileSplit,context: TaskAttemptContext,
     index: Integer)
 {
@@ -397,7 +397,7 @@ private[spark] class WholeTextFileRecordReader(split: CombineFileSplit,context: 
 }
 ```
 
-```markdown
+```scala
 private[spark] trait Configurable{
 	关系: father --> org.apache.hadoop.conf.HConfigurable
 	介绍: 这个特征实现了接口@org.apache.hadoop.conf.Configurable
@@ -412,7 +412,7 @@ private[spark] trait Configurable{
 }
 ```
 
-```markdown
+```scala
 private[spark] class ConfigurableCombineFileRecordReader[K, V] (split: InputSplit,
     context: TaskAttemptContext,recordReaderClass: Class[_ <: RecordReader[K, V] 
     with HConfigurable])){
@@ -423,7 +423,6 @@ private[spark] class ConfigurableCombineFileRecordReader[K, V] (split: InputSpli
 	在这之中对Configurable进行配置:
 	def initNextRecordReader(): Boolean 
 	功能: 初始化记录阅读器
-	```scala
         val r = super.initNextRecordReader()
         if (r) {
           if (getConf != null) {
@@ -431,16 +430,15 @@ private[spark] class ConfigurableCombineFileRecordReader[K, V] (split: InputSpli
           }
         }
         r
-```
-	def setConf(c: Configuration): Unit 
+    
+    def setConf(c: Configuration): Unit 
 	功能: 设置指定的configuration
-	```scala
-	    super.setConf(c)
-	    if (this.curReader != null) {
-	      this.curReader.asInstanceOf[HConfigurable].setConf(c)
-	    }
-	```
+    super.setConf(c)
+    if (this.curReader != null) {
+      this.curReader.asInstanceOf[HConfigurable].setConf(c)
+    }
 }
+```
 
 #### scala基础拓展
 

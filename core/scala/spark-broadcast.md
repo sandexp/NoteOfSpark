@@ -15,7 +15,7 @@
 
 ```markdown
 介绍:
-广播变量: 广播变量允许程序猿保存一份只读的变量,将之缓存在每台机器上.而不是通过任务区传送一份副本.举例来说,它可以用于,它可以通过一种高效的方式给每个节点机器一份大规模数据集(dataset)的副本.同时spark也通过一种高效的广播算法,将@广播变量分发给每台机器,有效的降低了建立连接的成本.
+广播变量: 广播变量允许程序员保存一份只读的变量,将之缓存在每台机器上.而不是通过任务去传送一份副本.举例来说,它可以用于,它可以通过一种高效的方式给每个节点机器一份大规模数据集(dataset)的副本.同时spark也通过一种高效的广播算法,将广播变量分发给每台机器,有效的降低了建立连接的成本.
 
 Broadcast变量创建方法:
 	常见Broadcast方法:
@@ -26,7 +26,7 @@ Broadcast变量创建方法:
 Broadcast创建完毕之后,在集群当中应当使用广播变量@broadcastVar而非值v.且需要注意到,一旦值v被广播之后,其值是不可以修改的,以便于确保所有的节点都获得了同一个值.
 ```
 
-```markdown
+```scala
 abstract class Broadcast[T: ClassTag] (val id: Long){
 	id : 广播变量唯一标识
 	关系:
@@ -92,7 +92,7 @@ abstract class Broadcast[T: ClassTag] (val id: Long){
 这是一个对于所有广播变量在spark中实现的接口(允许多个广播变量实现).spark上下文管理器@SparkContext使用广播变量工厂@BroadcastFactory实现对整个spark job的广播变量的实例化.
 ```
 
-```markdown
+```scala
 private[spark] trait BroadcastFactory{
 	操作集:
 	def initialize(isDriver: Boolean, conf: SparkConf, securityMgr: SecurityManager): Unit	
@@ -124,7 +124,7 @@ private[spark] trait BroadcastFactory{
 
 #### BroadcastManager
 
-```markdown
+```scala
 private[spark] class BroadcastManager(val isDriver: Boolean,conf: SparkConf,
 securityManager: SecurityManager){
 	关系: 
@@ -183,7 +183,7 @@ Broadcast类的一种比特流实现方式
 	初始化过程,本类会读取SparkEnv中的配置信息.
 ```
 
-```markdown
+```scala
 private[spark] class TorrentBroadcast [T: ClassTag] (obj: T, id: Long){
 	关系:
 		father-> Broadcast[T](id)
@@ -323,7 +323,7 @@ private[spark] class TorrentBroadcast [T: ClassTag] (obj: T, id: Long){
 			taskContext.addTaskCompletionListener[Unit](_ => blockManager.releaseLock(blockId))
 }
 ```
-```markdown
+```scala
 private object TorrentBroadcast{
 	关系: father->Logging
     属性:
@@ -376,7 +376,7 @@ private object TorrentBroadcast{
 	#class #TorrentBroadcast
 ```
 
-```markdown
+```scala
 private[spark] class TorrentBroadcastFactory{
 	关系:
 		father -> BroadcastFactory
