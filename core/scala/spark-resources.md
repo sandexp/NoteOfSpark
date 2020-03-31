@@ -286,17 +286,17 @@ private[spark] object ResourceProfile{
 	#name @MEMORY="memory"	内存使用量标识
 	#name @OVERHEAD_MEM="memoryOverhead"	常驻内存使用量标志
 	#name @PYSPARK_MEM="pyspark.memory"		pyspark使用内存量
-	#name @nextProfileId=new AtomicInteger(0) lazy	下一个资源编号Id 
+	#name @nextProfileId=new AtomicInteger(0) lazy	当前资源编号Id 
 	#name @defaultProfileRefnew AtomicReference[ResourceProfile](new ResourceProfile())
 		默认参考描述(默认资源描述使用应用级别配置，常见默认描述可理解获得ID 0，初始化获取时进行)
 	操作集:
 	def getNextProfileId: Int = nextProfileId.getAndIncrement()
-	功能: 获取下一个资源描述ID
+	功能: 获取当前资源描述ID
 	
 	def resetDefaultProfile(conf: SparkConf): Unit = getOrCreateDefaultProfile(conf).reset()
 	功能: 重置默认资源描述(常用于测试)
 	
-	getOrCreateDefaultProfile(conf: SparkConf): ResourceProfile 
+	def getOrCreateDefaultProfile(conf: SparkConf): ResourceProfile 
 	功能: 获取默认资源描述
 	1. 获取参考资源描述
 		val defaultProf = defaultProfileRef.get()
