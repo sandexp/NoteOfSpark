@@ -62,7 +62,7 @@ abstract class Broadcast[T: ClassTag] (val id: Long){
 		操作逻辑:
 			1. 广播变量可用标志@_isValid置为false
 			2. 设置释放地址@_destroySite=Utils.getCallSite().shortForm
-        	 3. 使用doDestroy释放空间
+        	3. 使用doDestroy释放空间
         	 
         private[spark] def isValid: Boolean 
         功能: 获取广播变量可用标志@_isValid
@@ -246,8 +246,7 @@ private[spark] class TorrentBroadcast [T: ClassTag] (obj: T, id: Long){
      			(存储广播变量到驱动器,以便于任务运行于驱动器,不需要创建广播变量值的副本)
      		3. 如果需要校验码@checksumEnabled,则计算校验码@checksums(缓冲)
      		4. 使用@blockifyObject()将对象切分成多个块(Array[ByteBuffer]),对每个块的内容进行zip压缩,参照
-     		#class @IndexedSeqOptimized #method @zipWithIndex 对块对象组@blocks中的每一个元素#type 
-     		@ByteBuffer进行:
+     		#class @IndexedSeqOptimized #method @zipWithIndex 对块对象组@blocks中的每一个元素#type @ByteBuffer 进行:
      			1. 计算该块@block(ByteBuffer)的校验码并存入到对应的位置checksum[i]
      			2. 使用#class @BlockId计算块编号@pieceId
      			3. 计算当前块对应的块字节数组@ChunkedByteBuffer 为bytes
@@ -256,15 +255,13 @@ private[spark] class TorrentBroadcast [T: ClassTag] (obj: T, id: Long){
      	
      	def readBlocks(): Array[BlockData]
      	功能: 从驱动器/其他执行器中获取流式块信息 #type Array[BlockData]
-     	注意: 所有数据块(chunk),注意这些块存储在@BlockManager中,且汇报给驱动器,所以其他执行器也可以从这里拉			取数据块.
+     	注意: 所有数据块(chunk),注意这些块存储在@BlockManager中,且汇报给驱动器,所以其他执行器也可以从这里拉取数据块.
      	操作逻辑:
      		0. 新建一个数据块数组Array[BlockData] 维度为numBlocks @blocks 用于放置读取数据块信息
-     		1. 首先需要将块编号0-->numblocks 使用#class @Random #method @shuffle随机打乱顺序,详情参照
-     		@shuffle,形成一个新的块编号序列(pids)
+     		1. 首先需要将块编号0-->numblocks 使用#class @Random #method @shuffle随机打乱顺序,详情参照@shuffle,形成一个新的块编号序列(pids)
      		2. 对这个序列中的每一个元素pid进行如下计算
      			1. 获取广播变量块编号@pieceId=BroadcastBlockId(id, "piece" + pid)
-     			对于这里块管理器是否能在本地节点获取编号为pieceId的数据块(使用@getLocalBytes)分成如下
-     			两种情况:
+     			对于这里块管理器是否能在本地节点获取编号为pieceId的数据块(使用@getLocalBytes)分成如下两种情况:
      				1. 能够获取到
      					+ 首先获取数据时,读取pieceId时操作是互斥的,所以@getLocalBytes内部即加上了锁
      					+ 读取到的数据卡写入到对应的数据块数组对应位置@blocks[pieceId]=block
