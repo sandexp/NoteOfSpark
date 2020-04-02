@@ -1,6 +1,6 @@
 
 
-## *spark-internal**
+## **spark-internal**
 
 ---
 
@@ -57,7 +57,7 @@
 
 #### ConfigBuilder
 
-```markdown
+```scala
 private object ConfigHelpers {
 	功能: 辅助配置
 	操作集:
@@ -105,7 +105,7 @@ private object ConfigHelpers {
 }
 ```
 
-```markdown
+```scala
 private[spark] class TypedConfigBuilder[T] (val parent: ConfigBuilder,val converter: String => T,
   	val stringConverter: T => String){
  	介绍: 类型安全的配置组件，提供了转换输入数据以及创建最终配置键值对的方法。
@@ -182,7 +182,7 @@ private[spark] class TypedConfigBuilder[T] (val parent: ConfigBuilder,val conver
  }
 ```
 
-```markdown
+```scala
 private[spark] case class ConfigBuilder(key: String) {
 	介绍: spark配置的基础组件器@ConfigBuilder
 	属性:
@@ -279,7 +279,7 @@ private[spark] case class ConfigBuilder(key: String) {
 	变量扩展也使用在有默认值的键值对信息中，这些信息含有一个string格式的默认值。
 ```
 
-```markdown
+```scala
 private[spark] abstract class ConfigEntry[T] (val key: String,val prependedKey: Option[String],
     val prependSeparator: String,val alternatives: List[String],val valueConverter: String => T,
     val stringConverter: T => String,val doc: String,val isPublic: Boolean)
@@ -316,7 +316,7 @@ private[spark] abstract class ConfigEntry[T] (val key: String,val prependedKey: 
  }
 ```
 
-```markdown
+```scala
 private class ConfigEntryWithDefault[T] (
     key: String,
     prependedKey: Option[String],
@@ -343,7 +343,7 @@ private class ConfigEntryWithDefault[T] (
 }
 ```
 
-```markdown
+```scala
 private class ConfigEntryWithDefaultString[T] (key: String,prependedKey: Option[String],
     prependSeparator: String,alternatives: List[String],_defaultValue: String,
     valueConverter: String => T,stringConverter: T => String,
@@ -365,7 +365,7 @@ private class ConfigEntryWithDefaultString[T] (key: String,prependedKey: Option[
 }
 ```
 
-```markdown
+```scala
 private class ConfigEntryWithDefaultFunction[T] (key: String,prependedKey: Option[String],
     prependSeparator: String,alternatives: List[String],_defaultFunction: () => T,
     valueConverter: String => T,stringConverter: T => String,
@@ -385,7 +385,7 @@ private class ConfigEntryWithDefaultFunction[T] (key: String,prependedKey: Optio
 }
 ```
 
-```markdown
+```scala
 private[spark] class OptionalConfigEntry[T] (key: String,prependedKey: Option[String],
     prependSeparator: String,alternatives: List[String],
     val rawValueConverter: String => T,val rawStringConverter: T => String,
@@ -403,7 +403,7 @@ private[spark] class OptionalConfigEntry[T] (key: String,prependedKey: Option[St
 }
 ```
 
-```markdown
+```scala
 private[spark] class FallbackConfigEntry[T] (key: String,prependedKey: Option[String],
     prependSeparator: String,alternatives: List[String],
     doc: String,isPublic: Boolean,val fallback: ConfigEntry[T]))
@@ -420,7 +420,7 @@ private[spark] class FallbackConfigEntry[T] (key: String,prependedKey: Option[St
 }
 ```
 
-```markdown
+```scala
 private[spark] object ConfigEntry {
 	属性:
     #name @UNDEFINED = "<undefined>" 	未定义信息
@@ -441,7 +441,7 @@ private[spark] object ConfigEntry {
 
 #### ConfigProvider
 
-```markdown
+```scala
 private[spark] trait ConfigProvider {
 	介绍: 提供配置的查询
 	操作集:
@@ -450,7 +450,7 @@ private[spark] trait ConfigProvider {
 }
 ```
 
-```markdown
+```scala
 private[spark] class EnvProvider{
 	关系: father --> ConfigProvider
 	介绍: 提供环境的查询
@@ -460,7 +460,7 @@ private[spark] class EnvProvider{
 }
 ```
 
-```markdown
+```scala
 private[spark] class SystemProvider{
 	关系: father --> ConfigProvider
 	介绍: 获取系统属性
@@ -469,7 +469,7 @@ private[spark] class SystemProvider{
 }
 ```
 
-```markdown
+```scala
 private[spark] class MapProvider(conf: JMap[String, String]) {
 	关系: father --> ConfigProvider
 	
@@ -478,7 +478,7 @@ private[spark] class MapProvider(conf: JMap[String, String]) {
 }
 ```
 
-```markdown
+```scala
 private[spark] class SparkConfigProvider(conf: JMap[String, String]) {
 	关系: father --> ConfigProvider
 	def get(key: String): Option[String]
@@ -501,7 +501,7 @@ private[spark] class SparkConfigProvider(conf: JMap[String, String]) {
 	如果参考不能被解决问题,原始字符串会被保留.
 ```
 
-```markdown
+```scala
 private[spark] class ConfigReader(conf: ConfigProvider) {
 	属性:
 	#name @bindings=new HashMap[String, ConfigProvider]() 绑定端口
@@ -802,7 +802,7 @@ worker信息配置
 2. 作为每个任务的执行，执行器调用@setupTask() 和 @commitTask()去提交任务(如果失败，则使用@abortTask()放弃提交)
 3. 当所有必要的任务全部成功完成，驱动器提交job。如果job执行失败(有过多的失败task)，那么这个job会调用@abortJob,弃用这个job。
 ```
-```markdown
+```scala
 abstract class FileCommitProtocol{
 	关系 : father --> Logging
 	操作集:
@@ -826,7 +826,7 @@ abstract class FileCommitProtocol{
 	2. 基本路径下的子文件目录，用于指定分区
 	3. 文件前缀，使用唯一的带有task id的job Id
 	4. 桶(bucket)id
-	5. 特点的文件名扩展(e.g. ".snappy.parquet")
+	5. 特定的文件名扩展(e.g. ".snappy.parquet")
 	目录蚕食指定2,"ext" 参数指定4和5.其他类型有实现决定。
 	
 	def newTaskTempFileAbsPath(taskContext: TaskAttemptContext, absoluteDir: String, 
@@ -848,7 +848,7 @@ abstract class FileCommitProtocol{
 	功能: 任务提交之后调用驱动器，这个可以在job完成之前获取task提交信息。如果整个job成功，这些任务提交信息会		被传递给@commitJob()
 }
 ```
-```markdown
+```scala
 object FileCommitProtocol{
 	关系: father --> Logging
 	内部类:
@@ -880,7 +880,7 @@ object FileCommitProtocol{
 	与hadoop 输出提交器@OutputCommitter不同的是，这个实现是可序列化的。
 ```
 
-```markdown
+```scala
 class HadoopMapRedCommitProtocol(jobId: String, path: String){
 	关系 : father --> HadoopMapReduceCommitProtocol(jobId, path)
 	操作集:
@@ -899,7 +899,7 @@ class HadoopMapRedCommitProtocol(jobId: String, path: String){
 	文件传输协议，由底层hadoop 输出提交器返回@OutputCommitter，与输出提交器@OutputCommitter不同的是，实现是可以序列化的。
 ```
 
-```markdown
+```scala
 class HadoopMapReduceCommitProtocol(jobId: String,path: String,
     dynamicPartitionOverwrite: Boolean = false){
 	关系: father --> FileCommitProtocol
@@ -1068,7 +1068,7 @@ class HadoopMapReduceCommitProtocol(jobId: String,path: String,
 	3. 实现需要有确定一个的构造器参数
 ```
 
-```markdown
+```scala
 abstract class HadoopWriteConfigUtil[K, V: ClassTag] {
 	关系: father --> Serializable
 	操作集:
@@ -1105,7 +1105,7 @@ abstract class HadoopWriteConfigUtil[K, V: ClassTag] {
 介绍: 使用hadoop @OutputFormat 保存RDD的辅助类
 ```
 
-```markdown
+```scala
 private[spark] object SparkHadoopWriter{
 	关系: father --> Logging
 	操作集:
@@ -1149,9 +1149,7 @@ private[spark] object SparkHadoopWriter{
     	committer.abortJob(jobContext)
     	throw SparkException
 	
-	def executeTask[K, V: ClassTag](context: TaskContext,config: HadoopWriteConfigUtil[K, V],
-      jobTrackerId: String,commitJobId: Int,sparkPartitionId: Int,sparkAttemptNumber: Int,
-      committer: FileCommitProtocol,iterator: Iterator[(K, V)]): TaskCommitMessage
+	def executeTask[K, V: ClassTag](context: TaskContext,config: HadoopWriteConfigUtil[K, V],jobTrackerId: String,commitJobId: Int,sparkPartitionId: Int,sparkAttemptNumber: Int,committer: FileCommitProtocol,iterator: Iterator[(K, V)]): TaskCommitMessage
 	功能: 写出RDD分区到单个spark任务task中
 	输入参数:
 		context	任务上下文
@@ -1192,7 +1190,7 @@ private[spark] object SparkHadoopWriter{
 }
 ```
 
-```markdown
+```scala
 private[spark] class HadoopMapRedWriteConfigUtil[K, V: ClassTag] (conf: SerializableJobConf){
 	关系: father --> HadoopWriteConfigUtil[K, V]
 		sibling --> Logging
@@ -1277,8 +1275,8 @@ private[spark] class HadoopMapRedWriteConfigUtil[K, V: ClassTag] (conf: Serializ
 }
 ```
 
-```markdown
-private[spark] class HadoopMapReduceWriteConfigUtil[K,V: ClassTag] (conf: SerializableConfiguration){
+```scala
+private[spark] class HadoopMapReduceWriteConfigUtil[K,V: ClassTag] (conf:SerializableConfiguration){
 	关系: father --> HadoopWriteConfigUtil[K, V]
 		sibling --> Logging
 	属性:
@@ -1358,7 +1356,7 @@ private[spark] class HadoopMapReduceWriteConfigUtil[K,V: ClassTag] (conf: Serial
 	辅助对象，用于提供通用工具，用于保存RDD期间使用Hadoop输出@OutputFormat
 ```
 
-```markdown
+```scala
 private[spark] object SparkHadoopWriterUtils{
 	属性:
 	#name @RECORDS_BETWEEN_BYTES_WRITTEN_METRIC_UPDATES=256	写出字节度量更新数量(默认256)
@@ -1422,7 +1420,7 @@ private[spark] object SparkHadoopWriterUtils{
 
    #### PluginContainer
 
-   ```markdown
+   ```scala
    sealed abstract class PluginContainer{
    	操作集:
    	def shutdown(): Unit
@@ -1432,7 +1430,7 @@ private[spark] object SparkHadoopWriterUtils{
    }
    ```
    
-   ```markdown
+   ```scala
    private class DriverPluginContainer(sc: SparkContext, plugins: Seq[SparkPlugin]){
    	关系: father --> PluginContainer
    	sibling --> Logging
@@ -1441,7 +1439,7 @@ private[spark] object SparkHadoopWriterUtils{
    		sc	应用程序配置集
    		plugins	插件序列
    	属性:
-   	#name @driverPlugins #type @ Seq[(String, DriverPlugin, PluginContextImpl)]	驱动器插件
+   	#name @driverPlugins #type @Seq[(String, DriverPlugin, PluginContextImpl)]	驱动器插件表
    	plugins.flatMap { p =>
    		val driverPlugin = p.driverPlugin()
    		if (driverPlugin != null) {
@@ -1482,7 +1480,7 @@ private[spark] object SparkHadoopWriterUtils{
    }
    ```
    
-   ```markdown
+   ```scala
    private class ExecutorPluginContainer(env: SparkEnv, plugins: Seq[SparkPlugin]){
    	关系: father --> PluginContainer
    		sibling --> Logging
@@ -1523,7 +1521,7 @@ private[spark] object SparkHadoopWriterUtils{
    }
    ```
    
-   ```markdown
+   ```scala
    object PluginContainer {
    	属性: 
    	#name @EXTRA_CONF_PREFIX="spark.plugins.internal.conf."	配置前缀
@@ -1553,7 +1551,7 @@ private[spark] object SparkHadoopWriterUtils{
    
    #### PluginContextImpl
    
-   ```markdown
+   ```scala
    private class PluginContextImpl(pluginName: String,rpcEnv: RpcEnv,metricsSystem: MetricsSystem,
        override val conf: SparkConf,override val executorID: String){
    	关系: father --> PluginContext
@@ -1597,7 +1595,7 @@ private[spark] object SparkHadoopWriterUtils{
    ```
    #### PluginEndpoint
    
-   ```markdown
+   ```scala
    private class PluginEndpoint(plugins: Map[String, DriverPlugin],override val rpcEnv: RpcEnv){
    	关系: father --> IsolatedRpcEndpoint
    		sibling --> Logging
@@ -1637,7 +1635,7 @@ private[spark] object SparkHadoopWriterUtils{
 	对于希望对数据做日志记录的类来说的一个实用特征。创建一个slf4j的日记记录器，允许日志信息使用懒加载的估算值,并登记到不同等级的日志中去。
 ```
 
-```markdown
+```scala
 trait Logging {
 	属性:
 	#name @log_=null #type @Logger
@@ -1757,7 +1755,7 @@ trait Logging {
 }
 ```
 
-```markdown
+```scala
 private[spark] object Logging {
 	属性:
 	#name @initialized=false #type @Boolean volatile	日志管理器初始化状态
@@ -1800,7 +1798,7 @@ private[spark] object Logging {
 }
 ```
 
-```markdown
+```scala
 private class SparkShellLoggingFilter{
 	关系: father --> Filter
 	def decide(loggingEvent: LoggingEvent): Int
