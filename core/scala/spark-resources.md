@@ -18,7 +18,7 @@
 ```markdown
 介绍:
 	执行器(excutor)资源请求,用于连接@ResourceProfile资源描述，程序指定RDD需要的资源，并且会应用到stage级别上。
-	这个类用于指定什么资源会分配给执行器，以及spark如何去找到这些资源的特定描述。对于不同的资源类型，不是都需要所有的参数。提供的资源名称时支持常用的spark配置(将前缀溢出的形式)。比如说常驻内存，在这个api中称作@memoryOverhead 它的全称为@spark.executor.memoryOverhead 移除前缀的结果。向GPU的资源，在这里就称作resource.gpu(spark.executor.resource.gpu.*).资源的数量(amount),发现脚本(discoveryScript),以及提供参数(vendor parameters)参数，用户可以使用spark.executor.resource.{resourceName}.{amount, discoveryScript, vendor}指出。
+	这个类用于指定什么资源会分配给执行器，以及spark如何去找到这些资源的特定描述。对于不同的资源类型，不是都需要所有的参数。提供的资源名称时支持常用的spark配置(将前缀溢出的形式)。比如说常驻内存，在这个api中称作@memoryOverhead 它的全称为@spark.executor.memoryOverhead 移除前缀的结果。像GPU的资源，在这里就称作resource.gpu(spark.executor.resource.gpu.*).资源的数量(amount),发现脚本(discoveryScript),以及提供参数(vendor parameters)参数，用户可以使用spark.executor.resource.{resourceName}.{amount, discoveryScript, vendor}指出。
 	比如说一个用户想要分配yarn的CPU资源。那么,用户必须指出资源名称(resource.gpu),每个执行器上的GPU数量,指定发现脚本(discovery script).以便于执行器启动时，能够找到GPU地址(yarn不会告诉spark程序gpu地址在哪),供应参数(vendor)由于是给Kubernetes的属性，所以不会使用。
 	详细请参照配置文档和集群特性文档。
 ```
