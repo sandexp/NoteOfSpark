@@ -19,7 +19,7 @@
 	诸如转化(parsing)和压缩(compression)schema的行动从计算方面来说是昂贵的。使得序列化缓存语言被视作values，这样可以降低需要做的工作。
 ```
 
-```markdown
+```scala
 private[serializer] class GenericAvroSerializer(schemas: Map[Long, String]){
 	关系: father --> KSerializer[GenericRecord]
     构造器属性:
@@ -120,7 +120,7 @@ private[serializer] class GenericAvroSerializer(schemas: Map[Long, String]){
 
 #### JavaSerializer
 
-```markdown
+```scala
 private[spark] class JavaSerializationStream(out: OutputStream, counterReset: Int,
 	extraDebugInfo: Boolean){
 	关系: father --> SerializationStream
@@ -148,7 +148,7 @@ private[spark] class JavaSerializationStream(out: OutputStream, counterReset: In
 }
 ```
 
-```markdown
+```scala
 private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoader){
 	关系: father --> DeserializationStream
 	构造器属性: 
@@ -166,7 +166,7 @@ private[spark] class JavaDeserializationStream(in: InputStream, loader: ClassLoa
 }
 ```
 
-```markdown
+```scala
 private object JavaDeserializationStream{
 	属性: 
 	原始类型映射:
@@ -184,7 +184,7 @@ private object JavaDeserializationStream{
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class JavaSerializer(conf: SparkConf) {
 	关系: father --> Serializer
@@ -218,7 +218,7 @@ class JavaSerializer(conf: SparkConf) {
 }
 ```
 
-```markdown
+```scala
 private[spark] class JavaSerializerInstance(counterReset: Int, extraDebugInfo: Boolean, 				defaultClassLoader: ClassLoader){
 	关系: father --> SerializerInstance
 	操作集:
@@ -263,7 +263,7 @@ private[spark] class JavaSerializerInstance(counterReset: Int, extraDebugInfo: B
 	注意: 这个类不保证在不同版本的spark兼容。所以使用与单个spark程序中用于序列化/反序列化。
 ```
 
-```markdown
+```scala
 class KryoSerializer(conf: SparkConf){
 	关系: father --> org.apache.spark.serializer.Serializer
 	sibling --> Logging  --> java.io.Serializable
@@ -322,8 +322,6 @@ class KryoSerializer(conf: SparkConf){
   		kryo.register(classOf[GenericRecord], new GenericAvroSerializer(avroSchemas))
     	kryo.register(classOf[GenericData.Record], new GenericAvroSerializer(avroSchemas))
   	+ 调用用户注册器时，加载默认的类加载器
-
-    	```scala
     		Utils.withContextClassLoader(classLoader){
     		try {
     			// 注册需要注册的类列表
@@ -365,7 +363,7 @@ class KryoSerializer(conf: SparkConf){
 }
 ```
 
-```markdown
+```scala
 private[spark] class KryoSerializationStream(serInstance: KryoSerializerInstance,
 	outStream: OutputStream,useUnsafe: Boolean){
 	关系: father --> SerializationStream
@@ -391,7 +389,7 @@ private[spark] class KryoSerializationStream(serInstance: KryoSerializerInstance
 } 
 ```
 
-```markdown
+```scala
 private[spark] class KryoDeserializationStream(serInstance: KryoSerializerInstance,
     inStream: InputStream,useUnsafe: Boolean){
 	关系： father --> DeserializationStream
@@ -414,7 +412,7 @@ private[spark] class KryoDeserializationStream(serInstance: KryoSerializerInstan
 } 
 ```
 
-```markdown
+```scala
 private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boolean, usePool: Boolean){
 	关系: father --> SerializerInstance
 	构造器属性:
@@ -525,7 +523,7 @@ private[spark] class KryoSerializerInstance(ks: KryoSerializer, useUnsafe: Boole
 }
 ```
 
-```markdown
+```scala
 private[spark] class KryoInputObjectInputBridge(kryo: Kryo, input: KryoInput){
 	关系: father --> FilterInputStream(input)
 		sibling --> ObjectInput
@@ -582,7 +580,7 @@ private[spark] class KryoInputObjectInputBridge(kryo: Kryo, input: KryoInput){
 }
 ```
 
-```markdown
+```scala
 private[spark] class KryoOutputObjectOutputBridge(kryo: Kryo, output: KryoOutput){
 	关系: father --> FilterOutputStream(output)
 		sibling --> ObjectOutput
@@ -606,7 +604,7 @@ private[spark] class KryoOutputObjectOutputBridge(kryo: Kryo, output: KryoOutput
 }
 ```
 
-```markdown
+```scala
 private class JavaIterableWrapperSerializer{
 	关系: father --> com.esotericsoftware.kryo.Serializer[java.lang.Iterable[_]]
 	操作集:
@@ -627,7 +625,7 @@ private class JavaIterableWrapperSerializer{
 }
 ```
 
-```markdown
+```scala
 private object JavaIterableWrapperSerializer{
 	关系: father --> Logging
 	介绍: java迭代器包装序列化器
@@ -638,7 +636,7 @@ private object JavaIterableWrapperSerializer{
 }
 ```
 
-```markdown
+```scala
 trait KryoRegistrator {
   	操作集:
   	def registerClasses(kryo: Kryo): Unit
@@ -646,7 +644,7 @@ trait KryoRegistrator {
 }
 ```
 
-```markdown
+```scala
 private[serializer] object KryoSerializer {
 	属性:
 	#name @toRegister 通用注册列表
@@ -721,7 +719,7 @@ private[serializer] object KryoSerializer {
 
 #### SerializationDebugger
 
-```markdown
+```scala
 private[spark] object SerializationDebugger{
 	关系: father --> Logging
 	属性: 
@@ -749,7 +747,7 @@ private[spark] object SerializationDebugger{
     	val desc = ObjectStreamClass.lookupAny(o.getClass)
 }
 ```
-```markdown
+```scala
 private class ListObjectOutputStream{
 	关系: father --> ObjectOutputStream(new NullOutputStream)
 	介绍: 这是一个假的@ObjectOutput,可以简单的保存由外部写入的对象列表
@@ -765,13 +763,13 @@ private class ListObjectOutputStream{
 		功能: 替换对象
 }
 ```
-```markdown
+```scala
   private class NullOutputStream extends ObjectOutput{
   	介绍: 模拟/dev/null的输出流
     def write(b: Int): Unit = { }
   }
 ```
-```markdown
+```scala
 private class ObjectStreamClassReflection{
 	属性:
 	val GetClassDataLayout: Method ={
@@ -825,7 +823,7 @@ private class ObjectStreamClassReflection{
     获取属性desc
 }
 ```
-```markdown
+```scala
 implicit class ObjectStreamClassMethods(val desc: ObjectStreamClass){
  	关系: father --> AnyVal
  	操作集:
@@ -850,7 +848,7 @@ implicit class ObjectStreamClassMethods(val desc: ObjectStreamClass){
  	val= reflect.GetObjFieldValues.invoke(desc, obj, out)
  }
 ```
-```markdown
+```scala
 private class ListObjectOutput{
 	关系: father --> ObjectOutput
 	介绍: 这是一个伪@ObjectOutput,用于简单的保存外部写入的数据
@@ -925,7 +923,7 @@ private class ListObjectOutput{
 	注意: 序列化器在不同版本spark之间可能不通用。用于单个spark程序内部比较合适。
 ```
 
-```markdown
+```scala
 @DeveloperApi
 abstract class Serializer{
 	属性:
@@ -958,7 +956,7 @@ abstract class Serializer{
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 @NotThreadSafe
 abstract class SerializerInstance {
@@ -980,7 +978,7 @@ abstract class SerializerInstance {
 }
 ```
 
-```markdown
+```scala
 abstract class DeserializationStream{
 	关系: father --> Closable
 	操作集: 
@@ -1041,7 +1039,7 @@ abstract class DeserializationStream{
 	这是一个用于给不同spark组件配置序列化，压缩，加密的组件。包括自动选择用于shuffle的@Serializer
 ```
 
-```markdown
+```scala
 private[spark] class SerializerManager(defaultSerializer: Serializer,conf: SparkConf,
     encryptionKey: Option[Array[Byte]]){
 	构造器属性:
