@@ -24,7 +24,7 @@
 
 #### CoarseGrainedExecutorBackend
 
-```markdown
+```scala
 private[spark] class CoarseGrainedExecutorBackend(override val rpcEnv: RpcEnv,driverUrl: String,
     executorId: String,bindAddress: String,hostname: String,cores: Int,userClassPath: Seq[URL],
     env: SparkEnv,resourcesFileOpt: Option[String]){
@@ -191,7 +191,7 @@ private[spark] class CoarseGrainedExecutorBackend(override val rpcEnv: RpcEnv,dr
 }
 ```
 
-```markdown
+```scala
 private[spark] object CoarseGrainedExecutorBackend extends Logging {
 	样例类:
 	case class Arguments(driverUrl: String,executorId: String,bindAddress: String,hostname: String,
@@ -351,7 +351,7 @@ private[spark] object CoarseGrainedExecutorBackend extends Logging {
 
 #### CommitDeniedException
 
-```markdown
+```scala
 private[spark] class CommitDeniedException(msg: String,jobID: Int,splitID: Int,attemptNumber: Int){
 	关系: father --> Exception(msg)
 	介绍: 当任务请求提交到HDFS中,被driver质疑权限时.抛出这个异常
@@ -370,7 +370,7 @@ private[spark] class CommitDeniedException(msg: String,jobID: Int,splitID: Int,a
 	fine-grained模式)
 ```
 
-```markdown
+```scala
 private[spark] class Executor(executorId: String,executorHostname: String,env: SparkEnv,
     userClassPath: Seq[URL] = Nil,isLocal: Boolean = false,
     uncaughtExceptionHandler: UncaughtExceptionHandler = new SparkUncaughtExceptionHandler){
@@ -689,7 +689,7 @@ private[spark] class Executor(executorId: String,executorHostname: String,env: S
 
 #subclass @TaskRunner
 
-```markdown
+```scala
 class TaskRunner(execBackend: ExecutorBackend,private val taskDescription: TaskDescription){
 	关系: father --> Runnable
 	构造器属性:
@@ -1000,7 +1000,7 @@ class TaskRunner(execBackend: ExecutorBackend,private val taskDescription: TaskD
 	@TaskReaper 当任务发送kill或者取消任务时会创建。典型的来说，一个任务会仅仅有一个@TaskReaper，但是对于一个任务来说,可能有超过两个任务需要去清理，这种情况下，kill会被调用两次，但是中断参数却是不同的。
 	一旦创建，这个回收任务便会监视，直到主任务都结束了。如果@TaskReaper 没有配置去kill JVM在一个指定时限内(timeout)，那么只要监视任务不退出运行，这个回收任务会一直运行。
 ```
-```markdown
+```scala
 private class TaskReaper(taskRunner: TaskRunner,val interruptThread: Boolean,val reason: String){
 	构造器属性:
 		taskRunner	运行任务的线程
@@ -1076,7 +1076,7 @@ private class TaskReaper(taskRunner: TaskRunner,val interruptThread: Boolean,val
 }
 ```
 
-```markdown
+```scala
 private[spark] object Executor {
 	属性:
 	#name @taskDeserializationProps=new ThreadLocal[Properties]	任务反序列化属性
@@ -1085,7 +1085,7 @@ private[spark] object Executor {
 
 #### ExecutorBackend
 
-```markdown
+```scala
 private[spark] trait ExecutorBackend {
 	介绍: 执行器后端
 		一个可插入的接口,执行器使用它去设置更新集群调度器.
@@ -1105,7 +1105,7 @@ private[spark] trait ExecutorBackend {
 	执行器退出码,执行器需要提供信息给master,这些执行器执行失败信息假定在集群管理框架能够捕捉退出码(可能没有日志文件).退出码常数与正常退出码(JVM或者用户代码引起的)不应当起冲突.特殊的,退出码在128以上出现在类Unix上,作为信号的结果,OpenJdk的JVM使用退出码1在其"最后一次尝试"代码中.
 ```
 
-```markdown
+```scala
 private[spark] object ExecutorExitCode {
 	属性:
 	#name @DISK_STORE_FAILED_TO_CREATE_DIR = 53	退出码: 磁盘存储不能在多次请求之后创建本地临时目录
@@ -1141,7 +1141,7 @@ private[spark] object ExecutorExitCode {
 
 #### ExecutorLogUrlHandler
 
-```markdown
+```scala
 private[spark] class ExecutorLogUrlHandler(logUrlPattern: Option[String]){
 	关系: father --> Logging
 	介绍: 执行器日志URI处理器
@@ -1205,7 +1205,7 @@ private[spark] class ExecutorLogUrlHandler(logUrlPattern: Option[String]){
 }
 ```
 
-```markdown
+```Scala
 private[spark] object ExecutorLogUrlHandler {
 	val CUSTOM_URL_PATTERN_REGEX: Regex = "\\{\\{([A-Za-z0-9_\\-]+)\\}\\}".r
 	用户URL正则形式
@@ -1214,7 +1214,7 @@ private[spark] object ExecutorLogUrlHandler {
 
 #### ExecutorMetrics
 
-```markdown
+```scala
 @DeveloperApi
 class ExecutorMetrics private[spark] extends Serializable {
 	介绍: 执行器/驱动器的度量器定位
@@ -1271,7 +1271,7 @@ class ExecutorMetrics private[spark] extends Serializable {
 }
 ```
 
-```markdown
+```scala
 private[spark] object ExecutorMetrics{
 	操作集:
 	def getCurrentMetrics(memoryManager: MemoryManager): Array[Long]
@@ -1291,7 +1291,7 @@ private[spark] object ExecutorMetrics{
 
 #### ExecutorMetricsPoller
 
-```markdown
+```scala
 private[spark] class ExecutorMetricsPoller(memoryManager: MemoryManager,pollingInterval: Long,
     executorMetricsSource: Option[ExecutorMetricsSource]){
 	关系: father --> Logging
@@ -1422,7 +1422,7 @@ private[spark] class ExecutorMetricsPoller(memoryManager: MemoryManager,pollingI
 		spark.eventLog.logStageExecutorMetrics.enabled=true.
 ```
 
-```markdown
+```scala
 private[spark] class ExecutorMetricsSource extends Source {
 	属性:
 	#name @metricRegistry = new MetricRegistry()	度量注册器
@@ -1458,7 +1458,7 @@ private[spark] class ExecutorMetricsSource extends Source {
 
 #### ExecutorSource
 
-```markdown
+```scala
 private[spark] class ExecutorSource(threadPool: ThreadPoolExecutor, executorId: String){
 	关系: father --> Source
 	构造器属性:
@@ -1563,7 +1563,7 @@ private[spark] class ExecutorSource(threadPool: ThreadPoolExecutor, executorId: 
 
 #### InputMetrics
 
-```markdown
+```scala
 @DeveloperApi
 object DataReadMethod extends Enumeration with Serializable {	
 	介绍: 输入数据读取的方法数据通过网络从远端块管理器中读取,这个块管理器含有很多磁盘和内存中的数据.操作是线程		不安全的.
@@ -1572,7 +1572,7 @@ object DataReadMethod extends Enumeration with Serializable {
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class InputMetrics private[spark] () extends Serializable {
 	属性:
@@ -1598,7 +1598,7 @@ class InputMetrics private[spark] () extends Serializable {
 
 #### OutputMetrics
 
-```markdown
+```scala
 @DeveloperApi
 object DataWriteMethod extends Enumeration with Serializable {
 	介绍: 输出数据写出的方法,操作是线程不安全的.
@@ -1607,7 +1607,7 @@ object DataWriteMethod extends Enumeration with Serializable {
 }
 ```
 
-```markdown
+```scala
 @DeveloperApi
 class OutputMetrics private[spark] () extends Serializable {
 	介绍: 累加器集合,代表写出到外部系统的度量参数
@@ -1631,7 +1631,7 @@ class OutputMetrics private[spark] () extends Serializable {
 
 #### ProcfsMetricsGetter
 
-```markdown
+```scala
 private[spark] case class ProcfsMetrics(jvmVmemTotal: Long,jvmRSSTotal: Long,
     pythonVmemTotal: Long,pythonRSSTotal: Long,
     otherVmemTotal: Long,otherRSSTotal: Long)
@@ -1650,7 +1650,7 @@ private[spark] object ProcfsMetricsGetter
 	#name @pTreeInfo = new ProcfsMetricsGetter	进程文件系统树状信息
 ```
 
-```markdown
+```scala
 private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/"){
 	关系: father --> Logging
 	构造器属性:
@@ -1808,7 +1808,7 @@ private[spark] class ProcfsMetricsGetter(procfsDir: String = "/proc/"){
 
 #### ShuffleReadMetrics
 
-```markdown
+```scala
 @DeveloperApi
 class ShuffleReadMetrics private[spark] () extends Serializable {
 	介绍: 累加器集合,表示shuffle读取数据的的度量参数.这些操作是线程不安全的.
@@ -1894,7 +1894,7 @@ class ShuffleReadMetrics private[spark] () extends Serializable {
 }
 ```
 
-```markdown
+```scala
 private[spark] class TempShuffleReadMetrics {
 	关系: father --> ShuffleReadMetricsReporter
 	功能: 临时shuffle读取度量器,用于收集每个shuffle依赖的读取计量参数,所有的临时shuffle读取计量参数都会在最	后累积到最终的@ShuffleReadMetrics中
@@ -1929,7 +1929,7 @@ private[spark] class TempShuffleReadMetrics {
 
 #### ShuffleWriteMetrics
 
-```markdown
+```scala
 @DeveloperApi
 class ShuffleWriteMetrics private[spark] () extends ShuffleWriteMetricsReporter with Serializable {
 	介绍: 累加器集合,表示shuffle写出数据的度量参数,操作是线程不安全的
@@ -1966,7 +1966,7 @@ class ShuffleWriteMetrics private[spark] () extends ShuffleWriteMetricsReporter 
 
 #### TaskMetrics
 
-```markdown
+```scala
 @DeveloperApi
 class TaskMetrics private[spark] () extends Serializable {
 	介绍: 任务度量器，任务执行期间用于对一个任务的计量
@@ -2145,7 +2145,7 @@ class TaskMetrics private[spark] () extends Serializable {
 }
 ```
 
-```markdown
+```scala
 private[spark] object TaskMetrics extends Logging {
 	操作集:
 	def empty: TaskMetrics 
