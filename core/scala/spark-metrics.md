@@ -36,13 +36,13 @@
 
     #### ConsoleSink
 
-    ```markdown
+    ```scala
 private[spark] class ConsoleSink(val property: Properties, val registry: MetricRegistry,
         securityMgr: SecurityManager){
 	关系: father --> Sink
         构造器属性:
     	property	属性
-        	registry	度量注册器
+        registry	度量注册器
     	securityMgr	安全管理器
         属性:
     #name @CONSOLE_DEFAULT_PERIOD=10 		控制台默认周期
@@ -80,7 +80,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### CsvSink
     
-    ```markdown
+    ```scala
     private[spark] class CsvSink(val property: Properties, val registry: MetricRegistry,
         securityMgr: SecurityManager){
     	关系: father --> Sink
@@ -127,7 +127,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### GraphiteSink
     
-    ```markdown
+    ```scala
     private[spark] class GraphiteSink(val property: Properties, val registry: MetricRegistry,
         securityMgr: SecurityManager){
     	关系: father --> Sink
@@ -187,11 +187,9 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     }
     ```
     
-    
-    
     #### JmxSink
     
-    ```markdown
+    ```scala
     private[spark] class JmxSink(val property: Properties, val registry: MetricRegistry,
         securityMgr: SecurityManager){
     	关系: father --> 	Sink
@@ -216,7 +214,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### MetricsServlet
     
-    ```markdown
+    ```scala
     private[spark] class MetricsServlet(val property: Properties,val registry: MetricRegistry,
     	securityMgr: SecurityManager){
     	关系: father --> Sink
@@ -254,7 +252,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### PrometheusServlet
     
-    ```markdown
+    ```scala
     private[spark] class PrometheusServlet(val property: Properties,val registry: MetricRegistry,
         securityMgr: SecurityManager){
     	关系: father --> Sink
@@ -338,7 +336,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### Sink
     
-    ```markdown
+    ```scala
     private[spark] trait Sink {
     	操作集:
     	def start(): Unit	功能: 开始
@@ -349,7 +347,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### Slf4jSink
     
-    ```markdown
+    ```scala
     private[spark] class Slf4jSink(val property: Properties,val registry: MetricRegistry,
         securityMgr: SecurityManager){
     	关系: father --> Sink
@@ -388,7 +386,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     
     #### StatsdReporter
     
-    ```markdown
+    ```scala
     private[spark] object StatsdMetricType{
     	属性:
     	#name @COUNTER = "c"	计数器
@@ -398,7 +396,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     }
     ```
     
-    ```markdown
+    ```scala
     private[spark] class StatsdReporter(registry: MetricRegistry,host: String = "127.0.0.1",
         port: Int = 8125,prefix: String = "",filter: MetricFilter = MetricFilter.ALL,
         rateUnit: TimeUnit = TimeUnit.SECONDS,durationUnit: TimeUnit = TimeUnit.MILLISECONDS){
@@ -489,11 +487,9 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     }
     ```
     
-    
-    
     #### StatsdSink
     
-    ```markdown
+    ```scala
     private[spark] object StatsdSink{
     	属性:
     	#name @STATSD_KEY_HOST="host"	规定host的key
@@ -509,7 +505,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
     }
     ```
     
-    ```markdown
+    ```scala
     private[spark] class StatsdSink(val property: Properties,val registry: MetricRegistry,
         securityMgr: SecurityManager){
     	关系: father --> Sink
@@ -574,7 +570,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
    	需要将累加器的范围严格的限定在@LongAccumulator和@DoubleAccumulator，这些累加器是当前建立在数字统计的累加器。且去除了@CollectionAccumulator，原因它是一个value的列表很难去汇报给度量系统。
    ```
    
-   ```markdown
+   ```scala
    private[spark] class AccumulatorSource{
    	关系: father --> Source
    	属性:
@@ -598,32 +594,30 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
 }
    ```
    
-   ```markdown
+   ```scala
    @Experimental
    class LongAccumulatorSource extends AccumulatorSource
    ```
    
-   ```markdown
+   ```scala
    @Experimental
    class DoubleAccumulatorSource extends AccumulatorSource
    ```
    
-   ```markdown
+   ```scala
    @Experimental
    object LongAccumulatorSource {
    	介绍: 这是给@LongAccumulators 的度量资源。累加器只能在驱动器上有效。所有度量数据由驱动器汇报。
    	操作集:
+       def register(sc: SparkContext, accumulators: Map[String, LongAccumulator]): Unit 
+       功能: 注册累加器到度量系统中
+   	val source = new LongAccumulatorSource
+          source.register(accumulators)
+       sc.env.metricsSystem.registerSource(source)
+      }
    ```
 
-	def register(sc: SparkContext, accumulators: Map[String, LongAccumulator]): Unit 
-   	功能: 注册累加器到度量系统中
-	val source = new LongAccumulatorSource
-       source.register(accumulators)
-    sc.env.metricsSystem.registerSource(source)
-   }
-   ```
-   
-   ```markdown
+   ```scala
    @Experimental
    object DoubleAccumulatorSource {
    	def register(sc: SparkContext, accumulators: Map[String, DoubleAccumulator]): Unit
@@ -636,8 +630,9 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
 
    #### JVMCPUSource
 
-   ```markdown
+```scala
    private[spark] class JVMCPUSource{
+
 	关系: father --> Source
    	属性:
    	#name @sourceName="JVMCPU" 	资源名称
@@ -654,15 +649,14 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
              }
            }
          })    
-     功能: 登记CPU及其使用量
+     功能 登记CPU及其使用量
    }
-   ```
 
-   
+```
 
-   #### JvmSource
+  #### JvmSource
 
-   ```markdown
+   ```scala
    private[spark] class JvmSource {
    	关系: father --> Source
    	属性:
@@ -682,7 +676,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
 
    #### Source
 
-   ```markdown
+   ```scala
    private[spark] trait Source {
    	操作集:
    	def sourceName: String
@@ -694,14 +688,14 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
 
    #### StaticSources
 
-```markdown
+```scala
    private[spark] object StaticSources {
    	属性:
    	#name @allSources=Seq(CodegenMetrics, HiveCatalogMetrics)	所有资源列表
    }
 ```
 
-   ```markdown
+   ```scala
    object CodegenMetrics { 
    	关系: father -->soruce
    	介绍: 编译度量器
@@ -717,7 +711,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
    }
    ```
 
-   ```markdown
+   ```scala
    object HiveCatalogMetrics{
    	关系: father -->soruce
    	介绍: hive 外部目录度量
@@ -764,7 +758,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
 ---
 #### ExecutorMetricType
 
-```markdown
+```scala
 sealed trait ExecutorMetricType {
 	介绍: 执行器度量器类型，存储在@ExecutorMetrics的执行器等级的度量器
 	操作集:
@@ -776,7 +770,7 @@ sealed trait ExecutorMetricType {
 }
 ```
 
-```markdown
+```scala
 sealed trait SingleValueExecutorMetricType{
 	关系: father --> ExecutorMetricType
 	介绍: 单值执行度量器类型
@@ -796,7 +790,7 @@ sealed trait SingleValueExecutorMetricType{
 }
 ```
 
-```markdown
+```scala
 private[spark] abstract class MemoryManagerExecutorMetricType(f: MemoryManager => Long){
 	关系: father --> SingleValueExecutorMetricType
 	构造器:
@@ -808,7 +802,7 @@ private[spark] abstract class MemoryManagerExecutorMetricType(f: MemoryManager =
 }
 ```
 
-```markdown
+```scala
 private[spark] abstract class MBeanExecutorMetricType(mBeanName: String){
 	关系: father --> SingleValueExecutorMetricType
 	属性:
@@ -822,7 +816,7 @@ private[spark] abstract class MBeanExecutorMetricType(mBeanName: String){
 }
 ```
 
-```markdown
+```scala
 case object JVMHeapMemory {
 	关系: father --> SingleValueExecutorMetricType
 	操作集:
@@ -839,7 +833,7 @@ case object JVMOffHeapMemory{
 }
 ```
 
-```markdown
+```scala
 case object ProcessTreeMetrics{
 	介绍: 进程树
     关系: father --> ExecutorMetricType
@@ -897,7 +891,7 @@ case object MappedPoolMemory extends MBeanExecutorMetricType(
   "java.nio:type=BufferPool,name=mapped")
  介绍: 映射内存池度量
 ```
-```markdown
+```scala
 case object GarbageCollectionMetrics{
 	关系: father --> ExecutorMetricType
 		sibling --> Logging
@@ -934,7 +928,7 @@ case object GarbageCollectionMetrics{
     val= gcMetrics
 }
 ```
-```markdown
+```scala
 private[spark] object ExecutorMetricType {
 	属性:
 	#name @metricGetters #type @IndexedSeq 		度量获取列表
@@ -967,7 +961,7 @@ private[spark] object ExecutorMetricType {
 ```
 #### MetricsConfig
 
-```markdown
+```scala
 private[spark] class MetricsConfig(conf: SparkConf){
 	关系: father --> Logging
 	构造器属性:
@@ -1053,7 +1047,7 @@ private[spark] class MetricsConfig(conf: SparkConf){
 		name : 名称
 		options	: 代表source/sink 属性
 ```
-```markdown
+```scala
 private[spark] class MetricsSystem private (val instance: String,conf: SparkConf,
     securityMgr: SecurityManager){
  	关系: father --> Logging
@@ -1136,7 +1130,6 @@ private[spark] class MetricsSystem private (val instance: String,conf: SparkConf
         val instConfig = metricsConfig.getInstance(instance)
         val sinkConfigs = metricsConfig.subProperties(instConfig, MetricsSystem.SINK_REGEX)
  	2. 注册sinks
- 	```scala
       sinkConfigs.foreach { kv =>
       val classPath = kv._2.getProperty("class")
       if (null != classPath) {
@@ -1166,10 +1159,9 @@ private[spark] class MetricsSystem private (val instance: String,conf: SparkConf
             throw e
         }
       }
-    ```
  }
 ```
-```markdown
+```scala
 private[spark] object MetricsSystem{
 	属性:
 	#name @SINK_REGEX= "^sink\\.(.+)\\.(.+)".r	sink正则
@@ -1188,7 +1180,7 @@ private[spark] object MetricsSystem{
 }
 ```
 
-```markdown
+```scala
 private[spark] object MetricsSystemInstances{
 	介绍: 度量系统实例
 	属性:
