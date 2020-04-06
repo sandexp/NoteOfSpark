@@ -599,17 +599,17 @@
        		2. 操作类
                	void writeSortedFile(boolean isLastFile)
                	功能: 对内存内部数据进行排序，并将排序好的数据写出成磁盘上的文件
-               	输入参数: isLastFile=true表示已经是最后一个文件，需要形成一个最终的输出文件。写出的字节			数量应统计到shuffle 溢写计数中，而不是shuffle写计数中。
+               	输入参数: isLastFile=true表示已经是最后一个文件，需要形成一个最终的输出文件。写出的字节数量应统计到shuffle 溢写计数中，而不是shuffle写计数中。
                	+ 处理写出度量器@writeMetrics与isLastFile标志的关系
-               		1. 若是最后一个文件，这个文件不会去溢写，直接使用本类的度量器@writeMetrics统计即				可。
-               		2. 不是最后一个文件的话，则需要新设置一个度量器@ShuffleWriteMetrics，去统计这个溢				写部分的字节数量
+               		1. 若是最后一个文件，这个文件不会去溢写，直接使用本类的度量器@writeMetrics统计即可。
+               		2. 不是最后一个文件的话，则需要新设置一个度量器@ShuffleWriteMetrics，去统计这个溢写部分的字节数量
                	+ 写缓冲区的设置
-               		直接写小文件到磁盘上是非常低效的，所以需要设置一个缓冲数组。但是这个数组没有必要一定				去容纳一条记录。写缓冲区大小=@diskWriteBufferSize
+               		直接写小文件到磁盘上是非常低效的，所以需要设置一个缓冲数组。但是这个数组没有必要一定去容纳一条记录。写缓冲区大小=@diskWriteBufferSize
                	+ 创建临时shuffle块,并创建数据块元数据信息@SpillInfo
                		由于输出会在shuffle期间读取,它的压缩(compression codec)必须要受到
-               		spark.shuffle.compress的控制,而不是spark.shuffle.spill.compress。因此此处需要获				取临时shuffle块。
+               		spark.shuffle.compress的控制,而不是spark.shuffle.spill.compress。因此此处需要获取临时shuffle块。
                	+ 获取一个序列化实例@SerializerInstance
-               		主要是用来构造磁盘块写出器@DiskBlockObjectWriter 。事实上写路径使用的不是这个序列			化对象(原因是底层调用了write()这个输出流中的方法)，但是磁盘块写出器中仍然是调用了它，所			有这里使用一个不可写的实例，详情参考@DummySerializerInstance。
+               		主要是用来构造磁盘块写出器@DiskBlockObjectWriter 。事实上写路径使用的不是这个序列化对象(原因是底层调用了write()这个输出流中的方法)，但是磁盘块写出器中仍然是调用了它，所有这里使用一个不可写的实例，详情参考@DummySerializerInstance。
                	+ 获取排序后的记录，获取记录的分区号，
                		如果分区号@partition不是当前指针所指@currentPartition
                		更新当前指针@currentPartition=@partition
@@ -619,7 +619,7 @@
                		3. 使用任务内存管理器@taskMemoryManager根据记录地址获取页内偏移量
                		4. 设置记录读取位置@recordReadPosition=页内偏移量@recordOffsetInPage+uao_size
                			(uao_size为操作系统默认偏移量)
-               		5. 将从记录读取位置@recordReadPosition开始的min(业内剩余数据@dataRemaining，块写				出缓冲大小@diskWriteBufferSize)以内存拷贝的方式到写出缓冲@writeBuffer。
+               		5. 将从记录读取位置@recordReadPosition开始的min(业内剩余数据@dataRemaining，块写出缓冲大小@diskWriteBufferSize)以内存拷贝的方式到写出缓冲@writeBuffer。
                		6. 将缓冲区的数据写出
                		7. 更新页内数据剩余量@dataRemaining 和记录读取指针@recordReadPosition+=数据拷贝量
                		
@@ -763,7 +763,7 @@
     		
     		void write(scala.collection.Iterator<Product2<K, V>> records)
     		功能: 写出记录
-    		+ 将所有的记录插入到本类的外部排序器中@sorter,插入完毕使用closeAndWriteOutput()关闭排序器并将记			录写出，设置写出标记@success为true
+    		+ 将所有的记录插入到本类的外部排序器中@sorter,插入完毕使用closeAndWriteOutput()关闭排序器并将记录写出，设置写出标记@success为true
     		+ 作为该操作的首尾，一定需要将外部排序器的记录删除完毕。
     		
     		void open()
@@ -777,8 +777,8 @@
     		+ 重设序列化缓冲@serBuffer，序列化输出流@serOutputStream
     		+ 从外部排序器@sorter中获取溢写文件块的元数据信息#name @spills #type @SpillInfo[]
     		并重置外部排序器
-    		+ 对元数据信息@spills进行多路归并@mergeSpills(spills) [使用最快的方式合并这些文件的元数据信息和			IO压缩码(compression codec)]
-    		+ 处理完成,检索元数据信息，当元数据信息所表示的文件存在且没有被删除时，则表示溢写该文件时出错了，			导致内存没有释放掉，会反映到日志信息上。
+    		+ 对元数据信息@spills进行多路归并@mergeSpills(spills) [使用最快的方式合并这些文件的元数据信息和IO压缩码(compression codec)]
+    		+ 处理完成,检索元数据信息，当元数据信息所表示的文件存在且没有被删除时，则表示溢写该文件时出错了，导致内存没有释放掉，会反映到日志信息上。
     		+ 设置map侧的状态@mapStatus=MapStatus$.MODULE$.apply(blockManager.shuffleServerId(), 				partitionLengths, mapId)
     			详情参照scala.MapStatus
     		
@@ -802,8 +802,7 @@
     		+ 数据块元数据信息列表长度=1
     			获取单文件shuffle溢写输出器@SingleSpillShuffleMapOutputWriter #name
                 @maybeSingleFileWriter，
-                如果这个值非null，则使用单文件shuffle溢写输出器的方式，将该部分的数据块进行转化#method 
-                @transferMapSpillFile(File f,long[] partitionLengths)
+                如果这个值非null，则使用单文件shuffle溢写输出器的方式，将该部分的数据块进行转化#method @transferMapSpillFile(File f,long[] partitionLengths)
                 如果这个值为null，则使用@mergeSpillsUsingStandardWriter(spills)的方式进行转化
              + 数据块元数据信息列表中>1
              	@mergeSpillsUsingStandardWriter(spills)
@@ -828,18 +827,17 @@
              + 归并完成，提交所有分区@commitAllPartitions()
              + 如果中途出现异常，mapWriter会弃读
              
-             void mergeSpillsWithFileStream(SpillInfo[] spills,ShuffleMapOutputWriter mapWriter,
-         		 @Nullable CompressionCodec compressionCodec)
+             void mergeSpillsWithFileStream(SpillInfo[] spills,ShuffleMapOutputWriter mapWriter,@Nullable CompressionCodec compressionCodec)
     		功能: 文件流归并
     		+ 获取分区器的分区数量
     		+ 对每个数据块元数据@spills建立一个输入流
     		+ 获取shuffle分区写出器@writer #type @ShufflePartitionWriter 由此建立分区输出流
     		@partitionOutput #type @OutputStream，这个分区输出流首先需要携带上时间统计功能
     		@TimeTrackingOutputStream,其次需要向块管理器@blockManager 中毒序列化管理器
-    		@serializerManager() 申请一层shuffle加密的操作。如果你指定了compressionCodec的话，还需要对分		区输出进行一次压缩。
-    		+ 对于每个数据块元数据@spills,获取分区的溢写数量@partitionLengthInSpill，如果这个数大于0，则要		获取长度为分区溢写数量@partitionLengthInSpill的输入流，并对文件进行读取。当然这里需要根据加密以			及是否压缩采取如同上述的操作步骤，将输入流读取到的内容拷贝到输出流中。参照#class @ByteStreams
+    		@serializerManager() 申请一层shuffle加密的操作。如果你指定了compressionCodec的话，还需要对分区输出进行一次压缩。
+    		+ 对于每个数据块元数据@spills,获取分区的溢写数量@partitionLengthInSpill，如果这个数大于0，则要获取长度为分区溢写数量@partitionLengthInSpill的输入流，并对文件进行读取。当然这里需要根据加密以及是否压缩采取如同上述的操作步骤，将输入流读取到的内容拷贝到输出流中。参照#class @ByteStreams
     		#method @copy
-    		+ 最后关闭分区输出流，使用@writer 统计写出的字节数,使用写出度量器@writeMetrics将值累加到内部累			加器中。
+    		+ 最后关闭分区输出流，使用@writer 统计写出的字节数,使用写出度量器@writeMetrics将值累加到内部累加器中。
     		+ 关闭输入流
     		
     		void mergeSpillsWithTransferTo(SpillInfo[] spills,ShuffleMapOutputWriter mapWriter)
