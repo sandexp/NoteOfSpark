@@ -8,7 +8,7 @@
 
    1. #class @LocalDiskShuffleDataIO
 
-      ```markdown
+      ```scala
       本地磁盘数据洗牌IO
       ADT LocalDiskShuffleDataIO{
       	数据元素: 
@@ -27,7 +27,7 @@
 
    2. #class @LocalDiskShuffleDriverComponents
 
-      ```markdown
+      ```java
       本地磁盘洗牌操作驱动组件
       ADT LocalDiskShuffleDriverComponents{
       	数据元素:
@@ -46,7 +46,7 @@
 
    3. #class @LocalDiskShuffleExecutorComponents
 
-      ```markdown
+      ```java
       本地磁盘洗牌操作执行组件
       ADT LocalDiskShuffleExecutorComponents{
       	数据元素：
@@ -82,7 +82,7 @@
 
    4. #class @LocalDiskSingleSpillMapOutputWriter
 
-      ```markdown
+      ```java
       本地磁盘map形式单溢写输出器
       ADT LocalDiskSingleSpillMapOutputWriter{
       	数据元素：
@@ -100,14 +100,13 @@
       		+ 使用shuffle 块映射器，根据shuffleID，mapID获取输出文件
       		+ 根据获得到的文件新建一个临时的文件对象（这个对象路径=源文件对象+随机UUID）
       		+ 将给定需要溢写的文件@mapSpillFile重名名为临时文件
-      		+ 使用块管理器@blockResolver 写入文件并且提交#class @IndexShuffleBlockResolver #method
-      		@writeIndexFileAndCommit ,这个根据的是临时文件的名称。
+      		+ 使用块管理器@blockResolver 写入文件并且提交#class @IndexShuffleBlockResolver #method @writeIndexFileAndCommit ,这个根据的是临时文件的名称。
       }
       ```
-
+      
    5. #class @LocalDiskShuffleMapOutputWriter
 
-      ```markdown
+      ```java
       ADT LocalDiskShuffleMapOutputWriter{
       	数据元素:
       		1. 日志管理器 #name @log #type $Logger [final]
@@ -152,27 +151,31 @@
             	@bytesWrittenToMergedFile
             	+ 关闭相关的输出流 #method @cleanUp()
       		+ 暂时获取临时输出文件对象@outputTempFile
-      		+ 使用块映射器@blockResolver根据当前shufflID，mapID，分区长度列表@partitionLengths以及临			时存储的暂存文件对象，写出到指定文件块中#class @IndexShuffleBlockResolver 
+      		+ 使用块映射器@blockResolver根据当前shufflID，mapID，分区长度列表@partitionLengths以及临时存储的暂存文件对象，写出到指定文件块中#class @IndexShuffleBlockResolver 
       		#method @writeIndexFileAndCommit
+                  
       		void abort(Throwable error)
       		功能: 放弃写出
       		+ 先关闭相关输出流@cleanUp()
-      		void cleanUp() 
+      		
+              void cleanUp() 
       		功能：关闭相关输出流
       		+ 关闭输出文件缓冲流@outputBufferedFileStream输出文件通道@outputFileChannel
       		关闭输出文件流@outputFileStream
-      		void initStream()
+      		
+              void initStream()
       		功能: 初始化流
       		初始化输出文件流@outputFileStream，初始化输出文件缓冲流@outputBufferedFileStream
-      		void initChannel()
-      		功能: 初始化通道
+      		
+              void initChannel()
+   		功能: 初始化通道
       		初始化输出文件通道@outputFileChannel，其中模式为可追加模式
-      }
+   }
       ```
-
+      
       #subclass @LocalDiskShufflePartitionWriter
-
-      ```markdown
+      
+      ```scala
       本地磁盘shuffle分区写出器
       ADT LocalDiskShufflePartitionWriter{
       	数据元素：
@@ -198,14 +201,14 @@
                Optional<WritableByteChannelWrapper> openChannelWrapper()
         		功能: 开启通道交换写出方式
         		操作条件: 流读取方式必须关闭@partStream
-        		+ 初始化通道
+     		+ 初始化通道
         		+ 根据分区号@partitionId获取通道分区写出器@partChannel，并返回       
-      }
+   }
       ```
-
+      
       #subclass @PartitionWriterStream
-
-      ```markdown
+      
+      ```scala
       分区写出流
       ADT PartitionWriterStream{
       	数据元素：
@@ -229,14 +232,14 @@
       		功能: 写出单字节
       		+ 检查是否处于关流状态@verifyNotClosed 没有关闭则写出一个字节，并更新写出计数器@count+=1
       		void write(byte[] buf, int pos, int length)
-      		功能：写出多个字节
+   		功能：写出多个字节
       		+ 检查是否处于关流状态，没有关流则@写出length个字节，并更新计数器@count+=length
-      }
+   }
       ```
-
+      
       #subclass @PartitionWriterChannel
-
-      ```markdown
+      
+      ```scala
       ADT PartitionWriterChannel{
       	数据元素:
       		1. 分区编号 #name @partitionId #type $int [final]
@@ -277,7 +280,7 @@
 
    + **抽象数据模型**
 
-   ```markdown
+   ```java
    ADT SpillInfo{ [final]
    	数据元素:
            1. 分区长度列表#name @partitionLengths $type @long[] [final]
@@ -307,7 +310,7 @@
 
     抽象数据模型
 
-    ```markdown
+    ```scala
     ADT BypassMergeSortShuffleWriter{
     	数据元素:
     		1. 日志管理器#name @logger $type @Logger  final
@@ -407,7 +410,7 @@
     这就意味着最大的可分配容量为2^27=128M。考虑到页号总容量=128 * 2^13= 1 TB，这是一个任务最多可以分配的RAM空间。
     ```
 
-    ```markdown
+    ```scala
     ADT PackedRecordPointer{ [final]
     	数据元素:
     		1. 常量  单页最大容量@MAXIMUM_PAGE_SIZE_BYTES=1 << 27 (128M)
@@ -437,7 +440,7 @@
 
 4.  #class @ShuffleSortDataFormat
 
-    ```markdown
+    ```scala
     ADT ShuffleSortDataFormat{
     	数据元素:
     		缓冲数组#name @buffer $type @LongArray  [final]
@@ -467,7 +470,7 @@
 
     1.  内部排序器
 
-        ```markdown
+        ```scala
         ADT ShuffleInMemorySorter{
         	数据元素:
         		1. 常量 排序比较逻辑@SORT_COMPARATOR
@@ -525,7 +528,7 @@
 
         #subclass @ShuffleSorterIterator
 
-        ```markdown
+        ```scala
         ADT ShuffleSorterIterator{
         	数据元素:
         		1. 记录指针数组@pointerArray final
@@ -556,7 +559,7 @@
        	与@org.apache.spark.util.collection.ExternalSorter不同，这个排序器不会合并分区文件。相反的，合并是执行在@UnsafeShuffleWriter 上，这个类使用了特定的合并程序从而规避了使用序列化/反序列化器。
        ```
     
-       ```markdown
+       ```scala
        ADT ShuffleExternalSorter{ 
        	father --> 内存消费者#class @MemoryConsumer
        	数据元素:
@@ -697,7 +700,7 @@
     
 6.  #class @UnsafeShuffleWriter<K,V>
 
-    ```markdown
+    ```scala
     ADT UnsafeShuffleWriter{
     	数据元素:
     		1. 日志处理器 #name @logger #type @Logger
@@ -860,7 +863,7 @@
     
     #subclass @StreamFallbackChannelWrapper
     
-    ```markdown
+    ```scala
     ADT StreamFallbackChannelWrapper{
     	数据元素
     		1. 可写字节通道 #name @channel #type @WritableByteChannel

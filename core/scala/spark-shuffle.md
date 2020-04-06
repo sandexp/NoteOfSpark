@@ -29,7 +29,7 @@
 
    #### SortShuffleManager
 
-   ```markdown
+   ```scala
    private[spark] class SortShuffleManager(conf: SparkConf){
    	关系: father --> ShuffleManager
    		sibling --> Logging
@@ -129,7 +129,7 @@
    }
    ```
 
-   ```markdown
+   ```scala
    private[spark] object SortShuffleManager{
    	关系: father --> Logging
    	属性:
@@ -169,7 +169,7 @@
    }
    ```
 
-   ```markdown
+   ```scala
    private[spark] class SerializedShuffleHandle[K, V] (
      shuffleId: Int,dependency: ShuffleDependency[K, V, V]){
    	关系: father --> BaseShuffleHandle(shuffleId, dependency)
@@ -188,7 +188,7 @@
 
    #### SortShuffleWriter
 
-   ```markdown
+   ```scala
    private[spark] class SortShuffleWriter[K, V, C] (
        shuffleBlockResolver: IndexShuffleBlockResolver,
        handle: BaseShuffleHandle[K, V, C],mapId: Long,
@@ -249,7 +249,7 @@
    }
    ```
 
-   ```markdown
+   ```scala
    private[spark] object SortShuffleWriter{
    	def shouldBypassMergeSort(conf: SparkConf, dep: ShuffleDependency[_, _, _]): Boolean
    	功能: 确定是否需要合并排序
@@ -271,7 +271,7 @@
 	基本的shuffle处理器，仅仅处理登记shuffle的属性
 ```
 
-```markdown
+```scala
 private[spark] class BaseShuffleHandle[K, V, C] (shuffleId: Int,
     val dependency: ShuffleDependency[K, V, C]) {
 	关系: father -->  ShuffleHandle(shuffleId) 
@@ -283,7 +283,7 @@ private[spark] class BaseShuffleHandle[K, V, C] (shuffleId: Int,
 
 #### BlockStoreShuffleReader
 
-```markdown
+```scala
 private[spark] class BlockStoreShuffleReader[K, C] (
     handle: BaseShuffleHandle[K, _, C],
     blocksByAddress: Iterator[(BlockManagerId, Seq[(BlockId, Long, Int)])],
@@ -337,7 +337,7 @@ private[spark] class BlockStoreShuffleReader[K, C] (
 	为了阻止用户代码隐藏获取失败，在构造器中调用@TaskContext.setFetchFailed()。这意味着在创建出它之后必须要立马抛出异常。
 ```
 
-```markdown
+```scala
 private[spark] class FetchFailedException(bmAddress: BlockManagerId,shuffleId: Int,
     mapId: Long,mapIndex: Int,reduceId: Int,message: String,cause: Throwable = null){
 	关系: father --> Exception(message, cause)
@@ -365,7 +365,7 @@ private[spark] class FetchFailedException(bmAddress: BlockManagerId,shuffleId: I
 }
 ```
 
-```markdown
+```scala
 private[spark] class MetadataFetchFailedException(shuffleId: Int,reduceId: Int,message: 
 ){
 	介绍: 获取元数据失败
@@ -387,7 +387,7 @@ private[spark] class MetadataFetchFailedException(shuffleId: Int,reduceId: Int,m
 	#method @getSortBasedShuffleBlockData()同步保存。
 ```
 
-```markdown
+```scala
 private[spark] class IndexShuffleBlockResolver(conf: SparkConf,_blockManager: BlockManager = null){
 	关系: father --> ShuffleBlockResolver
 		sibling --> Logging
@@ -553,7 +553,7 @@ private[spark] class IndexShuffleBlockResolver(conf: SparkConf,_blockManager: Bl
 }
 ```
 
-```markdown
+```scala
 private[spark] object IndexShuffleBlockResolver {
 	属性: 
 	#name @NOOP_REDUCE_ID = 0	与磁盘操作中没有操作的reduce ID
@@ -564,7 +564,7 @@ private[spark] object IndexShuffleBlockResolver {
 
 #### Metrics
 
-```markdown
+```scala
 private[spark] trait ShuffleReadMetricsReporter {
 	介绍: 用于汇报shuffle读取的度量数据，对于每个shuffle，这个接口假定所有方法都是单线程调用。
 		所有方法都有对spark的额外可见性@
@@ -592,7 +592,7 @@ private[spark] trait ShuffleReadMetricsReporter {
 }
 ```
 
-```markdown
+```scala
 private[spark] trait ShuffleWriteMetricsReporter {
 	  
 	 介绍: shuffle的写度量器，接口假定所有操作都是单线程的。
@@ -616,7 +616,7 @@ private[spark] trait ShuffleWriteMetricsReporter {
 
 #### ShuffleBlockResolver
 
-```markdown
+```scala
 trait ShuffleBlockResolver {
 	介绍:
 	实现这个特征需要理解如何去定位一个逻辑数据块标志对应的数据块。可以使用文件或者文件片段去定位文件块。用于
@@ -634,7 +634,7 @@ trait ShuffleBlockResolver {
 
 #### ShuffleDataIOUtils
 
-```markdown
+```scala
 private[spark] object ShuffleDataIOUtils {
 	属性：
 	#name @SHUFFLE_SPARK_CONF_PREFIX = "spark.shuffle.plugin.__config__."
@@ -654,7 +654,7 @@ private[spark] object ShuffleDataIOUtils {
 
 #### ShuffleHandle
 
-```markdown
+```scala
 @DeveloperApi
 abstract class ShuffleHandle(val shuffleId: Int){
 	关系: father --> Serializable
@@ -670,7 +670,7 @@ abstract class ShuffleHandle(val shuffleId: Int){
 	注意: 这个会被sparkEnv实例化，构造器能够接受@SparkConf类型数据和一个参数@isDriver(是否为驱动器标志)
 ```
 
-```markdown
+```scala
 private[spark] trait ShuffleManager {
 	操作集:
 	def registerShuffle[K, V, C](shuffleId: Int,
@@ -685,9 +685,7 @@ private[spark] trait ShuffleManager {
       	context: TaskContext,metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C]
 	功能: 获取获取一个返回分区的聚合结果，在执行器的reduce阶段调用
 	
-	def getReaderForOneMapper[K, C](handle: ShuffleHandle,mapIndex: Int,startPartition: Int,
-      	endPartition: Int,context: TaskContext,metrics: ShuffleReadMetricsReporter)
-      	: ShuffleReader[K, C]
+	def getReaderForOneMapper[K, C](handle: ShuffleHandle,mapIndex: Int,startPartition: Int,endPartition: Int,context: TaskContext,metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C]
 	功能: 获取指定map在reduce阶段指定区域的聚合结果，在执行器reduce阶段调用
 	
 	def unregisterShuffle(shuffleId: Int): Boolean
@@ -703,7 +701,7 @@ private[spark] trait ShuffleManager {
 
 #### ShufflePartitionPairsWriter
 
-```markdown
+```scala
 private[spark] class ShufflePartitionPairsWriter(
     partitionWriter: ShufflePartitionWriter,
     serializerManager: SerializerManager,
@@ -731,7 +729,6 @@ private[spark] class ShufflePartitionPairsWriter(
 	
 	def open(): Unit
 	功能: 打开流(partitionStream,timeTrackingStream,wrappedStream,objOut)
-	```scala
 	try {
       partitionStream = partitionWriter.openStream
       timeTrackingStream = new TimeTrackingOutputStream(writeMetrics, partitionStream)
@@ -799,7 +796,7 @@ private[spark] class ShufflePartitionPairsWriter(
 
 #### ShuffleReader
 
-```markdown
+```scala
 private[spark] trait ShuffleReader[K, C] {
 	介绍: 从mapper中读取记录放入reduce中
 	操作集:
@@ -813,7 +810,7 @@ private[spark] trait ShuffleReader[K, C] {
 
 #### ShuffleWriteProcessor
 
-```markdown
+```scala
 private[spark] class ShuffleWriteProcessor{
 	关系: father --> Serializable
 	sibling --> Logging
@@ -843,7 +840,7 @@ private[spark] class ShuffleWriteProcessor{
 
 #### ShuffleWriter
 
-```markdown
+```scala
 private[spark] abstract class ShuffleWriter[K, V] {
 	介绍: 写入记录到shuffle系统(在map任务中)
 	操作集:
