@@ -27,7 +27,7 @@
    	打开的块使用"一对一"的策略注册。意味着每个运输层的块(chunk)对等于一个spark-level 的shuffle块。
    ```
 
-   ```markdown
+   ```scala
    class NettyBlockRpcServer(appId: String,serializer: Serializer,blockManager: BlockDataManager){
    	关系: father --> RpcHandler
    		sibling --> Logging
@@ -129,10 +129,8 @@
    介绍: 这个类在一段时间内，使用netty去获取数据块
    ```
    
-   ```markdown
-   private[spark] class NettyBlockTransferService(conf: SparkConf,securityManager: SecurityManager,
-       bindAddress: String,override val hostName: String,_port: Int,numCores: Int,
-       driverEndPointRef: RpcEndpointRef = null){
+   ```scala
+   private[spark] class NettyBlockTransferService(conf: SparkConf,securityManager: SecurityManager,bindAddress: String,override val hostName: String,_port: Int,numCores: Int,driverEndPointRef: RpcEndpointRef = null){
    	关系: father --> BlockTransferService
        构造器参数:
        	conf	应用程序配置集
@@ -231,7 +229,7 @@
    			client.sendRpc(new UploadBlock(appId, execId, blockId.name, metadata, 							array).toByteBuffer,callback)
    		
    		def fetchBlocks(host: String,port: Int,execId: String,blockIds: Array[String],
-         		listener: BlockFetchingListener,tempFileManager: DownloadFileManager): Unit
+   listener: BlockFetchingListener,tempFileManager: DownloadFileManager): Unit
    		功能: 获取数据块(服务端动作)
    		输入参数:
    			host 	主机名
@@ -241,7 +239,7 @@
    			listener	块获取监听器@BlockFetchingListener
    			tempFileManager	临时文件管理器(下载文件管理器)
    		操作逻辑:
-   		1. 获取一个块获取器@blockFetchStarter,但是这个获取器是可以重试的@RetryingBlockFetcher，其中内		部包含一个块获取器@BlockFetchStarter，具体设计参考#class @RetryingBlockFetcher
+   		1. 获取一个块获取器@blockFetchStarter,但是这个获取器是可以重试的@RetryingBlockFetcher，其中内部包含一个块获取器@BlockFetchStarter，具体设计参考#class @RetryingBlockFetcher
    			+ 获取客户端
    			val client = clientFactory.createClient(host, port)
    			+ 由客户端对接起一个一对一块获取处理器@OneForOneBlockFetcher
@@ -255,10 +253,11 @@
                	listener).start()
    			+ 尝试次数不大于0 (为了避免bug,全部按照为0处理)
    			blockFetchStarter.createAndStart(blockIds, listener)
+       
    		def shuffleMetrics(): MetricSet 
    		功能: shuffle度量器
    		操作条件: 服务器存在且客户端存在
-   		require(server != null && clientFactory != null, "NettyBlockTransferServer is not 					initialized")	
+   		require(server != null && clientFactory != null, "NettyBlockTransferServer is not initialized")	
    		操作逻辑: 新建一个度量器集合实例@MetricSet
    			度量器中需要设置客户端和服务端信息
    		        allMetrics.putAll(clientFactory.getAllMetrics.getMetrics)
@@ -273,10 +272,9 @@
    	这里提供了实用的转化方式，将Spark JVM(比如说: 执行器，驱动器，脱机shuffle服务)中的#class @SparkConf 转化为#class @TransportConf。且需要携带环境信息，比如说JVM分配的核心数量。
    ```
    
-   ```markdown
+   ```scala
    操作集:
-   	def fromSparkConf(_conf: SparkConf,module: String,numUsableCores: Int = 0,
-   		role: Option[String] = None): TransportConf
+   	def fromSparkConf(_conf: SparkConf,module: String,numUsableCores: Int = 0,role: Option[String] = None): TransportConf
    	功能: 使用SparkConf创建@TransportConf
    	输入参数: 
    		_conf 应用程序配置集
@@ -288,11 +286,10 @@
    	2. 获取线程数量@numThreads= NettyUtils.defaultNumThreads(numUsableCores)
    		指定默认线程配置，根据JVM分配的核心数，而非所有机器上的核心。
    	3. 根据获得的参数获取配置信息
-   	```scala
    	new TransportConf(module, new ConfigProvider {
          override def get(name: String): String = conf.get(name)
          override def get(name: String, defaultValue: String): String = conf.get(name, defaultValue)
-         override def getAll(): java.lang.Iterable[java.util.Map.Entry[String, String]] = {
+         override def getAll(): java.lang.Iterable[java.util.Map.Entry[String, String]] = 		{
            conf.getAll.toMap.asJava.entrySet()
          }
        })
@@ -301,7 +298,7 @@
 
 #### BlockDataManager
 
-```markdown
+```scala
 private[spark] trait BlockDataManager{
 	操作集:
 	def getHostLocalShuffleData(blockId: BlockId, dirs: Array[String]): ManagedBuffer
@@ -310,13 +307,11 @@ private[spark] trait BlockDataManager{
 	def getLocalBlockData(blockId: BlockId): ManagedBuffer
 	功能: 这个接口获取本地块数据,如果块找不到或是读取不成功则会抛出异常
     
-    def putBlockData(blockId: BlockId,data: ManagedBuffer,level: StorageLevel,
-      	classTag: ClassTag[_]): Boolean
+    def putBlockData(blockId: BlockId,data: ManagedBuffer,level: StorageLevel,classTag: ClassTag[_]): Boolean
 	功能: 使用给定的存储等级@level，本地存放数据块。
 		如果: 块存储成功返回true，存储失败或块已经存在则返回false
 	
-    def putBlockDataAsStream(blockId: BlockId,level: StorageLevel,
-      	classTag: ClassTag[_]): StreamCallbackWithID
+    def putBlockDataAsStream(blockId: BlockId,level: StorageLevel,classTag: ClassTag[_]): StreamCallbackWithID
 	功能: 存储将被作为流接受的指定数据块。
 		调用此方法的时候，数据块本身时不可以被获得的。它会被传递给返回的回调流@StreamCallbackWithID
 		
@@ -327,7 +322,7 @@ private[spark] trait BlockDataManager{
 
 #### BlockTransferService
 
-```markdown
+```scala
 private[spark] abstract class BlockTransferService{
 	关系: father --> BlockStoreClient
 		sibling --> Logging
@@ -343,18 +338,15 @@ private[spark] abstract class BlockTransferService{
 	def hostName: String
 	功能: 监听的主机名称，@init()之后才可以使用
 	
-	def uploadBlock(hostname: String,port: Int,execId: String,blockId: BlockId,
-      blockData: ManagedBuffer,level: StorageLevel,classTag: ClassTag[_]): Future[Unit]
+	def uploadBlock(hostname: String,port: Int,execId: String,blockId: BlockId,blockData: ManagedBuffer,level: StorageLevel,classTag: ClassTag[_]): Future[Unit]
 	功能: 上传单个数据块到远程节点,@init()之后可以使用
 	
-	def uploadBlockSync(hostname: String,port: Int,execId: String,blockId: BlockId,
-      blockData: ManagedBuffer,level: StorageLevel,classTag: ClassTag[_]): Unit
+	def uploadBlockSync(hostname: String,port: Int,execId: String,blockId: BlockId,blockData: ManagedBuffer,level: StorageLevel,classTag: ClassTag[_]): Unit
 	功能: 同步上传
 	    val future = uploadBlock(hostname, port, execId, blockId, blockData, level, classTag)
     	ThreadUtils.awaitResult(future, Duration.Inf)
 	
-	def fetchBlockSync(host: String,port: Int,execId: String,blockId: String,
-      	tempFileManager: DownloadFileManager): ManagedBuffer 
+	def fetchBlockSync(host: String,port: Int,execId: String,blockId: String,tempFileManager: DownloadFileManager): ManagedBuffer 
 	功能: 同步获取数据块，返回一个缓冲结构@ManagedBuffer
 	1. 使用#class @BlockStoreClient #method @fetchBlocks 获取块信息
 	2. 读取成功同步读取下一个数据块
