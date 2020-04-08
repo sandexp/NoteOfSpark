@@ -375,8 +375,7 @@ extends Logging {
     #name @onHeapUnrollMemoryMap = mutable.HashMap[Long, Long]()	堆上展开内存映射表
     	任务编号和内存量之间的映射关系
     #name @offHeapUnrollMemoryMap = mutable.HashMap[Long, Long]()	非堆模式下展开内存映射表
-    #name @unrollMemoryThreshold: Long = conf.get(STORAGE_UNROLL_MEMORY_THRESHOLD) 展开内存容量
-    	初始情况下内存量
+    #name @unrollMemoryThreshold: Long = conf.get(STORAGE_UNROLL_MEMORY_THRESHOLD) 展开内存容量初始情况下内存量
     操作集:
     def maxMemory: Long= memoryManager.maxOnHeapStorageMemory + memoryManager.maxOffHeapStorageMemory
     功能: 获取最大内存量
@@ -1848,7 +1847,7 @@ extends BlockDataManager with BlockEvictionHandler with Logging {
     	dirs	指定的目录列表
     val= shuffleManager.shuffleBlockResolver.getBlockData(blockId, Some(dirs))
     
-    def getLocalBlockData(blockId: BlockId): ManagedBuffe
+    def getLocalBlockData(blockId: BlockId): ManagedBuffer
     功能: 获取本地数据块信息
     val= if (blockId.isShuffle) {
       shuffleManager.shuffleBlockResolver.getBlockData(blockId)
@@ -3210,8 +3209,7 @@ extends Logging {
     val= driverEndpoint.askSync[Option[BlockLocationsAndStatus]](
         GetLocationsAndStatus(blockId, requesterHost))
     
-    def updateBlockInfo(blockManagerId: BlockManagerId,blockId: BlockId,storageLevel: StorageLevel,
-      memSize: Long,diskSize: Long): Boolean
+    def updateBlockInfo(blockManagerId: BlockManagerId,blockId: BlockId,storageLevel: StorageLevel,memSize: Long,diskSize: Long): Boolean
     功能: 更新块信息
     输入参数:
     	blockManagerId	块管理器标识符
@@ -3644,7 +3642,7 @@ extends IsolatedRpcEndpoint with Logging {
     0. 无法寻找当前块管理器标识符@blockManagerId 处理
     if (!blockManagerInfo.contains(blockManagerId)) {
       if (blockManagerId.isDriver && !isLocal) {
-\		// 在master端不注册块信息(除非是运行在本地模式下)
+		// 在master端不注册块信息(除非是运行在本地模式下)
         return true
       } else {
         return false
@@ -3852,11 +3850,11 @@ extends Logging{
       }
     }
     
-    def updateBlockInfo(
-      blockId: BlockId,
-      storageLevel: StorageLevel,
-      memSize: Long,
-      diskSize: Long): Unit 
+        def updateBlockInfo(
+          blockId: BlockId,
+          storageLevel: StorageLevel,
+          memSize: Long,
+          diskSize: Long): Unit 
     功能: 更新块信息
     1. 更新时间
     updateLastSeenMs()
@@ -3941,7 +3939,8 @@ extends Logging{
 private[spark] class BlockManagerMasterHeartbeatEndpoint(
     override val rpcEnv: RpcEnv,
     isLocal: Boolean,
-    blockManagerInfo: mutable.Map[BlockManagerId, BlockManagerInfo])
+        blockManagerInfo: mutable.Map[BlockManagerId, BlockManagerInfo])
+: mutable.Map[BlockManagerId, BlockManagerInfo])
 extends ThreadSafeRpcEndpoint with Logging {
     构造器参数:
     	rpcEnv	RPC环境参数
@@ -5447,7 +5446,6 @@ extends Iterator[(BlockId, InputStream)] with DownloadFileManager with Logging {
       var curBlocks = new ArrayBuffer[FetchBlockInfo]
       val mergedBlockInfo = new ArrayBuffer[FetchBlockInfo]
       val iter = blocks.iterator
-
       while (iter.hasNext) {
         val info = iter.next()
         val curBlockId = info.blockId.asInstanceOf[ShuffleBlockId]
