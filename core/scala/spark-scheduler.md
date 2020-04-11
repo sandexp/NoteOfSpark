@@ -1742,7 +1742,7 @@ extends SparkListenerBus with Logging {
         while (next != POISON_PILL) { //没有收到截止事件,则继续发送到子监听器
           val ctx = processingTime.time()
           try {
-            super.postToAll(next)
+            super.postToAll(next) // 使用消息总线分发事件到每台机器上
           } finally {
             ctx.stop()
           }
@@ -5790,7 +5790,6 @@ object SchedulingMode extends Enumeration {
 
 ```scala
 private[spark] class ShuffleMapStage(
-    
     id: Int,
     rdd: RDD[_],
     numTasks: Int,
