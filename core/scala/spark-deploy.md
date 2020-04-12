@@ -1112,7 +1112,7 @@ class RollingEventLogFilesWriter(
 ```
 
 ```scala
-object RollingEventLogFilesWriter {
+    object RollingEventLogFilesWriter {
     属性:
     #name @EVENT_LOG_DIR_NAME_PREFIX = "eventlog_v2_"	事件日志目录前缀名称
     #name @EVENT_LOG_FILE_NAME_PREFIX = "events_"	事件日志文件前缀
