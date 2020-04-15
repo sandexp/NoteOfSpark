@@ -5885,23 +5885,23 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
 
    ---
 
-   #### HadoopDelegationTokenManager
+##### HadoopDelegationTokenManager
 
-   ```markdown
-   介绍:
-   	hadoop授权令牌管理器,管理spark应用程序的授权令牌.
-   	当运行更新授权令牌时,这个管理器会确保长期运行,且获取安全服务时不会中断.周期性地向密钥分配中心产生日志,使用用户提供的证书与所有配置的安全服务交互,目的是获取授权令牌去分配到剩余的应用上.
-   	新的授权令牌每次创建的时间为原始授权令牌更新时间的75%.新的令牌会发送的spark驱动器端点上.驱动器将令牌分配到需要它的进程中.
-   	更新可以使用两种方式开启:
-   	1. 提供转换准则和spark的密钥表
-   	2. 允许基于本地证书缓存更新
-   	后者有一个缺陷,spark自身无法生成TGT票据,因此用于必须手动更新Kerberos票据缓存.
-    	这个类也可以仅仅用来创建授权令牌,通过调用@obtainDelegationTokens 方法,这个配置不需要使用@start方法或者提供驱动器属性,但是调用者需要自己分配产生的授权令牌.
-    	构造器参数:
-    		sparkConf	spark配置
-    		hadoopConf	hadoop配置
-    		schedulerRef	调度的RPC端点(驱动器)
-   ```
+```markdown
+介绍:
+	hadoop授权令牌管理器,管理spark应用程序的授权令牌.
+	当运行更新授权令牌时,这个管理器会确保长期运行,且获取安全服务时不会中断.周期性地向密钥分配中心产生日志,使用用户提供的证书与所有配置的安全服务交互,目的是获取授权令牌去分配到剩余的应用上.
+	新的授权令牌每次创建的时间为原始授权令牌更新时间的75%.新的令牌会发送的spark驱动器端点上.驱动器将令牌分配到需要它的进程中.
+	更新可以使用两种方式开启:
+	1. 提供转换准则和spark的密钥表
+	2. 允许基于本地证书缓存更新
+	后者有一个缺陷,spark自身无法生成TGT票据,因此用于必须手动更新Kerberos票据缓存.
+ 	这个类也可以仅仅用来创建授权令牌,通过调用@obtainDelegationTokens 方法,这个配置不需要使用@start方法或者提供驱动器属性,但是调用者需要自己分配产生的授权令牌.
+ 	构造器参数:
+ 		sparkConf	spark配置
+ 		hadoopConf	hadoop配置
+ 		schedulerRef	调度的RPC端点(驱动器)
+```
 
 
 ```scala
@@ -5972,7 +5972,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
        val currentUser = UserGroupInformation.getCurrentUser()
        2. 获取授权令牌，并将其存储到证书中
        val hasKerberosCreds = principal != null ||
-         Option(currentUser.getRealUser()).getOrElse(currentUser).hasKerberosCredentials()
+        Option(currentUser.getRealUser()).getOrElse(currentUser).hasKerberosCredentials()
        if (hasKerberosCreds) {
          val freshUGI = doLogin()
          freshUGI.doAs(new PrivilegedExceptionAction[Unit]() {
@@ -6112,7 +6112,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    }
 ```
 
-   #### HadoopFSDelegationTokenProvider
+   ##### HadoopFSDelegationTokenProvider
 
    ```scala
    private[deploy] class HadoopFSDelegationTokenProvider
@@ -6229,7 +6229,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    }
    ```
 
-   #### HBaseDelegationTokenProvider
+   ##### HBaseDelegationTokenProvider
 
    ```scala
    private[security] class HBaseDelegationTokenProvider
@@ -6341,7 +6341,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
 
    ---
 
-   #### ui
+##### ui
 
    ```scala
    介绍: 这个目录下是worker所属web UI内容
@@ -6353,7 +6353,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    """
    ```
 
-   #### CommandUtils
+##### CommandUtils
 
    ```scala
    private[deploy]
@@ -6435,7 +6435,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    }
    ```
 
-   #### DriverRunner
+   ##### DriverRunner
 
    ```scala
    private[deploy] class DriverRunner(
@@ -6589,8 +6589,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
        // 可重试的执行指令
        runCommandWithRetry(ProcessBuilderLike(builder), initialize, supervise)
        
-       def runCommandWithRetry(
-         command: ProcessBuilderLike, initialize: Process => Unit, supervise: Boolean): Int
+       def runCommandWithRetry(command: ProcessBuilderLike, initialize: Process => Unit, supervise: Boolean): Int
        功能: 可重试的运行指令
        1. 确定是否进行尝试
        var exitCode = -1
@@ -6642,7 +6641,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    }
    ```
 
-   #### DriverWrapper
+   ##### DriverWrapper
 
    ```scala
    object DriverWrapper extends Logging {
@@ -6715,7 +6714,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    }
    ```
 
-   #### ExecutorRunner
+   ##### ExecutorRunner
 
    ```scala
    private[deploy] class ExecutorRunner(
@@ -6866,7 +6865,7 @@ private[spark] class SubmissionStatusResponse extends SubmitRestProtocolResponse
    }
    ```
 
-   #### Worker
+   ##### Worker
 
    ```scala
 private[deploy] class Worker(
@@ -7499,7 +7498,7 @@ private[deploy] class Worker(
        }
    }
    ```
-   
+
    ```scala
    private[deploy] object Worker extends Logging {
        属性:
@@ -7555,9 +7554,9 @@ private[deploy] class Worker(
        功能: 启动函数
    }
    ```
-   
-   #### WorkerArguments
-   
+
+   ##### WorkerArguments
+
    ```scala
    private[worker] class WorkerArguments(args: Array[String], conf: SparkConf){
        介绍: worker的命令行转换器
@@ -7689,9 +7688,9 @@ private[deploy] class Worker(
        }
    }
    ```
-   
-   #### WorkerSource
-   
+
+   ##### WorkerSource
+
    ```scala
    private[worker] class WorkerSource(val worker: Worker) extends Source {
        介绍:
@@ -7726,9 +7725,9 @@ private[deploy] class Worker(
        功能: 注册空闲内存量
    }
    ```
-   
-   #### WorkerWatcher
-   
+
+   ##### WorkerWatcher
+
    ```scala
    private[spark] class WorkerWatcher(
        override val rpcEnv: RpcEnv, workerUrl: String, isTesting: Boolean = false)
@@ -9514,8 +9513,7 @@ private[spark] class SparkHadoopUtil extends Logging {
     transferCredentials(UserGroupInformation.getCurrentUser(), ugi)
     val= ugi
     
-    def transferCredentials(source: UserGroupInformation, 
-                            dest: UserGroupInformation): Unit
+    def transferCredentials(source: UserGroupInformation, dest: UserGroupInformation): Unit
     功能: 转换证书(将源用户组的证书添加到目标组中)
     dest.addCredentials(source.getCredentials())
     
