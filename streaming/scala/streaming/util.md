@@ -1,4 +1,4 @@
-1. [gBatchedWriteAheadLog.scala](BatchedWriteAheadLog)
+1. [BatchedWriteAheadLog.scala](BatchedWriteAheadLog)
 2. [FileBasedWriteAheadLog.scala](FileBasedWriteAheadLog)
 3. [FileBasedWriteAheadLogRandomReader.scala](FileBasedWriteAheadLogRandomReader)
 4. [FileBasedWriteAheadLogReader.scala](FileBasedWriteAheadLogReader)

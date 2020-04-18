@@ -328,7 +328,7 @@ abstract class DStream[T: ClassTag] (
     
     def generateJob(time: Time): Option[Job] 
     功能: 生成指定时间的sparkstreaming job.这个内部方法不能直接调用,子类需要重写去创建自己的job
-    val= getOrCompute(time) match {
+    val= getOrCompute(time) match {	
       case Some(rdd) =>
         val jobFunc = () => {
           val emptyFunc = { (iterator: Iterator[T]) => {} }
