@@ -17,7 +17,7 @@
  * 
  * 
  */
-public class Aler32 {
+public class Adler32 {
 
     static int a=1;
     static int b=0;
