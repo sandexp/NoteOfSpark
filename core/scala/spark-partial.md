@@ -1,4 +1,4 @@
-## spark-partial**
+## **spark-partial**
 
 ---
 
@@ -22,7 +22,7 @@
 	这个类假定了动作执行在完整的RDD[T]上，通过一个计算每个分区中类型U的结果的函数。且这个操作返回一个局部或者完整的R类型结果。注意这个R类型结果必须包括错误处理(error bars).具体可以参考@BoundedInt作为示例。
 ```
 
-```markdown
+```scala
 private[spark] class ApproximateActionListener[T, U, R] (rdd: RDD[T],
 	func: (TaskContext, Iterator[T]) => U,evaluator: ApproximateEvaluator[U, R],timeout: Long)
 {
@@ -77,7 +77,7 @@ private[spark] class ApproximateActionListener[T, U, R] (rdd: RDD[T],
 	这个类提供通过增量式的合并多个任务产生的部分结果集U的函数,运行在任何时刻调用@currentResult获取部分解。
 ```
 
-```markdown
+```scala
 private[spark] trait ApproximateEvaluator[U, R] {
 	操作集:
 	def merge(outputId: Int, taskResult: U): Unit
@@ -90,7 +90,7 @@ private[spark] trait ApproximateEvaluator[U, R] {
 
 #### BoundedDouble
 
-```markdown
+```scala
 class BoundedDouble(val mean: Double, val confidence: Double, val low: Double, val high: Double){
 	介绍: 有界的double类型
 	构造器属性:
@@ -118,7 +118,7 @@ class BoundedDouble(val mean: Double, val confidence: Double, val low: Double, v
 介绍: 近似评估器@ApproximateEvaluator 的计数状态下执行策略
 ```
 
-```markdown
+```scala
 private[spark] class CountEvaluator(totalOutputs: Int, confidence: Double){
 	关系: father --> ApproximateEvaluator[Long, BoundedDouble]
 	构造器属性:
@@ -147,7 +147,7 @@ private[spark] class CountEvaluator(totalOutputs: Int, confidence: Double){
 }
 ```
 
-```markdown
+```scala
 private[partial] object CountEvaluator{
 	操作集:
 	def bound(confidence: Double, sum: Long, p: Double): BoundedDouble 
@@ -166,7 +166,7 @@ private[partial] object CountEvaluator{
 
 #### GroupedCountEvaluator
 
-```markdown
+```scala
 private[spark] class GroupedCountEvaluator[T : ClassTag] (totalOutputs: Int, confidence: Double){
 	关系: father --> ApproximateEvaluator[OpenHashMap[T, Long], Map[T, BoundedDouble]]
 	构造器属性:
@@ -198,7 +198,7 @@ private[spark] class GroupedCountEvaluator[T : ClassTag] (totalOutputs: Int, con
 
 #### MeanEvaluator
 
-```markdown
+```scala
 private[spark] class MeanEvaluator(totalOutputs: Int, confidence: Double){
 	关系: father --> ApproximateEvaluator[StatCounter, BoundedDouble]
 	介绍: 均值估算器
@@ -236,7 +236,7 @@ private[spark] class MeanEvaluator(totalOutputs: Int, confidence: Double){
 
 #### PartialResult
 
-```markdown
+```scala
 class PartialResult[R] (initialVal: R, isFinal: Boolean) {
 	构造器属性:
 		initialVal	初始值
@@ -256,12 +256,10 @@ class PartialResult[R] (initialVal: R, isFinal: Boolean) {
 	def getFinalValue(): R 
 	功能: 获取最后一条记录
 	介绍: 阻塞等待最后一条记录
-	```scala
 	   // 阻塞等待
 	   while (finalValue.isEmpty && failure.isEmpty) {
      	 this.wait()
     	}
-	```
 	结果:
 		finalValue.isDefined? finalValue.get: throw failure.get
 	
@@ -307,33 +305,31 @@ class PartialResult[R] (initialVal: R, isFinal: Boolean) {
 	功能: 将PartialResult 转化为T
 	return new PartialResult[T](f(initialVal), isFinal){
 		内部设置:
-		```scala
 		override def getFinalValue() : T = synchronized {
-         	f(PartialResult.this.getFinalValue())
-       	}
-       	override def onComplete(handler: T => Unit): PartialResult[T] = synchronized {
-        	 PartialResult.this.onComplete(handler.compose(f)).map(f)
-       	}
-      	override def onFail(handler: Exception => Unit): Unit = {
-        	synchronized {
-          	PartialResult.this.onFail(handler)
-        	}
-      	}
-      	override def toString : String = synchronized {
-        	PartialResult.this.getFinalValueInternal() match {
-          		case Some(value) => "(final: " + f(value) + ")"
-          		case None => "(partial: " + initialValue + ")"
-        	}
-      	}
-      	def getFinalValueInternal(): Option[T] = PartialResult.this.getFinalValueInternal().map(f)
-		```
+	     	f(PartialResult.this.getFinalValue())
+	   	}
+	   	override def onComplete(handler: T => Unit): PartialResult[T] = synchronized {
+	    	 PartialResult.this.onComplete(handler.compose(f)).map(f)
+	   	}
+	  	override def onFail(handler: Exception => Unit): Unit = {
+	    	synchronized {
+	      	PartialResult.this.onFail(handler)
+	    	}
+	  	}
+	  	override def toString : String = synchronized {
+	    	PartialResult.this.getFinalValueInternal() match {
+	      		case Some(value) => "(final: " + f(value) + ")"
+	      		case None => "(partial: " + initialValue + ")"
+	    	}
+	  	}
+	  	def getFinalValueInternal(): Option[T] = PartialResult.this.getFinalValueInternal().map(f)
 	}
 }
 ```
 
 #### SumEvaluator
 
-```markdown
+```scala
 private[spark] class SumEvaluator(totalOutputs: Int, confidence: Double){
 	关系: ApproximateEvaluator[StatCounter, BoundedDouble]
 	介绍: 这是一个和估值器，它完成了均值估算器以及计数估值器功能。然后使用公式，对于两个独立的随机变量进行处理，获得计算结果的方差，并计算出置信区间。
@@ -377,21 +373,21 @@ private[spark] class SumEvaluator(totalOutputs: Int, confidence: Double){
 			+ 计算和的方差
 				计算公式:
 				Var(Sum) = Var(Mean*Count) =[E(Mean)]^2 * Var(Count) + [E(Count)]^2 *
-                	Var(Mean) + Var(Mean) * Var(Count)
+	            	Var(Mean) + Var(Mean) * Var(Count)
 			    实际计算:
 			    val sumVar = (meanEstimate * meanEstimate * countVar) +
-          			(countEstimate * countEstimate * meanVar) +
-          			(meanVar * countVar)
+	      			(countEstimate * countEstimate * meanVar) +
+	      			(meanVar * countVar)
 			+ 计算和的标准差
 				val sumStdev = math.sqrt(sumVar)
 			+ 获取分布
 				1. 计数值>100(counter.count > 100) 使用正常分布
 				2. 计数值<=100 使用T-分布
 				val degreesOfFreedom = (counter.count - 1).toInt
-          		new TDistribution(degreesOfFreedom).inverseCumulativeProbability((1+confidence) / 2)
+	      		new TDistribution(degreesOfFreedom).inverseCumulativeProbability((1+confidence) / 2)
 			+ 获取置信区间的上下界
 				val low = sumEstimate - confFactor * sumStdev
-        		 val high = sumEstimate + confFactor * sumStdev
+	    		 val high = sumEstimate + confFactor * sumStdev
 			返回结果集
 			BoundedDouble(counter.sum+sumEstimate, confidence,counter.sum + low, counter.sum + high)
 }
@@ -406,4 +402,3 @@ private[spark] class SumEvaluator(totalOutputs: Int, confidence: Double){
 3.  平均值，置信值，置信区间
 4.  普通分布模型
 5.  T-分布模型
-
