@@ -19,7 +19,7 @@
 	这个一个可以操作IO加密以及流加密的工具类
 ```
 
-```markdown
+```scala
 private[spark] object CryptoStreamUtils{
 	关系: father --> Logging
 	属性:
@@ -87,7 +87,7 @@ private[spark] object CryptoStreamUtils{
     随机处理方式请参照接口#interface @CryptoRandom
 }
 ```
-```markdown
+```scala
 private class CryptoHelperChannel(sink: WritableByteChannel){
 	关系: father --> WritableByteChannel
 	介绍: 这个类与CRYPTO-125有关。使得所有字节写到底层通道中。因此这个API的调用者使用BIO，所有没有CPU使用的考		虑。
@@ -104,7 +104,7 @@ private class CryptoHelperChannel(sink: WritableByteChannel){
 	功能: 将src写出到底层通道@sink
 }
 ```
-```markdown
+```scala
 trait BaseErrorHandler{
 	关系: father --> Closeable
 	介绍: commons-cryto库在出现错误时，会报出@InternalError错误。由于在java包装类中留下来失败状态,之后再使	用就不安全了。这个包装发现避免进一步的调用commons-crypto代码，此时仍然允许底层流保持关闭状态。
@@ -127,7 +127,7 @@ trait BaseErrorHandler{
 	功能: 关流
 }
 ```
-```markdown
+```scala
 class ErrorHandlingReadableChannel(
       protected val cipherStream: ReadableByteChannel,
       protected val original: ReadableByteChannel){
@@ -141,7 +141,7 @@ class ErrorHandlingReadableChannel(
     	功能: 获取字节通道当前状态
 }
 ```
-```markdown
+```scala
 private class ErrorHandlingInputStream(protected val cipherStream: InputStream,
       protected val original: InputStream){
  	关系: father --> InputStream
@@ -158,7 +158,7 @@ private class ErrorHandlingInputStream(protected val cipherStream: InputStream,
  }
 ```
 
-```markdown
+```scala
 private class ErrorHandlingWritableChannel(
       protected val cipherStream: WritableByteChannel,
       protected val original: WritableByteChannel){
@@ -173,7 +173,7 @@ private class ErrorHandlingWritableChannel(
 }
 ```
 
-```markdown
+```scala
   private class ErrorHandlingOutputStream(protected val cipherStream: OutputStream,
       protected val original: OutputStream){
  	关系: father --> OutputStream
@@ -189,7 +189,7 @@ private class ErrorHandlingWritableChannel(
  }
 ```
 
-```markdown
+```scala
 private class CryptoParams(key: Array[Byte], sparkConf: SparkConf){
 	构造器属性:
 		key			key值列表
@@ -212,7 +212,7 @@ private class CryptoParams(key: Array[Byte], sparkConf: SparkConf){
 	@spark.acls.enable使能权限检查,每次当用户尝试去使用或者修改应用时.安全管理器@SecurityManager获取用户所属的权限组,通过由@spark.user.groups.mapping指定的组映射
 ```
 
-```markdown
+```scala
 trait GroupMappingServiceProvider {
 	def getGroups(userName : String) : Set[String]
 	功能: 获取用户所属组
@@ -226,7 +226,7 @@ trait GroupMappingServiceProvider {
 	这个特征的实现可交给用户实现.主要是提供hadoop的委托令牌(delegation token)
 ```
 
-```markdown
+```scala
 @DeveloperApi
 trait HadoopDelegationTokenProvider{
 	操作集:
@@ -258,7 +258,7 @@ trait HadoopDelegationTokenProvider{
 	这个类负责获取特点Unix环境下用户所属的组.这个实现使用Unix Shell,基于id commond去获取指定用户所属的用户组,但是它不缓存用户组,因为调用的不频繁的.
 ```
 
-```markdown
+```scala
 private[spark] class ShellBasedGroupsMappingProvider{
 	关系: father --> GroupMappingServiceProvider
 	sibling --> Logging
@@ -285,7 +285,7 @@ private[spark] class ShellBasedGroupsMappingProvider{
 	这之中没有保密,所以这个依赖于本地socket或者某种程度上的加密socket。
 ```
 
-```markdown
+```scala
 private[spark] class SocketAuthHelper(conf: SparkConf){
 	构造器属性:
 		conf	应用程序配置集
@@ -337,7 +337,7 @@ private[spark] class SocketAuthHelper(conf: SparkConf){
 	socket服务器仅能接受一个连接,如果连接在15s内依旧不存在，那么就要关闭连接。
 ```
 
-```markdown
+```scala
 private[spark] abstract class SocketAuthServer[T] (authHelper: SocketAuthHelper,threadName: String){
 	构造器属性:
 		authHelper	权限辅助器
@@ -390,7 +390,7 @@ private[spark] abstract class SocketAuthServer[T] (authHelper: SocketAuthHelper,
 } 
 ```
 
-```markdown
+```scala
 private[spark] class SocketFuncServer(authHelper: SocketAuthHelper,threadName: String,
     func: Socket => Unit){
     介绍: 创建一个socket服务器，在后台线程上运行用户功能。这个线程可以读写socket输入输出。函数会被传送给一个已	经连接且授权的socket。
@@ -401,7 +401,7 @@ private[spark] class SocketFuncServer(authHelper: SocketAuthHelper,threadName: S
 }
 ```
 
-```markdown
+```scala
 private[spark] object SocketAuthServer {
 	操作集:
 	def serveToStream(threadName: String,authHelper: SocketAuthHelper)
