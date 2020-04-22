@@ -264,4 +264,103 @@
   }	
   ```
   
-  
+
+#### 最差拟合法的内存分配策略
+
+```java
+public long acquireExecutionMemory(long required, MemoryConsumer consumer) {
+    assert(required >= 0);
+    assert(consumer != null);
+    MemoryMode mode = consumer.getMode();
+    // If we are allocating Tungsten pages off-heap and receive a request to allocate on-heap
+    // memory here, then it may not make sense to spill since that would only end up freeing
+    // off-heap memory. This is subject to change, though, so it may be risky to make this
+    // optimization now in case we forget to undo it late when making changes.
+    synchronized (this) {
+      long got = memoryManager.acquireExecutionMemory(required, taskAttemptId, mode);
+
+      // Try to release memory from other consumers first, then we can reduce the frequency of
+      // spilling, avoid to have too many spilled files.
+      if (got < required) {
+        // Call spill() on other consumers to release memory
+        // Sort the consumers according their memory usage. So we avoid spilling the same consumer
+        // which is just spilled in last few times and re-spilling on it will produce many small
+        // spill files.
+        TreeMap<Long, List<MemoryConsumer>> sortedConsumers = new TreeMap<>();
+        for (MemoryConsumer c: consumers) {
+          if (c != consumer && c.getUsed() > 0 && c.getMode() == mode) {
+            long key = c.getUsed();
+            List<MemoryConsumer> list =
+                sortedConsumers.computeIfAbsent(key, k -> new ArrayList<>(1));
+            list.add(c);
+          }
+        }
+        while (!sortedConsumers.isEmpty()) {
+          // Get the consumer using the least memory more than the remaining required memory.
+          Map.Entry<Long, List<MemoryConsumer>> currentEntry =
+            sortedConsumers.ceilingEntry(required - got);
+          // No consumer has used memory more than the remaining required memory.
+          // Get the consumer of largest used memory.
+          if (currentEntry == null) {
+            currentEntry = sortedConsumers.lastEntry();
+          }
+          List<MemoryConsumer> cList = currentEntry.getValue();
+          MemoryConsumer c = cList.get(cList.size() - 1);
+          try {
+            long released = c.spill(required - got, consumer);
+            if (released > 0) {
+              logger.debug("Task {} released {} from {} for {}", taskAttemptId,
+                Utils.bytesToString(released), c, consumer);
+              got += memoryManager.acquireExecutionMemory(required - got, taskAttemptId, mode);
+              if (got >= required) {
+                break;
+              }
+            } else {
+              cList.remove(cList.size() - 1);
+              if (cList.isEmpty()) {
+                sortedConsumers.remove(currentEntry.getKey());
+              }
+            }
+          } catch (ClosedByInterruptException e) {
+            // This called by user to kill a task (e.g: speculative task).
+            logger.error("error while calling spill() on " + c, e);
+            throw new RuntimeException(e.getMessage());
+          } catch (IOException e) {
+            logger.error("error while calling spill() on " + c, e);
+            // checkstyle.off: RegexpSinglelineJava
+            throw new SparkOutOfMemoryError("error while calling spill() on " + c + " : "
+              + e.getMessage());
+            // checkstyle.on: RegexpSinglelineJava
+          }
+        }
+      }
+
+      // call spill() on itself
+      if (got < required) {
+        try {
+          long released = consumer.spill(required - got, consumer);
+          if (released > 0) {
+            logger.debug("Task {} released {} from itself ({})", taskAttemptId,
+              Utils.bytesToString(released), consumer);
+            got += memoryManager.acquireExecutionMemory(required - got, taskAttemptId, mode);
+          }
+        } catch (ClosedByInterruptException e) {
+          // This called by user to kill a task (e.g: speculative task).
+          logger.error("error while calling spill() on " + consumer, e);
+          throw new RuntimeException(e.getMessage());
+        } catch (IOException e) {
+          logger.error("error while calling spill() on " + consumer, e);
+          // checkstyle.off: RegexpSinglelineJava
+          throw new SparkOutOfMemoryError("error while calling spill() on " + consumer + " : "
+            + e.getMessage());
+          // checkstyle.on: RegexpSinglelineJava
+        }
+      }
+
+      consumers.add(consumer);
+      logger.debug("Task {} acquired {} for {}", taskAttemptId, Utils.bytesToString(got), consumer);
+      return got;
+    }
+  }
+```
+
