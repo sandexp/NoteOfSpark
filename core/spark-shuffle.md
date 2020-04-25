@@ -168,47 +168,45 @@
       		初始化输出文件流@outputFileStream，初始化输出文件缓冲流@outputBufferedFileStream
       		
               void initChannel()
-   		功能: 初始化通道
+   			功能: 初始化通道
       		初始化输出文件通道@outputFileChannel，其中模式为可追加模式
    }
       ```
       
       #subclass @LocalDiskShufflePartitionWriter
       
-      ```scala
-      本地磁盘shuffle分区写出器
-      ADT LocalDiskShufflePartitionWriter{
-      	数据元素：
-      		1. 分区编号 #name @partitionId $type @int [final]
-      		2. 分区写出流 #name @partStream $type @PartitionWriterStream
-      		3. 分区写出通道 #name @partChannel $type @PartitionWriterChannel
-      	操作集:
-      		1. 构造器
-      		private LocalDiskShufflePartitionWriter(int partitionId)
-      		指定本类的分区号@partitionId
-      		2. 查找获取类
-      		long getNumBytesWritten()
-      		功能： 获取写出字节数
-      		+ 优先从分区写出通道中获取数据统计量@partChannel #method @PartChannel.getCount()
-               + 在分区写出通道不存在的情况下，从底层输出流获取统计数据@partStream 
-               #method @PartStream.getCount()	
-               3. 操作类
-               OutputStream openStream()
-               功能: 开启流@partStream写出功能
-               操作条件: 通道@outputFileChannel一定要是处于关闭状态
-               + 初始化流 initStream()
-               + 根据分区号@partitionId返回分区写出器@partStream
-               Optional<WritableByteChannelWrapper> openChannelWrapper()
-        		功能: 开启通道交换写出方式
-        		操作条件: 流读取方式必须关闭@partStream
-     		+ 初始化通道
-        		+ 根据分区号@partitionId获取通道分区写出器@partChannel，并返回       
-   }
+      ```java
+          本地磁盘shuffle分区写出器
+          ADT LocalDiskShufflePartitionWriter{
+          数据元素：
+          1. 分区编号 #name @partitionId $type @int [final]
+          2. 分区写出流 #name @partStream $type @PartitionWriterStream
+          3. 分区写出通道 #name @partChannel $type @PartitionWriterChannel
+          操作集:
+          1. 构造器
+          private LocalDiskShufflePartitionWriter(int partitionId)
+          指定本类的分区号@partitionId
+          2. 查找获取类
+          long getNumBytesWritten()
+          功能： 获取写出字节数
+          + 优先从分区写出通道中获取数据统计量@partChannel #method @PartChannel.getCount()
+          + 在分区写出通道不存在的情况下，从底层输出流获取统计数据@partStream 
+          #method @PartStream.getCount()	
+          3. 操作类
+          OutputStream openStream()
+          功能: 开启流@partStream写出功能
+          操作条件: 通道@outputFileChannel一定要是处于关闭状态
+          + 初始化流 initStream()
+          + 根据分区号@partitionId返回分区写出器@partStream
+          Optional<WritableByteChannelWrapper> openChannelWrapper()
+          功能: 开启通道交换写出方式
+          操作条件: 流读取方式必须关闭@partStream
+          + 初始化通道
+          + 根据分区号@partitionId获取通道分区写出器@partChannel，并返回 
+          }
       ```
-      
       #subclass @PartitionWriterStream
-      
-      ```scala
+      ```java
       分区写出流
       ADT PartitionWriterStream{
       	数据元素：
@@ -236,9 +234,9 @@
       		+ 检查是否处于关流状态，没有关流则@写出length个字节，并更新计数器@count+=length
    }
       ```
-      
+
       #subclass @PartitionWriterChannel
-      
+
       ```scala
       ADT PartitionWriterChannel{
       	数据元素:
@@ -301,10 +299,10 @@
     ```markdown
     简介:
     	本类实现了排序基准的shuffle的hash格式shuffle备用路径.写路径将进来的数据写到分开的文件中.一个文件对应于一个reduce的partition.连接这些分区文件,进而组成一个输出文件.这个输出文件是共属于各个reduce的.记录没有缓冲在内存中.其写输出时通过了org.apache.spark.shuffle.IndexShuffleBlockResolver shuffle块管理器来处理.
-    	如果存在有大量的reduce分区数量时,写路径是无效的.原因是写操作同时打开了各个分区的序列化器,以及文件流.因此对于写路径的选择是由要求的,这个要求以及管理工作交给#class @SortShuffleManager 处理.
+    	如果存在有大量的reduce分区数量时,写路径是无效的.原因是写操作同时打开了各个分区的序列化器,以及文件流.因此对于写路径的选择是有要求的,这个要求以及管理工作交给#class @SortShuffleManager 处理.
     	当满足
     		1. map侧的combine操作没有被指定
-    		2.分区数小于等于@spark.shuffle.sort.bypassMergeThreshold 即可
+    		2. 分区数小于等于@spark.shuffle.sort.bypassMergeThreshold 即可
     	本类原来是属于org.apache.spark.util.collection.ExternalSorter类的一部分,但是由于重构就单独的形成了一个类.主要目的是降低外部排序类的代码复杂度. 同样的外部排序类也将这段代码移除.
     ```
 
@@ -348,7 +346,7 @@
           		long[] getPartitionLengths()
     			功能: 获取分区长度列表
     	    3. 操作类
-    			void write(Iterator<Product2<K, V>> records)
+        	void write(Iterator<Product2<K, V>> records)
                  功能： 写出记录的内容到分区
                  操作条件: 当前分区写出器列表为空
                  + 获取map形式的写出器@ShuffleMapOutputWriter 
@@ -369,7 +367,7 @@
                  异常处理:
                  	捕获异常@mapOutputWriter 直接放弃输出
            		
-           		long[] writePartitionedData(ShuffleMapOutputWriter mapOutputWriter)
+        	long[] writePartitionedData(ShuffleMapOutputWriter mapOutputWriter)
            		功能: 写分区数据，且更新分区长度列表@partitionLengths 
            			连接每个分区的文件，从而形成一个整体的文件
            		返回: 每个分区的大小(单位自己)
@@ -380,18 +378,18 @@
     				2. 不存在通道，使用流方式 #method @writePartitionedDataWithStream
     			写出完毕，分区写出器列表置空
     			
-    			void writePartitionedDataWithChannel(File file,
+        	void writePartitionedDataWithChannel(File file,
           			WritableByteChannelWrapper outputChannel)
     			功能: 使用通道写出分区数据
     			+ 通过spark @Utils 使用NIO文件流拷贝将通过文件@file创建的输入流，放到输出通道中。通道初始指			针@position=0，放置元素为输入通道的大小。
     			+ 拷贝完毕，关闭输入流，关闭输出流
     			
-    			void writePartitionedDataWithStream(File file, ShufflePartitionWriter writer)
+        	void writePartitionedDataWithStream(File file, ShufflePartitionWriter writer)
     			功能： 流式写出分区文件
     			特点: 直接通过基本输入输出流实现文件的输入，以及文件的输出
     			+ 使用spark @Utils 的#method @copyStream 将输入流的内容拷贝的输出流中,此时NIO的读取方式就			会被弃用。
     			
-    			Option<MapStatus> stop(boolean success)
+        	Option<MapStatus> stop(boolean success)
     			功能: 停止操作,主要用于处理map侧状态@mapStatus
     			+ 在success=true的情况下，设置mapStatus=Option.apply(mapStatus)
     			+ success不为true
@@ -468,86 +466,86 @@
 
 5.  **shuffle排序器** 
 
-    1.  内部排序器
+    1. 内部排序器
 
-        ```scala
-        ADT ShuffleInMemorySorter{
-        	数据元素:
-        		1. 常量 排序比较逻辑@SORT_COMPARATOR
-        		2. 内存消费者#name @consumer $type @MemoryConsumer
-        		3. 记录指针数组@array $type @LongArray
-        			这个数组用于存放记录地址和分区编号排序操作是对数组的操作而非直接操作记录(改链接)
-        			部分空间用于存放记录地址和分区编号，另一部分用于排序的暂态缓冲区
-        		4. 基数排序标志@useRadixSort
-        		   用了基数排序会比较快
-        		5. 新纪录插入位置@pos=0
-        		6. 记录容量 @usableCapacity int
-        		7. 初始化大小@initialSize final int
-        	操作集:
-        		1. 构造器
-        		ShuffleInMemorySorter(MemoryConsumer consumer, int initialSize, boolean useRadixSort)
-        		指定内存消费者@consumer，初始化大小@initialsize，基数排序标志@useRadixSort。
-        		根据上面的参数，获取记录指针数组@array，记录容量@usableCapacity
-        		2. 查询获取类
-        		int numRecords()
-        		获取记录数量 返回@pos
-        		
-        		int getUsableCapacity()
-        		获取记录指针数组可用部分大小
-        		基数排序需要更多的空间去存储数据，所有可使用的空间相对来说就比较少
-        		val=(int) (array.size() / (useRadixSort ? 2 : 1.5))
-        		
-        		long getMemoryUsage()
-        		获取内存使用量，这里的内存使用主要是存储记录指针数组@array
-        		val=array.size() * 8L
-        		
-        		boolean hasSpaceForAnotherRecord()
-        		确定是否还能容纳一条记录
-        		val=pos<usableCapacity
-        		
-        		ShuffleSorterIterator getSortedIterator()
-        		获取排序好的排序迭代器@ShuffleSorterIterator
-        			1. 基数排序
-        				采取基数排序对记录进行排序#class @RadixSort #method @sort
-        			2. 非基数排序
-        				使用#class @TimSort对记录进行排序
-        		
-        		3. 操作类
-        			void free()
-        			功能: 用户释放记录指针数组的内存
-        			void reset()
-        			重置为刚建立的状态，pos=0
-        			void insertRecord(long recordPointer, int partitionId)
-        			功能: 在插入指针@pos处插入一条记录，器记录指针/分区号为指定
-        			void expandPointerArray(LongArray newArray)
-        			功能: 扩展记录指针数组大小为指定的新记录指针数组
-        			操作条件: 新数组长度大于原数组大小
-        			+ 将旧数组内容拷贝到新数组上，释放旧数组空间。重新设置当前访问数组指针(注意不要出现悬挂			访问)，更新可用容量大小@usableCapacity
-        }
-        ```
+       ```java
+       ADT ShuffleInMemorySorter{
+       	数据元素:
+       		1. 常量 排序比较逻辑@SORT_COMPARATOR
+       		2. 内存消费者#name @consumer $type @MemoryConsumer
+       		3. 记录指针数组@array $type @LongArray
+       			这个数组用于存放记录地址和分区编号排序操作是对数组的操作而非直接操作记录(改链接)
+       			部分空间用于存放记录地址和分区编号，另一部分用于排序的暂态缓冲区
+       		4. 基数排序标志@useRadixSort
+       		   用了基数排序会比较快
+       		5. 新纪录插入位置@pos=0
+       		6. 记录容量 @usableCapacity int
+       		7. 初始化大小@initialSize final int
+       	操作集:
+       		1. 构造器
+       		ShuffleInMemorySorter(MemoryConsumer consumer, int initialSize, boolean useRadixSort)
+       		指定内存消费者@consumer，初始化大小@initialsize，基数排序标志@useRadixSort。
+       		根据上面的参数，获取记录指针数组@array，记录容量@usableCapacity
+       		2. 查询获取类
+       		int numRecords()
+       		获取记录数量 返回@pos
+       		
+       		int getUsableCapacity()
+       		获取记录指针数组可用部分大小
+       		基数排序需要更多的空间去存储数据，所有可使用的空间相对来说就比较少
+       		val=(int) (array.size() / (useRadixSort ? 2 : 1.5))
+       		
+       		long getMemoryUsage()
+       		获取内存使用量，这里的内存使用主要是存储记录指针数组@array
+       		val=array.size() * 8L
+       		
+       		boolean hasSpaceForAnotherRecord()
+       		确定是否还能容纳一条记录
+       		val=pos<usableCapacity
+       		
+       		ShuffleSorterIterator getSortedIterator()
+       		获取排序好的排序迭代器@ShuffleSorterIterator
+       			1. 基数排序
+       				采取基数排序对记录进行排序#class @RadixSort #method @sort
+       			2. 非基数排序
+       				使用#class @TimSort对记录进行排序
+       		
+       		3. 操作类
+       			void free()
+       			功能: 用户释放记录指针数组的内存
+       			void reset()
+       			重置为刚建立的状态，pos=0
+       			void insertRecord(long recordPointer, int partitionId)
+       			功能: 在插入指针@pos处插入一条记录，器记录指针/分区号为指定
+       			void expandPointerArray(LongArray newArray)
+       			功能: 扩展记录指针数组大小为指定的新记录指针数组
+       			操作条件: 新数组长度大于原数组大小
+       			+ 将旧数组内容拷贝到新数组上，释放旧数组空间。重新设置当前访问数组指针(注意不要出现悬挂			访问)，更新可用容量大小@usableCapacity
+       }
+       ```
 
-        #subclass @ShuffleSorterIterator
+       #subclass @ShuffleSorterIterator
 
-        ```scala
-        ADT ShuffleSorterIterator{
-        	数据元素:
-        		1. 记录指针数组@pointerArray final
-        		2. 上限@limit final
-        		3. 包装记录指针@packedRecordPointer final
-        		4. 位置指针@position
-        	操作集:
-        		1. ShuffleSorterIterator(int numRecords, LongArray pointerArray,
-                	int startingPosition)
-                	初始化上限@limit=numRecords+startingPosition
-                	初始化@position=startingPosition
-                	初始化记录指针数组
-                2. boolean hasNext()
-        			检测是否有下一个元素
-        	    3. void loadNext()
-        	   		记录指针数组@packedRecordPointer加载当前位置@position的值	
-        	   		移动位置指针
-        }
-        ```
+       ```scala
+       ADT ShuffleSorterIterator{
+       	数据元素:
+       		1. 记录指针数组@pointerArray final
+       		2. 上限@limit final
+       		3. 包装记录指针@packedRecordPointer final
+       		4. 位置指针@position
+       	操作集:
+       		1. ShuffleSorterIterator(int numRecords, LongArray pointerArray,
+               	int startingPosition)
+               	初始化上限@limit=numRecords+startingPosition
+               	初始化@position=startingPosition
+               	初始化记录指针数组
+               2. boolean hasNext()
+       			检测是否有下一个元素
+       	    3. void loadNext()
+       	   		记录指针数组@packedRecordPointer加载当前位置@position的值	
+       	   		移动位置指针
+       }
+       ```
 
     2. 外部排序器
 
@@ -601,15 +599,15 @@
                	功能: 对内存内部数据进行排序，并将排序好的数据写出成磁盘上的文件
                	输入参数: isLastFile=true表示已经是最后一个文件，需要形成一个最终的输出文件。写出的字节数量应统计到shuffle 溢写计数中，而不是shuffle写计数中。
                	+ 处理写出度量器@writeMetrics与isLastFile标志的关系
-               		1. 若是最后一个文件，这个文件不会去溢写，直接使用本类的度量器@writeMetrics统计即可。
-               		2. 不是最后一个文件的话，则需要新设置一个度量器@ShuffleWriteMetrics，去统计这个溢写部分的字节数量
+           		1. 若是最后一个文件，这个文件不会去溢写，直接使用本类的度量器@writeMetrics统计即可。
+               	2. 不是最后一个文件的话，则需要新设置一个度量器@ShuffleWriteMetrics，去统计这个溢写部分的字节数量
                	+ 写缓冲区的设置
-               		直接写小文件到磁盘上是非常低效的，所以需要设置一个缓冲数组。但是这个数组没有必要一定去容纳一条记录。写缓冲区大小=@diskWriteBufferSize
+               	直接写小文件到磁盘上是非常低效的，所以需要设置一个缓冲数组。但是这个数组没有必要一定去容纳一条记录。写缓冲区大小=@diskWriteBufferSize
                	+ 创建临时shuffle块,并创建数据块元数据信息@SpillInfo
-               		由于输出会在shuffle期间读取,它的压缩(compression codec)必须要受到
-               		spark.shuffle.compress的控制,而不是spark.shuffle.spill.compress。因此此处需要获取临时shuffle块。
+               	由于输出会在shuffle期间读取,它的压缩(compression codec)必须要受到
+               	spark.shuffle.compress的控制,而不是spark.shuffle.spill.compress。因此此处需要获取临时shuffle块。
                	+ 获取一个序列化实例@SerializerInstance
-               		主要是用来构造磁盘块写出器@DiskBlockObjectWriter 。事实上写路径使用的不是这个序列化对象(原因是底层调用了write()这个输出流中的方法)，但是磁盘块写出器中仍然是调用了它，所有这里使用一个不可写的实例，详情参考@DummySerializerInstance。
+               	主要是用来构造磁盘块写出器@DiskBlockObjectWriter 。事实上写路径使用的不是这个序列化对象(原因是底层调用了write()这个输出流中的方法)，但是磁盘块写出器中仍然是调用了它，所有这里使用一个不可写的实例，详情参考@DummySerializerInstance。
                	+ 获取排序后的记录，获取记录的分区号，
                		如果分区号@partition不是当前指针所指@currentPartition
                		更新当前指针@currentPartition=@partition
@@ -665,7 +663,7 @@
        		+ 再释放内部排序器@inMemSorter内存
        		
        		void acquireNewPageIfNecessary(int required)
-       		功能: 根据输入获取新的数据页/内存块
+       		功能: 根据输入申请新的数据页/内存块
        		+ 检测当前页@pageCursor后required页的是否存在，如果不存在，则会分配空
        		间@allocatePage(required)，并将指针指向新开空间的基本对象处。
        		+ 向已分配页/内存块列表中注册刚分配出来的空间
@@ -700,7 +698,7 @@
     
 6.  #class @UnsafeShuffleWriter<K,V>
 
-    ```scala
+    ```java
     ADT UnsafeShuffleWriter{
     	数据元素:
     		1. 日志处理器 #name @logger #type @Logger
@@ -795,15 +793,13 @@
     		
     		long[] mergeSpills(SpillInfo[] spills)
     		功能: 溢写文件块的多路归并
-    		返回: 合并后文的分区长度列表
+    		返回: 合并后的分区长度列表
     		+ 数据块元数据信息列表长度=0
     			使用map形式的写出器#class @ShuffleMapOutputWriter直接提交所有分区
     			#method @commitAllPartitions即可
     		+ 数据块元数据信息列表长度=1
     			获取单文件shuffle溢写输出器@SingleSpillShuffleMapOutputWriter #name
-                @maybeSingleFileWriter，
-                如果这个值非null，则使用单文件shuffle溢写输出器的方式，将该部分的数据块进行转化#method @transferMapSpillFile(File f,long[] partitionLengths)
-                如果这个值为null，则使用@mergeSpillsUsingStandardWriter(spills)的方式进行转化
+                @maybeSingleFileWriter，如果这个值非null，则使用单文件shuffle溢写输出器的方式，将该部分的数据块进行转化#method @transferMapSpillFile(File f,long[] partitionLengths),如果这个值为null，则使用@mergeSpillsUsingStandardWriter(spills)的方式进行转化
              + 数据块元数据信息列表中>1
              	@mergeSpillsUsingStandardWriter(spills)
              
@@ -818,7 +814,7 @@
              	3. 加密使能位@encryptionEnabled (块管理器@blockManager中获取)
              + 创建map形式shuffle输出器 @mapWriter
              + 根据之前状态位的不同，采取
-             	1. 转向式快速归并 [可以转换transferToEnabled=true但是不可加密encryptionEnabled=false]
+             	1. 转换式快速归并 [可以转换transferToEnabled=true但是不可加密encryptionEnabled=false]
              		mergeSpillsWithTransferTo(spills, mapWriter)
              	2. 文件流快速归并 
              		mergeSpillsWithFileStream(spills, mapWriter, null)
@@ -833,19 +829,18 @@
     		+ 对每个数据块元数据@spills建立一个输入流
     		+ 获取shuffle分区写出器@writer #type @ShufflePartitionWriter 由此建立分区输出流
     		@partitionOutput #type @OutputStream，这个分区输出流首先需要携带上时间统计功能
-    		@TimeTrackingOutputStream,其次需要向块管理器@blockManager 中毒序列化管理器
+    		@TimeTrackingOutputStream,其次需要向块管理器@blockManager 中的序列化管理器
     		@serializerManager() 申请一层shuffle加密的操作。如果你指定了compressionCodec的话，还需要对分区输出进行一次压缩。
-    		+ 对于每个数据块元数据@spills,获取分区的溢写数量@partitionLengthInSpill，如果这个数大于0，则要获取长度为分区溢写数量@partitionLengthInSpill的输入流，并对文件进行读取。当然这里需要根据加密以及是否压缩采取如同上述的操作步骤，将输入流读取到的内容拷贝到输出流中。参照#class @ByteStreams
-    		#method @copy
+    		+ 对于每个数据块元数据@spills,获取分区的溢写数量@partitionLengthInSpill，如果这个数大于0，则要获取长度为分区溢写数量@partitionLengthInSpill的输入流，并对文件进行读取。当然这里需要根据加密以及是否压缩采取如同上述的操作步骤，将输入流读取到的内容拷贝到输出流中。参照#class @ByteStreams #method @copy
     		+ 最后关闭分区输出流，使用@writer 统计写出的字节数,使用写出度量器@writeMetrics将值累加到内部累加器中。
     		+ 关闭输入流
     		
     		void mergeSpillsWithTransferTo(SpillInfo[] spills,ShuffleMapOutputWriter mapWriter)
-    		功能: 转向式快速归并
+    		功能: 转换式快速归并
     		与文件流式快速归并不同的是，这里使用的是文件通道，而不是分区输出流
     		+ 对于任意一个数据块元数据@spill需要创建一个文件通道
     		+ 对于每一个分区，获取分区写出器@write，创建输出流类型@WritableByteChannelWrapper #name 
-    		@resolvedChannel .将溢写输入流@spillInputChannel拷贝到@resolvedChannel的通道内，并移动
+    		@resolvedChannel .将溢写输入通道@spillInputChannel拷贝到@resolvedChannel的通道内，并移动
     		@spillInputChannel通道指针@spillInputChannelPositions[i]+=溢写数partitionLengthInSpill
     		+ 处理写度量器@writeMetrics时间增长问题(t(拷贝前)-t(拷贝后))
     		+ 关闭写出通道,统计写出字节数，并更新到写出度量器@writeMetrics中
@@ -875,7 +870,6 @@
     		关流
     }
     ```
-    
     
 
 ---
