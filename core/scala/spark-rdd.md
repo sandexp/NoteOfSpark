@@ -3853,7 +3853,7 @@ abstract class RDD[T: ClassTag](
     @Experimental
     @Since("2.4.0")
     def barrier(): RDDBarrier[T] = withScope(new RDDBarrier[T](this))
-    功能: 运行spark job时将该stage标记位barrier stage。由任务失败时，不需要重启失败任务，而是放弃整个任务，来个这个stage重新运行所有任务。
+    功能: 运行spark job时将该stage标记为barrier stage。由任务失败时，不需要重启失败任务，而是放弃整个任务，来个这个stage重新运行所有任务。
     
     def getCreationSite: String = Option(creationSite).map(_.shortForm).getOrElse("")
     功能: 获取用户调用

@@ -2221,7 +2221,7 @@ private[spark] object BlacklistTracker extends Logging {
  	3. task
  	任务,执行单元,用于分发到机器上
  	4. Cache tracking	
- 	缓存追踪,DAG调度器指出哪些RDD需要缓存,用于避免重新计算.同样地计算map侧的map out文件,用于避免重新计算map侧的任务,避免置信屏蔽任务(耗时).此外这些map输出文件记录在内存中不需要从外存调页.
+ 	缓存追踪,DAG调度器指出哪些RDD需要缓存,用于避免重新计算.同样地计算map侧的map out文件,用于避免重新计算map侧的任务,避免执行屏蔽任务(耗时).此外这些map输出文件记录在内存中不需要从外存调页.
  	5. Preferred locations
  	最佳位置,dag调度器还需要计算stage每个任务的最佳执行位置,或者是缓存/shuffle数据的位置.通常顺序为同一台主机>同一个机架> 其他
  	6. clean up
