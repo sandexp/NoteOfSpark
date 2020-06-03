@@ -24,7 +24,7 @@ private[streaming] object MapWithStateRDDRecord {
         timeoutThresholdTime: Option[Long],
         removeTimedoutData: Boolean
       ): MapWithStateRDDRecord[K, S, E]
-    功能: 使用数据更新记录记录
+    功能: 使用数据更新记录(旧的记录)
     输入参数:
     	prevRecord	上一条记录
     	dataIterator	数据信息(迭代器)
@@ -32,7 +32,7 @@ private[streaming] object MapWithStateRDDRecord {
     	batchTime	批次时间
     	timeoutThresholdTime	超时上限时间
     	removeTimedoutData	是否移除超时数据
-    1. 创建状态map
+    1. 创建状态map(对旧map进行映射)
     val newStateMap = prevRecord.map { _.stateMap.copy() }
     . getOrElse { new EmptyStateMap[K, S]() }
     val mappedData = new ArrayBuffer[E]
@@ -113,11 +113,11 @@ private[streaming] class MapWithStateRDD[K: ClassTag, V: ClassTag, S: ClassTag, 
     介绍: 
     RDD存储@mapWithState 操作的key状态和项羽的数据,这个RDD的每个分区都有单一的记录类型@MapWithStateRDDRecord.包含@StateMap,且记录列表右映射函数返回.
     构造器参数:
-    prevStateRDD	之前的@MapWithStateRDD,其中@StateMap数据的RDD已经被创建
-    partitionedDataRDD	分区数据RDD,,用于在@prevStateRDD更新之前的@StateMaps,创建这个RDD
-    mappingFunction	映射函数
-    batchTime	当前RDD的批次时间,用于更新
-    timeoutThresholdTime	超时时间上限
+        prevStateRDD	之前的@MapWithStateRDD,其中@StateMap数据的RDD已经被创建
+        partitionedDataRDD	分区数据RDD,,用于在@prevStateRDD更新之前的@StateMaps,创建这个RDD
+        mappingFunction	映射函数
+        batchTime	当前RDD的批次时间,用于更新
+        timeoutThresholdTime	超时时间上限
     属性:
     #name @doFullScan = false volatile	是否进行全扫描
     #name @partitioner = prevStateRDD.partitioner	分区器

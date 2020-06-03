@@ -9190,8 +9190,6 @@ private[scheduler] class PendingTasksByLocality {
 }
 ```
 
-
-
 #### WorkerOffer
 
 ```scala
