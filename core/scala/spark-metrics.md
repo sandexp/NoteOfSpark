@@ -548,7 +548,7 @@ private[spark] class ConsoleSink(val property: Properties, val registry: MetricR
 
 ---
 
-#### source
+####  source
 
 1. [AccumulatorSource.scala](# AccumulatorSource)
 

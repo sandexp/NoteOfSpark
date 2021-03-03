@@ -54,7 +54,7 @@
    		
            MemoryBlock allocatePage(long required)
    		功能: 
-   		+ 使用内存管理器@taskManager 开启一个大小最少为指定值的内存块，如果指定值小于页长@pageSize,		    则会默认区开启一个与页长等大的内存块。
+   		+ 使用内存管理器@taskManager 开启一个大小最少为指定值的内存块，如果指定值小于页长@pageSize,则会默认区开启一个与页长等大的内存块。
    		+ 同理，如果内存块的容纳量不足指定的所需值@required，会抛出OOM@throwOom(MemoryBlock,long)
    		+ 开辟完成之后,消费者@this,使用内存量@used更新。
                

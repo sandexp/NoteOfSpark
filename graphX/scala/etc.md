@@ -1028,7 +1028,7 @@ object Pregel extends Logging {
     : Graph[VD, ED]
     功能: 
     执行类似pregal迭代顶点并行运行,用户定义的顶点处理函数@vprog,会在每个顶点上并行执行,用于接收内部消息,且对顶点计算新的值.发送消息函数@sendMsg然后被调用在所有的出边上,且用于计算目标顶点的消息.合并函数@mergeMsg韩式将发送到目标顶点的消息进行合并,并计算新的值.
-       * On the first iteration all vertices receive the `initialMsg` and
+   * On the first iteration all vertices receive the `initialMsg` and
    * on subsequent iterations if a vertex does not receive a message
    * then the vertex-program is not invoked.
    *
