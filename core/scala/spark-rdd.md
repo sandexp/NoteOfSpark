@@ -5079,4 +5079,4 @@ class ZippedWithIndexRDD[T: ClassTag](prev: RDD[T]) extends RDD[(T, Long)](prev)
 
 1.  [spark paper](http://people.csail.mit.edu/matei/papers/2012/nsdi_spark.pdf)
 2.  闭包清理
-3.  [Art Cardinality Estimation Algorithm](https://doi.org/10.1145/2452376.2452456)
+3.  [Art Cardinality Estimation Algorithm](https://doi.org/10.1145/2452376.2452456)`
